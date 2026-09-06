@@ -228,21 +228,27 @@ struct RehandshakeTests {
         )
     }
 
+    /// Timeout cleanup must leave the abort sender uncancelled; the
+    /// cancellation-aware mock rejects a send that arrives pre-cancelled.
     @Test("Pairing attempt timeout aborts without persistence")
     func pairingAttemptTimeoutAbortsWithoutPersistence() async throws {
         let session = try await makePairableSession(pairingAttemptTimeout: .milliseconds(100))
         let server = session.server
+        await server.transport.setHonorCancellationSends(true)
 
         try await rehandshake(server, to: session.pairingPsk)
         try await server.sendJSON(
             #"{"type":"server/activate","payload":{"activities":["pairing"],"active_roles":[],"pairing":{"method":"pairing_psk"}}}"#
         )
-        #expect(await waitUntil {
-            await server.clientJSONMessages(ofType: PairAbortMessage.typeString).count == 1
-        }, "the pending attempt must expire")
+        #expect(
+            await waitUntil(timeout: .seconds(3)) {
+                await server.clientJSONMessages(ofType: PairAbortMessage.typeString).count == 1
+            },
+            "the pending attempt must expire AND the intentional pair/abort must reach the server"
+        )
         let abort = try #require(await server.clientJSONMessages(ofType: PairAbortMessage.typeString).first)
         #expect(try JSONDecoder().decode(PairAbortMessage.self, from: abort).payload.reason == .attemptTimeout)
-        #expect(await session.store.listRecords().allSatisfy { $0.serverId == nil })
+        #expect(await session.store.listRecords().allSatisfy { $0.serverId == nil }, "a timed-out attempt must not persist")
         #expect(await session.client.connectionState == .connected)
         await session.client.disconnect()
     }
@@ -329,6 +335,105 @@ struct RehandshakeTests {
                 await server.clientJSONMessages(ofType: ClientTimeMessage.typeString).count >= 1
             },
             "clock-sync traffic resumes after the post-swap activation"
+        )
+        await session.client.disconnect()
+    }
+
+    /// A sender parked on the outbound queue before a rehandshake re-checks the
+    /// gate once woken: the gate closes on message-1 receipt, ahead of the reply's
+    /// key swap, so the woken sender is rejected while the swap is still pending.
+    @Test("a queued sender woken under the closed rehandshake gate is rejected before the key swap")
+    func queuedSenderWokenUnderClosedGateIsRejected() async throws {
+        let longTermPsk = Psk.generate()
+        let session = try await makePairableSession(seededLongTermPsk: longTermPsk)
+        let server = session.server
+        let transport = server.transport
+        let connection = try #require(await MainActor.run { session.client.connection })
+        // start() returns before messageLoop installs the clock-sync sampler;
+        // wait for the handle first so cancel/join drains it deterministically.
+        #expect(await waitUntil { await connection.clockSyncTask != nil }, "clock-sync task handle must appear before cancel")
+        await connection.clockSyncTask?.cancel()
+        await connection.clockSyncTask?.value
+
+        // #1 takes the outbound slot and parks mid-fragment on the gate.
+        await transport.enableGoodbyeGate()
+        let first = Task { () -> Result<Void, Error> in
+            do {
+                try await connection.send(clientMessage:
+                    OutboundTestMessage(
+                        type: OutboundTestMessageType.padded,
+                        note: String(repeating: "g", count: NoiseChannel.maxSinglePayload + 2_000)
+                    )
+                )
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        #expect(await waitUntil { await transport.isGoodbyeGateWaiting })
+
+        // #2 queues behind #1 (it has NOT acquired the slot, so it has not checked
+        // the gate — it will only do so once woken).
+        let second = Task { () -> Result<Void, Error> in
+            do {
+                try await connection.send(clientMessage: OutboundTestMessage(type: OutboundTestMessageType.small, note: "queued-before-rekey"))
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        #expect(await waitUntil { await connection.outboundWaiters.count == 1 }, "the second sender must queue")
+
+        // beginRehandshake only injects message 1; the gate closes when the
+        // connection consumes it. Wait for that before releasing the sender, and
+        // release unconditionally so failure cannot wedge the parked send.
+        try await server.beginRehandshake(to: longTermPsk, pskCategoryOverride: .longTerm)
+        #expect(await waitUntil { await connection.isRehandshakeInProgress })
+        await transport.releaseGoodbyeGate()
+
+        let firstResult = await first.value
+        #expect((try? firstResult.get()) != nil, "the first send must complete")
+
+        // #2 wakes under the (now closed) rehandshake gate and is rejected.
+        let secondResult = await second.value
+        let secondWasRejected: Bool = {
+            guard case .failure = secondResult else { return false }
+            return true
+        }()
+        #expect(secondWasRejected, "a sender that parked before the re-key swap must be gate-rejected when woken after it")
+
+        // The reply sent bypass under the old keys; the swap lands on the client.
+        #expect(await waitUntil { await server.rehandshakeComplete })
+
+        // Neither queued-before-rekey send may have hit the wire under the old or
+        // new keys: the small one was gate-rejected (no encrypt); the padded one
+        // completed before the handshake and is legitimate old-key traffic.
+        let wireTypes = await server.decryptedMessages.compactMap(typeOfDecryptedJSON)
+        #expect(!wireTypes.contains(OutboundTestMessageType.small), "a gate-rejected send must not reach the wire at all")
+
+        try await server.sendJSON(#"{"type":"server/hello","payload":{"name":"Test Server"}}"#)
+        #expect(await waitUntil { await server.clientJSONMessages(ofType: ClientHelloMessage.typeString).count == 1 })
+        await session.client.disconnect()
+    }
+
+    @Test("Post-swap activate publishes the full client/state under the new keys")
+    func postSwapActivationPublishesClientState() async throws {
+        let longTermPsk = Psk.generate()
+        let session = try await makePairableSession(seededLongTermPsk: longTermPsk)
+        let server = session.server
+
+        try await rehandshake(server, to: longTermPsk, pskCategory: .longTerm)
+
+        // Between the swap and the post-swap activate, publishClientState must be
+        // rejected by the gate (the rehandshakeInProgress bypass is not yet set).
+        #expect(await server.clientJSONMessages(ofType: ClientStateMessage.typeString).isEmpty)
+
+        try await server.sendActivation(activities: [], activeRoles: [])
+        #expect(
+            await waitUntil(timeout: .seconds(3)) {
+                await server.clientJSONMessages(ofType: ClientStateMessage.typeString).count == 1
+            },
+            "the completed rehandshake must publish the post-swap full client/state under the new keys"
         )
         await session.client.disconnect()
     }

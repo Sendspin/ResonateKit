@@ -767,7 +767,13 @@ extension SendspinConnection {
     }
 
     func pairingAttemptTimedOut() async {
+        // A stale wake (its handle was cancelled and replaced by a newer attempt
+        // or teardown) must not detach the newer handle or abort the fresh attempt.
+        guard !Task.isCancelled else { return }
         guard pendingPairingPsk != nil || dynamicPairingAttempt != nil || staticPairingAttempt != nil else { return }
+        // Detach this task's handle before clear: clearPairingAttempt cancels the
+        // owned task, which would self-cancel the abort send below.
+        pairingAttemptTask = nil
         clearPairingAttempt(reason: .attemptTimeout)
         try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .attemptTimeout)))
     }

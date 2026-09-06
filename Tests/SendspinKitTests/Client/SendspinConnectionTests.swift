@@ -1456,6 +1456,364 @@ struct SendspinConnectionSessionTests {
             "start() after an idle shutdown must be a no-op (no client/hello)"
         )
     }
+
+    // MARK: - Outbound whole-message serialization
+
+    /// Core regression: a fragmented message parks mid-send with all fragment
+    /// nonces already consumed; the peer must still decrypt both messages in send
+    /// order with no AEAD gap.
+    @Test("fragmented outbound message reaches the peer before a concurrent message (no nonce gap)")
+    func outboundMessageFragmentsSerializeBeforeConcurrentMessage() async throws {
+        let transport = MockTransport()
+        let connection = try await makeConnectionWithTransport(transport)
+        // start() returns before messageLoop installs the clock-sync sampler;
+        // wait for the handle first so cancel/join drains it deterministically.
+        #expect(await waitUntil { await connection.clockSyncTask != nil }, "clock-sync task handle must appear before cancel")
+        await connection.clockSyncTask?.cancel()
+        await connection.clockSyncTask?.value
+        // Drain any residual in-flight send so no unrelated sender races the test.
+        #expect(await waitUntil { await !(connection.outboundInFlight) }, "initial clock samples must drain")
+
+        await transport.enableGoodbyeGate()
+        let big = OutboundTestMessage(
+            type: OutboundTestMessageType.padded,
+            note: String(repeating: "a", count: NoiseChannel.maxSinglePayload + 2_000)
+        )
+        async let bigSend: Void = connection.send(clientMessage: big)
+
+        // The first fragment of the fragmented message parks mid-send; every
+        // fragment's nonces are already consumed by encryptMessage.
+        #expect(await waitUntil { await transport.isGoodbyeGateWaiting }, "the first fragment must park on the transport gate")
+
+        let small = OutboundTestMessage(type: OutboundTestMessageType.small, note: "after")
+        async let smallSend: Void = connection.send(clientMessage: small)
+        // The concurrent sender must be QUEUED on the outbound slot, not
+        // encrypting — the exact interleaving that used to burn nonce n+2
+        // before n+1.
+        #expect(
+            await waitUntil { await connection.outboundWaiters.count == 1 },
+            "the second sender must park on the outbound slot"
+        )
+
+        await transport.releaseGoodbyeGate()
+        try await bigSend
+        try await smallSend
+
+        // The peer must have decrypted both messages with contiguous AEAD nonces:
+        // a gap makes decryptFrame throw, so the message would never appear here.
+        let server = try #require(await connectionReadbacks.server(for: transport))
+        #expect(
+            await waitUntil(timeout: .seconds(3)) {
+                await server.decryptedMessages.contains { typeOfDecryptedJSON($0) == OutboundTestMessageType.small }
+            },
+            "the fragmented message must decrypt at the peer (no nonce gap)"
+        )
+        let types = await server.decryptedMessages.compactMap(typeOfDecryptedJSON)
+        let bigIndex = try #require(types.lastIndex(of: OutboundTestMessageType.padded))
+        let smallIndex = try #require(types.lastIndex(of: OutboundTestMessageType.small))
+        #expect(bigIndex < smallIndex, "the fragmented message must complete before the concurrent one")
+        await transport.finishStreams()
+        await connection.shutdown()
+    }
+
+    /// Three concurrent senders: the fragmented message is admitted first, then
+    /// two single-frame messages queue behind it. All three must decrypt in the
+    /// order they were enqueued (FIFO).
+    @Test("three concurrent outbound messages decrypt in FIFO order")
+    func outboundQueueDeliveryIsFIFO() async throws {
+        let transport = MockTransport()
+        let connection = try await makeConnectionWithTransport(transport)
+        // start() returns before messageLoop installs the clock-sync sampler;
+        // wait for the handle first so cancel/join drains it deterministically.
+        #expect(await waitUntil { await connection.clockSyncTask != nil }, "clock-sync task handle must appear before cancel")
+        await connection.clockSyncTask?.cancel()
+        await connection.clockSyncTask?.value
+        #expect(await waitUntil { await !(connection.outboundInFlight) })
+
+        await transport.enableGoodbyeGate()
+        let big = OutboundTestMessage(
+            type: OutboundTestMessageType.padded,
+            note: String(repeating: "b", count: NoiseChannel.maxSinglePayload + 2_000)
+        )
+        async let first: Void = connection.send(clientMessage: big)
+        #expect(await waitUntil { await transport.isGoodbyeGateWaiting })
+
+        // Sequence: wait for the FIRST queued sender before launching the second,
+        // so both are deterministically in the queue when the gate opens.
+        let second = Task { () -> Result<Void, Error> in
+            do {
+                try await connection.send(clientMessage: OutboundTestMessage(type: OutboundTestMessageType.one, note: "one"))
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        #expect(await waitUntil { await connection.outboundWaiters.count == 1 }, "the first single-frame sender must queue")
+
+        let third = Task { () -> Result<Void, Error> in
+            do {
+                try await connection.send(clientMessage: OutboundTestMessage(type: OutboundTestMessageType.two, note: "two"))
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        #expect(await waitUntil { await connection.outboundWaiters.count == 2 }, "both single-frame senders must queue")
+
+        await transport.releaseGoodbyeGate()
+        try await first
+        let secondResult = await second.value
+        _ = try? secondResult.get()
+        let thirdResult = await third.value
+        _ = try? thirdResult.get()
+
+        // Wait for the peer readback of all three before snapshotting order.
+        let server = try #require(await connectionReadbacks.server(for: transport))
+        #expect(
+            await waitUntil(timeout: .seconds(3)) {
+                await server.decryptedMessages.count >= 3
+            },
+            "the peer must read all three messages"
+        )
+        let types = await server.decryptedMessages.compactMap(typeOfDecryptedJSON)
+        let ours = types.filter { OutboundTestMessageType.all.contains($0) }
+        #expect(
+            ours == [OutboundTestMessageType.padded, OutboundTestMessageType.one, OutboundTestMessageType.two],
+            "messages must reach the peer in FIFO enqueue order"
+        )
+        await transport.finishStreams()
+        await connection.shutdown()
+    }
+
+    /// A queued sender cancelled while parked must not encrypt a frame (no nonce
+    /// burn), must not wedge the chain, and the slot must stay usable afterwards.
+    @Test("a queued outbound send cancelled while parked must not burn a nonce or wedge the chain")
+    func queuedCancellationDoesNotBurnNonceOrWedgeChain() async throws {
+        let transport = MockTransport()
+        let connection = try await makeConnectionWithTransport(transport)
+        // start() returns before messageLoop installs the clock-sync sampler;
+        // wait for the handle first so cancel/join drains it deterministically.
+        #expect(await waitUntil { await connection.clockSyncTask != nil }, "clock-sync task handle must appear before cancel")
+        await connection.clockSyncTask?.cancel()
+        await connection.clockSyncTask?.value
+        #expect(await waitUntil { await !(connection.outboundInFlight) })
+
+        await transport.enableGoodbyeGate()
+        let big = OutboundTestMessage(
+            type: OutboundTestMessageType.padded,
+            note: String(repeating: "c", count: NoiseChannel.maxSinglePayload + 2_000)
+        )
+        let bigTask = Task { () -> Result<Void, Error> in
+            do {
+                try await connection.send(clientMessage: big)
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        #expect(await waitUntil { await transport.isGoodbyeGateWaiting })
+
+        let smallTask = Task { () -> Result<Void, Error> in
+            do {
+                try await connection.send(clientMessage: OutboundTestMessage(type: OutboundTestMessageType.small, note: "cancelled"))
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        // WAIT for the small sender to be parked BEFORE cancelling, so it is
+        // cancelled while parked (wasCancelledBeforeWaiting == false) and the
+        // parked-cancel path deterministically drops it.
+        #expect(await waitUntil { await connection.outboundWaiters.count == 1 }, "the small sender must queue")
+
+        smallTask.cancel()
+        await transport.releaseGoodbyeGate()
+
+        let bigResult = await bigTask.value
+        #expect((try? bigResult.get()) != nil, "the fragmented message must still send")
+
+        let smallResult = await smallTask.value
+        guard case .failure = smallResult else {
+            Issue.record("a cancelled queued send must fail")
+            return
+        }
+        #expect(await connection.outboundWaiters.isEmpty, "the cancelled waiter must release the slot")
+
+        // The cancelled message never encrypted, so it must not appear at the peer.
+        let server = try #require(await connectionReadbacks.server(for: transport))
+        let wireTypes = await server.decryptedMessages.compactMap(typeOfDecryptedJSON)
+        #expect(!wireTypes.contains(OutboundTestMessageType.small), "a cancelled send must not reach the wire")
+
+        // The chain is still live: a follow-up send goes out under the next nonce.
+        try await connection.send(clientMessage: OutboundTestMessage(type: OutboundTestMessageType.one, note: "after-cancel"))
+        #expect(
+            await waitUntil(timeout: .seconds(3)) {
+                await server.decryptedMessages.contains { typeOfDecryptedJSON($0) == OutboundTestMessageType.one }
+            },
+            "the chain must stay usable after a cancelled waiter"
+        )
+        await transport.finishStreams()
+        await connection.shutdown()
+    }
+
+    /// The cancellation policy is uniform: a send reaching a cancelled task —
+    /// including one already-cancelled at entry — is rejected before encrypting,
+    /// so no nonce is burned for a frame nothing will carry.
+    @Test("a send already-cancelled at entry is rejected without burning a nonce or wedging the chain")
+    func cancelledEntryIsRejectedWithoutBurningNonceOrWedgingChain() async throws {
+        let transport = MockTransport()
+        let connection = try await makeConnectionWithTransport(transport)
+        // start() returns before messageLoop installs the clock-sync sampler;
+        // wait for the handle first so cancel/join drains it deterministically.
+        #expect(await waitUntil { await connection.clockSyncTask != nil }, "clock-sync task handle must appear before cancel")
+        await connection.clockSyncTask?.cancel()
+        await connection.clockSyncTask?.value
+        #expect(await waitUntil { await !(connection.outboundInFlight) })
+
+        await transport.enableGoodbyeGate()
+        // Make the mock transport mirror the real one: a pre-cancelled sender that
+        // somehow reached the transport must also be rejected, not delivered.
+        await transport.setHonorCancellationSends(true)
+        let big = OutboundTestMessage(
+            type: OutboundTestMessageType.padded,
+            note: String(repeating: "e", count: NoiseChannel.maxSinglePayload + 2_000)
+        )
+        let bigTask = Task { () -> Result<Void, Error> in
+            do {
+                try await connection.send(clientMessage: big)
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        #expect(await waitUntil { await transport.isGoodbyeGateWaiting })
+
+        // The task cancels ITSELF before sending; with the uniform policy the
+        // send must fail without encrypting, and the chain must stay live.
+        let cancelledAtEntryTask = Task { () -> Result<Void, Error> in
+            withUnsafeCurrentTask { $0?.cancel() }
+            do {
+                try await connection.send(clientMessage: OutboundTestMessage(type: OutboundTestMessageType.small, note: "pre-cancelled"))
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        #expect(await waitUntil { await connection.outboundWaiters.count == 1 }, "the pre-cancelled sender must queue")
+
+        // Release the parked first sender; the pre-cancelled sender wakes and must be rejected.
+        await transport.releaseGoodbyeGate()
+        let bigResult = await bigTask.value
+        #expect((try? bigResult.get()) != nil, "the fragmented message must still send")
+        let smallResult = await cancelledAtEntryTask.value
+        guard case .failure = smallResult else {
+            Issue.record("a send already-cancelled at entry must fail under the uniform policy")
+            return
+        }
+        #expect(await connection.outboundWaiters.isEmpty, "the rejected waiter must release the slot")
+
+        // The cancelled message never encrypted, so it must not appear at the peer.
+        let server = try #require(await connectionReadbacks.server(for: transport))
+        let wireTypes = await server.decryptedMessages.compactMap(typeOfDecryptedJSON)
+        #expect(!wireTypes.contains(OutboundTestMessageType.small), "a pre-cancelled send must not reach the wire")
+
+        // The chain is still live after the rejection.
+        try await connection.send(clientMessage: OutboundTestMessage(type: OutboundTestMessageType.one, note: "after-reject"))
+        #expect(
+            await waitUntil(timeout: .seconds(3)) {
+                await server.decryptedMessages.contains { typeOfDecryptedJSON($0) == OutboundTestMessageType.one }
+            },
+            "the chain must stay usable after a rejected pre-cancelled sender"
+        )
+        await transport.finishStreams()
+        await connection.shutdown()
+    }
+
+    /// A failed fragmented send is terminal (nonces burned): latch so queued and
+    /// later senders fail without encrypting, and nothing hangs.
+    @Test("outbound failure latches: queued and later senders send nothing after the error")
+    func outboundFailureLatchStopsFurtherSends() async throws {
+        let transport = MockTransport()
+        let connection = try await makeConnectionWithTransport(transport)
+        // start() returns before messageLoop installs the clock-sync sampler;
+        // wait for the handle first so cancel/join drains it deterministically.
+        #expect(await waitUntil { await connection.clockSyncTask != nil }, "clock-sync task handle must appear before cancel")
+        await connection.clockSyncTask?.cancel()
+        await connection.clockSyncTask?.value
+        #expect(await waitUntil { await !(connection.outboundInFlight) })
+
+        await transport.enableGoodbyeGate()
+        let big = OutboundTestMessage(
+            type: OutboundTestMessageType.padded,
+            note: String(repeating: "d", count: NoiseChannel.maxSinglePayload + 2_000)
+        )
+        let bigTask = Task { () -> Result<Void, Error> in
+            do {
+                try await connection.send(clientMessage: big)
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        #expect(await waitUntil { await transport.isGoodbyeGateWaiting })
+
+        let queuedTask = Task { () -> Result<Void, Error> in
+            do {
+                try await connection.send(clientMessage: OutboundTestMessage(type: OutboundTestMessageType.small, note: "queued"))
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        #expect(await waitUntil { await connection.outboundWaiters.count == 1 }, "the queued sender must park")
+
+        // Arm failure so the SECOND fragment (post-release) throws; the parked
+        // first fragment already passed the fail check, so it sends once.
+        let framesBeforeRelease = await transport.sentBinaryMessages.count
+        await transport.setShouldFailOnSend(true)
+        await transport.releaseGoodbyeGate()
+
+        let bigResult = await bigTask.value
+        guard case .failure = bigResult else {
+            Issue.record("a send that burned nonces then failed must surface the error")
+            return
+        }
+        let queuedResult = await queuedTask.value
+        guard case .failure = queuedResult else {
+            Issue.record("a queued sender behind a failed send must fail (channel is crypto-dead)")
+            return
+        }
+
+        // A LATER sender must also fail without encrypting or sending: nothing
+        // beyond the failure point may reach the wire.
+        let laterResult = await Task {
+            do {
+                try await connection.send(clientMessage: OutboundTestMessage(type: OutboundTestMessageType.one, note: "later"))
+                return Result<Void, Error>.success(())
+            } catch {
+                return .failure(error)
+            }
+        }.value
+        guard case .failure = laterResult else {
+            Issue.record("a later send after an outbound failure must fail (channel is crypto-dead)")
+            return
+        }
+
+        #expect(await connection.outboundWaiters.isEmpty, "no sender may remain parked")
+        #expect(await connection.outboundFailed, "the outbound-failure state must be latched")
+        #expect(await transport.disconnectCalled, "a burned-nonce send must tear the session down")
+
+        // Only the first fragment ever reached the wire (it parked BEFORE the
+        // fail arm and sent once on release); the failing second fragment and
+        // every queued/later send must not have produced a frame.
+        let sentCount = await transport.sentBinaryMessages.count
+        #expect(
+            sentCount == framesBeforeRelease + 1,
+            "only the first fragment may reach the wire after the failure point; got \(sentCount) frames"
+        )
+        await transport.finishStreams()
+        await connection.shutdown()
+    }
 }
 
 // MARK: - Connection factories (shared by both suites)
@@ -1574,6 +1932,35 @@ private func audioChunkFrame(index: Int = 0, baseTimestamp: Int64 = 1_000_000) -
     frame.append(Data(bytes: &timestamp, count: 8))
     frame.append(Data(repeating: 0x7F, count: 400))
     return frame
+}
+
+/// Wire discriminators for the outbound-serialization tests. The `padded` type
+/// carries a payload large enough to force fragmentation, so the connection
+/// exercises the multi-frame path with one wait per fragment.
+enum OutboundTestMessageType: String, Codable {
+    case padded
+    case small
+    case one
+    case two
+
+    static let all: [OutboundTestMessageType] = [.padded, .small, .one, .two]
+}
+
+/// A minimal custom control message the connection's `send(clientMessage:)`
+/// accepts and encrypts directly (not a `client/state` snapshot, so the state
+/// coalescing gate cannot serialize the test away).
+struct OutboundTestMessage: Codable, Sendable {
+    let type: OutboundTestMessageType
+    let note: String
+}
+
+/// Message type of a decrypted `[json type][payload]` plaintext, or nil for
+/// non-JSON (audio) frames.
+func typeOfDecryptedJSON(_ message: Data) -> OutboundTestMessageType? {
+    guard message.first == NoiseFrameType.json,
+          let decoded = try? JSONDecoder().decode(OutboundTestMessage.self, from: Data(message.dropFirst()))
+    else { return nil }
+    return decoded.type
 }
 
 /// Encode a `stream/start` carrying a player format. `codec` is a raw wire string

@@ -447,10 +447,8 @@ public final class SendspinClient {
             throw error
         }
 
-        // Re-validate: the guard above ran before a network-length suspension, during
-        // which an inbound server can win arbitration and be promoted, or the caller can
-        // call `disconnect()`. Either bumps the epoch, and neither is visible in
-        // `connection` — a cancelled dial leaves it nil, exactly as an untouched one does.
+        // Re-validate after the network suspension: a promotion or a disconnect bumps
+        // the epoch, and neither is visible in `connection` (nil either way).
         guard sessionEpoch == dialEpoch else {
             Log.client.warning("The session changed while dialing \(url); abandoning this dial")
             await transport.disconnect()
@@ -481,7 +479,13 @@ public final class SendspinClient {
                 await transport.disconnect()
                 throw SendspinClientError.alreadyConnected
             }
-            await setupConnection(with: transport, outcome: outcome, negotiation: negotiation)
+            await setupConnection(
+                with: transport,
+                outcome: outcome,
+                negotiation: negotiation,
+                runtimeConfiguration: runtimeConfiguration,
+                setupEpoch: dialEpoch
+            )
             try requireOpen()
         } catch {
             await transport.disconnect()
@@ -507,6 +511,10 @@ public final class SendspinClient {
         defer { pendingTransports.removeValue(forKey: pendingID) }
         if connectionState == .disconnected {
             connectionState = .connecting
+            // Claim the epoch before the first suspension: the dial window holds no
+            // `connection`, so only the epoch tracks caller intent.
+            sessionEpoch += 1
+            let acceptEpoch = sessionEpoch
             await preparePairingConfiguration()
             do {
                 let negotiation = try await makeSessionFormatNegotiation()
@@ -527,10 +535,29 @@ public final class SendspinClient {
                     phaseTimeout: handshakeTimeout
                 )
                 try requireOpen()
-                await setupConnection(with: transport, outcome: outcome, negotiation: negotiation)
+                guard sessionEpoch == acceptEpoch else {
+                    // A disconnect/close or a promoted competitor invalidated this claim.
+                    await transport.disconnect()
+                    throw SendspinClientError.alreadyConnected
+                }
+                await setupConnection(
+                    with: transport,
+                    outcome: outcome,
+                    negotiation: negotiation,
+                    runtimeConfiguration: runtimeConfiguration,
+                    setupEpoch: acceptEpoch
+                )
+                try requireOpen()
             } catch {
                 await transport.disconnect()
-                updateConnectionState(.disconnected)
+                // Only a candidate still owning this epoch may reset the visible
+                // state; a stale failure must not clobber a replacement session.
+                if sessionEpoch == acceptEpoch, connectionState == .connecting {
+                    updateConnectionState(.disconnected)
+                }
+                if isTerminated {
+                    throw TerminatedError()
+                }
                 throw error
             }
         } else {
@@ -561,23 +588,26 @@ public final class SendspinClient {
         return retired
     }
 
-    /// - Parameter preReadHello: When non-nil, the `client/hello` was already sent
-    ///   and the `server/hello` already consumed during competing-connection
-    ///   arbitration. In that case we process the hello directly instead of sending
-    ///   another `client/hello`, and the message loop resumes the transport's stream
-    ///   from the (buffered) frames that follow.
+    /// Install an admitted session on `transport` and start it.
     ///
-    /// This setup path is intentionally non-throwing: all genuine dial/handshake
-    /// failures are handled before a transport reaches this point, so callers do not
-    /// need duplicate rollback logic after they set `.connecting`.
+    /// Caller already resolved the pairing runtime snapshot and claimed its
+    /// epoch: never install for an epoch that lost its claim. Non-throwing.
     @MainActor
     // swiftlint:disable:next function_body_length
     func setupConnection(
         with transport: any SendspinTransport,
         outcome: consuming HandshakeDriver.Result,
-        negotiation: SessionFormatNegotiation
+        negotiation: SessionFormatNegotiation,
+        runtimeConfiguration: PairingManagementConfiguration,
+        setupEpoch: Int
     ) async {
         guard !isTerminated else {
+            await transport.disconnect()
+            return
+        }
+        // Claim the epoch re-check: an interleaved `disconnect()` or promoted
+        // competitor bumps the epoch; this candidate must not install for it.
+        guard sessionEpoch == setupEpoch else {
             await transport.disconnect()
             return
         }
@@ -592,13 +622,15 @@ public final class SendspinClient {
 
         // Retire the old session synchronously (token + identity guards both
         // reject its late events from this point), then await its teardown.
-        //
-        // `oldConnection` is nil for every current caller, so this await does not run. If
-        // that changes, the nil-`connection` window makes `disconnect()` a silent no-op and
-        // can orphan a live connection. Keep the rest of this suspension-free.
+        // `oldConnection` is nil for current callers. Re-check the epoch after
+        // that suspension: teardown can take arbitrarily long.
         let oldConnection = retireSession()
         if let oldConnection {
             await oldConnection.shutdown()
+        }
+        guard sessionEpoch == setupEpoch else {
+            await transport.disconnect()
+            return
         }
 
         // Build the SendspinConnection with configuration from this facade
@@ -624,7 +656,6 @@ public final class SendspinClient {
         let outcomeServerStaticPublicKey = outcome.serverStaticPublicKey
         let outcomeSuite = outcome.suite
         let sessionChannel = outcome.takeChannel()
-        let runtimeConfiguration = await pairingRuntimeConfiguration()
         #if DEBUG
             let nonceBOverride = nonceBOverride
             let pairingHandshakeHashOverride = pairingHandshakeHashOverride
@@ -713,6 +744,7 @@ public final class SendspinClient {
             clock: clockSync,
             engine: audioEngine
         )
+        // No suspension occurs between the re-check above and this install.
 
         connection = newConnection
         currentOutputFormatStatus = nil

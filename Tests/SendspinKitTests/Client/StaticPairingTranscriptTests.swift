@@ -440,6 +440,7 @@ struct PairingCancellationTests {
     @Test("static attempt timeout sends attempt_timeout")
     func attemptTimeout() async throws {
         let session = try await makeStaticTestSession(attemptTimeout: .milliseconds(100))
+        await session.server.transport.setHonorCancellationSends(true)
         try await activateStatic(session.server)
         try await session.client.openPairingWindow()
         _ = try await waitForStaticClientMessage(session.server, type: ClientPairInitMessage.typeString)

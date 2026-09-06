@@ -212,6 +212,43 @@ struct NoiseSessionEstablisherTests {
         }
     }
 
+    /// Cancelling the caller must not strand the parked `FrameInbox` pull: only
+    /// `disconnect()` releases it, so a regression that ignores cancellation
+    /// parks until the phase watchdog fires.
+    @Test("Cancelling after client/init returns promptly and disconnects the transport")
+    func cancellationAfterClientInitReturnsPromptly() async {
+        let transport = MockTransport()
+        let clientSide = establishmentTask(
+            transport: transport,
+            phaseTimeout: NoiseSessionEstablisher.defaultPhaseTimeout
+        )
+        _ = await transport.nextSentFrame() // client/init went out; the server never replies
+        clientSide.cancel()
+
+        let outcome = TestBox<Result<Void, Error>?>(nil)
+        let observer = Task {
+            do {
+                _ = try await clientSide.value
+                await outcome.set(.success(()))
+            } catch {
+                await outcome.set(.failure(error))
+            }
+        }
+        let returned = await waitUntil(timeout: .seconds(2)) { await outcome.value != nil }
+        let disconnectedOnCancellation = await transport.disconnectCalled
+
+        // Release and join even when the cancellation assertion fails.
+        await transport.disconnect()
+        _ = try? await clientSide.value
+        await observer.value
+
+        #expect(returned, "a cancelled establishment must return promptly, not park until the phase watchdog")
+        #expect(
+            disconnectedOnCancellation,
+            "cancellation must disconnect the transport, which is what releases the parked pull"
+        )
+    }
+
     @Test("client/init carries the identity, core version, and chosen suite")
     func clientInitContents() async throws {
         let transport = MockTransport()

@@ -102,6 +102,15 @@ actor SendspinConnection {
     var clientStateSendInFlight = false
     var clientStateDirty = false
 
+    /// Outbound whole-message fence: nonces burn per fragment up front and the
+    /// fragments must reach the transport with nothing interleaved, so one
+    /// message sends at a time; the rest park on `outboundWaiters` (FIFO).
+    var outboundInFlight = false
+    var outboundWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Set when an outbound send fails: a burned nonce makes the channel
+    /// crypto-dead, so queued and later senders must fail without encrypting.
+    var outboundFailed = false
+
     /// Server info
     var currentServerId: String?
     var serverName: String
