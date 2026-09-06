@@ -209,10 +209,13 @@ struct StaticPairingWindowTests {
 
     @Test("a rejected static activation cancels its attempt and allows a fresh activation")
     func rejectedStaticActivationCleansUpAttempt() async throws {
-        let session = try await makeStaticTestSession(attemptTimeout: .milliseconds(100))
+        let session = try await makeStaticTestSession()
         try await session.client.openPairingWindow()
         try await activateStatic(session.server)
         _ = try await waitForStaticClientMessage(session.server, type: ClientPairInitMessage.typeString)
+        let connection = try #require(await MainActor.run { session.client.connection })
+        let attemptTask = try #require(await connection.pairingAttemptTask)
+        #expect(!attemptTask.isCancelled)
 
         let runtime = try #require(await MainActor.run { session.client.pairingConfiguration?.runtime })
         let pairingPsk = await runtime.snapshot().pairingPsk
@@ -227,7 +230,13 @@ struct StaticPairingWindowTests {
         try await activateStatic(session.server)
         let firstAbort = try await waitForStaticClientMessage(session.server, type: PairAbortMessage.typeString)
         #expect(try JSONDecoder().decode(PairAbortMessage.self, from: firstAbort).payload.reason == .methodNotSupported)
-        try await Task.sleep(for: .milliseconds(150))
+        #expect(attemptTask.isCancelled)
+        #expect(await connection.pairingAttemptTask == nil)
+        // Clean up even when the cancellation assertion fails.
+        attemptTask.cancel()
+        if case .timedOut = await observeTask(attemptTask, timeout: .seconds(2)) {
+            Issue.record("cancelled pairing timer did not finish")
+        }
         #expect(await session.server.clientJSONMessages(ofType: PairAbortMessage.typeString).count == 1)
 
         await runtime.update(PairingManagementConfiguration(
@@ -240,7 +249,15 @@ struct StaticPairingWindowTests {
         ))
         try await session.client.openPairingWindow()
         try await activateStatic(session.server)
-        _ = try await waitForStaticClientMessage(session.server, type: ClientPairInitMessage.typeString)
+        let refreshedInit = try await waitForStaticClientMessage(
+            session.server,
+            type: ClientPairInitMessage.typeString,
+            count: 2
+        )
+        let refreshedPairInit = try JSONDecoder().decode(ClientPairInitMessage.self, from: refreshedInit)
+        #expect(refreshedPairInit.payload.commitB == nil)
+        let replacementTask = try #require(await connection.pairingAttemptTask)
+        #expect(!replacementTask.isCancelled)
         #expect(await MainActor.run { session.client.connectionState == .connected })
         await session.client.disconnect()
     }
