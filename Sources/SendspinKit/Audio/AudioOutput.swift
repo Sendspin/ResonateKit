@@ -60,7 +60,7 @@ protocol AudioOutputPlatformMonitoring: Actor {
     nonisolated var requiresActiveAudioSession: Bool { get }
 
     /// Start a fresh, single-consumer observation stream.
-    func startMonitoring() -> AsyncStream<AudioOutputPlatformObservation>
+    func startMonitoring() async -> AsyncStream<AudioOutputPlatformObservation>
 
     /// Remove all listeners and finish the current observation stream.
     func stopMonitoring()

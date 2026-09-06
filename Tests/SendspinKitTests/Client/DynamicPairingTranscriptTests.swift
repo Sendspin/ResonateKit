@@ -533,6 +533,7 @@ struct DynamicPairingTimeoutTests {
     @Test("attempt timeout uses the exact attempt_timeout reason")
     func attemptTimeout() async throws {
         let session = try await makeDynamicTestSession(attemptTimeout: .milliseconds(100))
+        await session.server.transport.setHonorCancellationSends(true)
         try await activateDynamic(session.server)
         _ = try await waitForClientMessage(session.server, type: ClientPairInitMessage.typeString)
         let abortData = try await waitForClientMessage(session.server, type: PairAbortMessage.typeString)

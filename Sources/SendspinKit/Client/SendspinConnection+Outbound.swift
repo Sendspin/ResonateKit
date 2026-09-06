@@ -3,11 +3,62 @@ import Foundation
 extension SendspinConnection {
     // MARK: - Outbound sends
 
+    /// Park until the outbound slot is free, then take it. FIFO, no busy spin.
+    private func acquireOutboundSlot() async {
+        if outboundInFlight {
+            await withCheckedContinuation { outboundWaiters.append($0) }
+        }
+        outboundInFlight = true
+    }
+
+    /// Free the slot or hand it to the queued head (inFlight stays true so a
+    /// fresh sender cannot steal it between the release and the wake).
+    private func releaseOutboundSlot() {
+        if outboundWaiters.isEmpty {
+            outboundInFlight = false
+        } else {
+            outboundWaiters.removeFirst().resume()
+        }
+    }
+
+    /// A send failure burns nonces, so the channel is crypto-dead. Latch the
+    /// failure before the async teardown: the deferred slot release then chains
+    /// queued senders into the latch, which rejects them without encrypting.
+    private func failOutbound() async {
+        outboundFailed = true
+        if !shuttingDown {
+            shuttingDown = true
+            if disconnectReason == nil {
+                disconnectReason = .connectionLost(nil)
+            }
+        }
+        await transport.disconnect()
+    }
+
     func sendWrapped(_ message: some Codable & Sendable, bypassRehandshakeGate: Bool = false) async throws {
-        // Check the gate before encryption; a post-encryption re-check would consume a nonce before throwing.
+        await acquireOutboundSlot()
+        defer { releaseOutboundSlot() }
+
+        guard !outboundFailed else {
+            throw SendspinClientError.sendFailed("outbound channel is dead")
+        }
+        // Gate check comes after acquisition: a sender that parked during the
+        // exchange must not encrypt under pre-swap keys.
         guard bypassRehandshakeGate || !rehandshakeInProgress else {
             throw SendspinClientError.handshakeIncomplete
         }
+        guard lifecycle == .running || lifecycle == .shuttingDown else {
+            // `.shuttingDown` permits the intentional goodbye; everything else
+            // on a stopped connection is rejected.
+            throw SendspinClientError.notConnected
+        }
+        if Task.isCancelled {
+            // The pairing timeout handler detaches its own task handle before
+            // clearing, so a cancelled sender here is always abandoned work:
+            // don't burn a nonce for a frame nothing will carry.
+            throw CancellationError()
+        }
+
         let data = try SendspinEncoding.makeEncoder().encode(message)
         var plaintext = Data([NoiseFrameType.json])
         plaintext.append(data)
@@ -16,17 +67,7 @@ extension SendspinConnection {
                 try await transport.sendBinary(frame)
             }
         } catch {
-            // A failed send is terminal: encryption already consumed AEAD nonces,
-            // so the peer can never decrypt a later frame — the session is
-            // cryptographically dead, not merely degraded. Tear down (unless a
-            // teardown is already driving this send) and surface the error.
-            if !shuttingDown {
-                shuttingDown = true
-                if disconnectReason == nil {
-                    disconnectReason = .connectionLost(nil)
-                }
-                await transport.disconnect()
-            }
+            await failOutbound()
             throw error
         }
     }
@@ -35,10 +76,6 @@ extension SendspinConnection {
 
     /// Send a facade-initiated protocol message, wrapping transport errors in
     /// the public typed ``SendspinClientError/sendFailed(_:)``.
-    ///
-    /// All outbound protocol I/O flows through this actor — the facade holds
-    /// no send path of its own — so public API sends serialize with the
-    /// handshake/time/state/goodbye sequencing this actor owns.
     func send(clientMessage message: some Codable & Sendable) async throws {
         guard lifecycle == .running, !rehandshakeInProgress else {
             throw SendspinClientError.handshakeIncomplete
@@ -63,7 +100,9 @@ extension SendspinConnection {
         while clientStateDirty {
             clientStateDirty = false
             let payload = currentClientStatePayload()
-            try await sendWrapped(ClientStateMessage(payload: payload))
+            // Forward the rehandshake bypass: handleServerActivate publishes the
+            // post-swap full state while rehandshakeInProgress is still true.
+            try await sendWrapped(ClientStateMessage(payload: payload), bypassRehandshakeGate: bypassRehandshakeGate)
             if payload.player != nil {
                 playerStateSent = true
             }

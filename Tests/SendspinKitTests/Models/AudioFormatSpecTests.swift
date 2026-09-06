@@ -715,9 +715,9 @@ private actor BlockingStartAudioOutputPlatformMonitor: AudioOutputPlatformMonito
     private(set) var stopCount = 0
     private(set) var activeListenerCount = 0
 
-    func startMonitoring() -> AsyncStream<AudioOutputPlatformObservation> {
+    func startMonitoring() async -> AsyncStream<AudioOutputPlatformObservation> {
         startCount += 1
-        gate.enterAndWaitForCancellationThenRelease()
+        await gate.enterAndWaitForCancellationThenRelease()
         activeListenerCount = 1
         return AsyncStream { _ in }
     }
@@ -734,9 +734,7 @@ private actor BlockingStartAudioOutputPlatformMonitor: AudioOutputPlatformMonito
     }
 
     nonisolated func waitUntilStartWasCancelled() async {
-        while !gate.hasObservedCancellation {
-            await Task.yield()
-        }
+        await gate.waitForCancellationObserved()
     }
 
     nonisolated func releaseStart() {
@@ -745,38 +743,71 @@ private actor BlockingStartAudioOutputPlatformMonitor: AudioOutputPlatformMonito
 }
 
 private final class BlockingStartGate: @unchecked Sendable {
-    private let condition = NSCondition()
+    private let lock = NSLock()
     private var entered = false
     private var cancellationObserved = false
     private var released = false
+    private var waiter: CheckedContinuation<Void, Never>?
+    private var cancelWaiters: [CheckedContinuation<Void, Never>] = []
 
-    func enterAndWaitForCancellationThenRelease() {
-        condition.lock()
-        entered = true
-        condition.broadcast()
-        while !released {
-            if Task.isCancelled {
-                cancellationObserved = true
-                condition.broadcast()
+    func enterAndWaitForCancellationThenRelease() async {
+        // Suspends until releaseStart(); cancellation is observed but does not
+        // resume, preserving the start-after-cancel race.
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                entered = true
+                if released {
+                    lock.unlock()
+                    continuation.resume()
+                    return
+                }
+                if Task.isCancelled {
+                    cancellationObserved = true
+                }
+                waiter = continuation
+                lock.unlock()
             }
-            _ = condition.wait(until: Date(timeIntervalSinceNow: 0.01))
+        } onCancel: {
+            lock.lock()
+            cancellationObserved = true
+            let observers = cancelWaiters
+            cancelWaiters.removeAll()
+            lock.unlock()
+            for observer in observers {
+                observer.resume()
+            }
         }
-        condition.unlock()
     }
 
     var hasEntered: Bool {
-        condition.withLock { entered }
+        lock.withLock { entered }
     }
 
     var hasObservedCancellation: Bool {
-        condition.withLock { cancellationObserved }
+        lock.withLock { cancellationObserved }
     }
 
     func release() {
-        condition.lock()
+        lock.lock()
         released = true
-        condition.broadcast()
-        condition.unlock()
+        let waiter = waiter
+        self.waiter = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    func waitForCancellationObserved() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if cancellationObserved {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            cancelWaiters.append(continuation)
+            lock.unlock()
+        }
     }
 }
 

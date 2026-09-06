@@ -43,6 +43,11 @@ actor MockTransport: ClientDialingTransport {
     private var goodbyeGateEnabled = false
     private var goodbyeGateContinuation: CheckedContinuation<Void, Never>?
 
+    /// Opt-in mirror of `NWWebSocketTransport`: senders that reach the
+    /// transport already-cancelled are rejected. Defaults off so existing
+    /// tests that queue non-cancelled senders stay unchanged.
+    private var honorCancellationSends = false
+
     // MARK: - SendspinTransport conformance
 
     func connect() async throws {}
@@ -55,6 +60,9 @@ actor MockTransport: ClientDialingTransport {
         if shouldFailOnSend {
             throw MockTransportError.simulatedFailure
         }
+        if honorCancellationSends, Task.isCancelled {
+            throw CancellationError()
+        }
         await parkNextOutboundFrameIfArmed()
         sentTextMessages.append(Data(text.utf8))
         outbox.yield(.text(text))
@@ -63,6 +71,9 @@ actor MockTransport: ClientDialingTransport {
     func sendBinary(_ data: Data) async throws {
         if shouldFailOnSend {
             throw MockTransportError.simulatedFailure
+        }
+        if honorCancellationSends, Task.isCancelled {
+            throw CancellationError()
         }
         await parkNextOutboundFrameIfArmed()
         sentBinaryMessages.append(data)
@@ -152,6 +163,11 @@ actor MockTransport: ClientDialingTransport {
     /// ``releaseGoodbyeGate()``.
     func enableGoodbyeGate() {
         goodbyeGateEnabled = true
+    }
+
+    /// Opt in to rejecting sends that arrive here already-cancelled.
+    func setHonorCancellationSends(_ value: Bool) {
+        honorCancellationSends = value
     }
 
     /// Whether an outbound frame is currently parked on the gate.

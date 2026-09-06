@@ -178,39 +178,42 @@ enum NoiseSessionEstablisher {
         )
     }
 
-    /// Pull the next frame, requiring a text frame within `timeout`. The timeout is
-    /// a watchdog that *disconnects the transport*: a parked `nextFrame()` pull is
-    /// released by `disconnect()` finishing the frame stream, never by cancellation
-    /// (the FrameInbox contract).
+    /// Both timeout and caller cancellation must disconnect: cancellation alone
+    /// cannot release a parked `FrameInbox` pull. A fired watchdog wins over an
+    /// arriving frame because the transport is already being closed.
     private static func nextTextFrame(
         from transport: any SendspinTransport,
         timeout: Duration
     ) async throws -> Data {
-        let watchdog = Task { () -> Bool in
-            do {
-                try await Task.sleep(for: timeout)
-            } catch {
-                return false // cancelled: the frame arrived in time
+        try await withTaskCancellationHandler(operation: {
+            let watchdog = Task { () -> Bool in
+                do {
+                    try await Task.sleep(for: timeout)
+                } catch {
+                    return false // cancelled: the frame arrived in time
+                }
+                await transport.disconnect()
+                return true
             }
-            await transport.disconnect()
-            return true
-        }
-        let frame = await transport.nextFrame()
-        watchdog.cancel()
-        let timedOut = await watchdog.value
-        // The deadline wins a race with an arriving frame: the watchdog already
-        // disconnected, so proceeding would run the next phase on a dead connection.
-        if timedOut {
-            throw HandshakeError.timeout
-        }
+            let frame = await transport.nextFrame()
+            watchdog.cancel()
+            let timedOut = await watchdog.value
+            // The deadline wins a race with an arriving frame: the watchdog already
+            // disconnected, so proceeding would run the next phase on a dead connection.
+            if timedOut {
+                throw HandshakeError.timeout
+            }
 
-        switch frame {
-        case let .text(text):
-            return Data(text.utf8)
-        case .binary:
-            throw HandshakeError.malformed
-        case nil:
-            throw HandshakeError.transportClosed
-        }
+            switch frame {
+            case let .text(text):
+                return Data(text.utf8)
+            case .binary:
+                throw HandshakeError.malformed
+            case nil:
+                throw HandshakeError.transportClosed
+            }
+        }, onCancel: {
+            Task { await transport.disconnect() }
+        })
     }
 }

@@ -70,11 +70,30 @@ extension SendspinClient {
             case .keepExisting:
                 await HandshakeDriver.reject(outcome, reason: .concurrentAttempt, on: transport)
             case .acceptIncoming:
+                // Promotion is a session transition: claim a fresh epoch so a parked
+                // connect/accept at the older epoch cannot install over this winner.
+                guard sessionEpoch == arbitrationEpoch else {
+                    await transport.disconnect()
+                    return
+                }
+                sessionEpoch += 1
+                let promotionEpoch = sessionEpoch
                 if let incumbent = retireSession() {
                     await incumbent.disconnect(reason: .anotherServer)
                 }
+                // The incumbent teardown suspends; a disconnect may have landed.
+                guard sessionEpoch == promotionEpoch else {
+                    await transport.disconnect()
+                    return
+                }
                 updateConnectionState(.connecting)
-                await setupConnection(with: transport, outcome: outcome, negotiation: negotiation)
+                await setupConnection(
+                    with: transport,
+                    outcome: outcome,
+                    negotiation: negotiation,
+                    runtimeConfiguration: runtimeConfiguration,
+                    setupEpoch: promotionEpoch
+                )
             }
         } catch {
             await transport.disconnect()
