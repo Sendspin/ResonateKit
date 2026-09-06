@@ -891,7 +891,9 @@ actor AudioEngine {
             startupReleaseDeferredChunks.removeAll(keepingCapacity: true)
             startupReleaseInProgress = false
             cancelStartupDeadline()
-            signalStartupCoordinator(.stateChanged)
+            // No self-wake: the restored chunks are identical to the ones that just
+            // failed the scan, so `.stateChanged` here spins forever. Only a fresh
+            // arrival changes the outcome, and the chunk path signals the coordinator.
             return
         }
         if candidate.index > 0 {

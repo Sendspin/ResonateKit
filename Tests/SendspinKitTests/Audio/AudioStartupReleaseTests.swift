@@ -348,6 +348,49 @@ struct AudioStartupReleaseTests {
         await engine.shutdown()
     }
 
+    /// With no self-wake in the all-stale branch, the coordinator parks after the stale
+    /// chunks drain instead of re-scanning identical data; a new arrival re-enters it.
+    @Test("an all-stale startup buffer parks without self-woken re-evaluation")
+    func allStaleBufferParksWithoutSelfWake() async throws {
+        let clock = StubClock(anchorToNow: true)
+        let output = SpyAudioOutput()
+        let scheduler = AudioScheduler(clockSync: clock)
+        let engine = AudioEngine(output: output, scheduler: scheduler, clock: clock, enableStartupBuffering: true)
+        let format = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 48_000, bitDepth: 16)
+        await engine.start()
+        await engine.commands.enqueue(.streamStart(format, codecHeader: nil))
+
+        let staleCount = 3
+        for index in 0 ..< staleCount {
+            await engine.commands.enqueue(
+                .chunk(Data(repeating: UInt8(index), count: 100), ts: -1_000_000 + Int64(index) * 20_000)
+            )
+        }
+        #expect(
+            await waitUntil { await engine.appliedCommandKinds().count(where: { $0 == .chunk }) == staleCount },
+            "the stale chunks should have reached the engine"
+        )
+        #expect(await !output.recordedCalls.contains("startPrepared()"), "nothing is viable yet")
+
+        // Without parking, the self-signal would keep burning evaluations on the same
+        // buffer; a tight spread here means the coordinator went back to waiting.
+        let afterDrain = await engine.startupReleaseEvaluations
+        try? await Task.sleep(for: .milliseconds(100))
+        let afterQuiet = await engine.startupReleaseEvaluations
+        #expect(
+            afterQuiet - afterDrain <= staleCount,
+            "the all-stale buffer kept re-evaluating (\(afterDrain) -> \(afterQuiet))"
+        )
+
+        // A single viable chunk arrival must restart the stalled release.
+        await engine.commands.enqueue(.chunk(Data(repeating: 0xAA, count: 100), ts: 1_500_000))
+        #expect(
+            await waitUntil(timeout: .seconds(3)) { await engine.startupReleaseCommits == 1 },
+            "a fresh viable chunk must commit a release"
+        )
+        await engine.shutdown()
+    }
+
     @Test("startup release remains single-flight while a deadline probe is suspended")
     func startupReleaseRemainsSingleFlightWhileDeadlineProbeIsSuspended() async throws {
         let clock = StubClock(anchorToNow: true)
