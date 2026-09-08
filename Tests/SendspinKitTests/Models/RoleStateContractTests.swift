@@ -53,7 +53,27 @@ struct RoleStateContractTests {
         #expect(throws: ConfigurationError.missingSpectrumConfiguration) {
             try VisualizerStateObject(types: [.spectrum], rateMax: 30)
         }
-        // Mutation claim: removing either construction-level guard must fail its corresponding case.
+        #expect(throws: ConfigurationError.emptyVisualizerTypes) {
+            try VisualizerConfiguration(types: [], rateMax: 30)
+        }
+        #expect(throws: ConfigurationError.nonPositiveVisualizerRate) {
+            try VisualizerConfiguration(types: [.loudness], rateMax: 0)
+        }
+        #expect(throws: ConfigurationError.missingSpectrumConfiguration) {
+            try VisualizerConfiguration(
+                types: [.loudness],
+                rateMax: 30,
+                spectrum: SpectrumConfiguration(nDispBins: 8, scale: .lin, fMin: 20, fMax: 20_000)
+            )
+        }
+        #expect(throws: ConfigurationError.invalidSpectrumConfiguration) {
+            try VisualizerConfiguration(
+                types: [.spectrum],
+                rateMax: 30,
+                spectrum: SpectrumConfiguration(nDispBins: 0, scale: .lin, fMin: 20, fMax: 20_000)
+            )
+        }
+        // Mutation claim: removing a construction guard must fail one of these cases.
     }
 
     @Test("visualizer state encodes the complete requested object")

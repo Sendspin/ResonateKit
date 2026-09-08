@@ -127,12 +127,79 @@ public struct ArtworkData: Sendable, Equatable {
     public let localDisplayTime: Int64?
 }
 
+/// The server-negotiated visualizer stream configuration from `stream/start`.
+public struct VisualizerStreamConfiguration: Sendable, Equatable {
+    public let types: [VisualizerType]
+    public let rateMax: Int
+    /// Whether beat frames carry meaningful downbeat flags; absent unless beat is streamed.
+    public let tracksDownbeats: Bool?
+    /// Present only when spectrum is among ``types``.
+    public let spectrum: SpectrumConfiguration?
+
+    public init(types: [VisualizerType], rateMax: Int, tracksDownbeats: Bool? = nil, spectrum: SpectrumConfiguration? = nil) {
+        self.types = types
+        self.rateMax = rateMax
+        self.tracksDownbeats = tracksDownbeats
+        self.spectrum = spectrum
+    }
+}
+
+/// Validity shared by frames in one visualizer stream generation.
+/// Queued frames can outlive stream boundaries or session replacement; check
+/// ``VisualizerData/isRenderable`` before drawing.
+public final class VisualizerFrameValidity: @unchecked Sendable {
+    private let lock = NSLock()
+    private var valid = true
+
+    public init() {}
+
+    /// Whether this frame still belongs to the active visualizer stream.
+    public var isValid: Bool {
+        lock.withLock { valid }
+    }
+
+    func invalidate() {
+        lock.withLock { valid = false }
+    }
+}
+
 /// Visualizer bytes received from the visualizer stream.
 public struct VisualizerData: Sendable, Equatable {
+    /// The visualization type encoded by the binary message type byte.
+    public let type: VisualizerType
     /// Raw visualizer payload bytes after the Sendspin binary header.
     public let data: Data
     /// Local absolute display time in microseconds.
     public let localDisplayTime: Int64
+    /// Stream-generation validity. Check this immediately before rendering.
+    public let validity: VisualizerFrameValidity
+
+    /// True only while this frame belongs to the active stream and its display deadline is fresh.
+    public var isRenderable: Bool {
+        isRenderable(at: MonotonicClock.absoluteMicroseconds())
+    }
+
+    /// True only while valid and not already late at the supplied local instant.
+    public func isRenderable(at localNow: Int64) -> Bool {
+        validity.isValid && localDisplayTime > localNow
+    }
+
+    public init(
+        type: VisualizerType,
+        data: Data,
+        localDisplayTime: Int64,
+        validity: VisualizerFrameValidity = VisualizerFrameValidity()
+    ) {
+        self.type = type
+        self.data = data
+        self.localDisplayTime = localDisplayTime
+        self.validity = validity
+    }
+
+    public static func == (lhs: VisualizerData, rhs: VisualizerData) -> Bool {
+        lhs.type == rhs.type && lhs.data == rhs.data && lhs.localDisplayTime == rhs.localDisplayTime
+            && lhs.validity === rhs.validity
+    }
 }
 
 public enum PairingCodeFormat: String, Codable, Sendable, Equatable {
@@ -187,6 +254,8 @@ public enum ClientEvent: Sendable, Equatable {
     /// The server cleared the complete color role state.
     case colorStateCleared
     case artworkStreamStarted([StreamArtworkChannelConfig])
+    /// Visualizer stream started with the server-negotiated configuration.
+    case visualizerStreamStarted(VisualizerStreamConfiguration)
     /// Server changed the output delay via `server/command`. The host app should
     /// persist this value and pass it back as `initialOutputDelayMs` on next launch.
     case outputDelayChanged(milliseconds: Int)
@@ -417,6 +486,7 @@ public struct ControllerState: Sendable, Hashable {
 public enum StreamRole: String, Sendable, Hashable {
     case player
     case artwork
+    case visualizer
 }
 
 /// Errors thrown by `SendspinClient` methods.

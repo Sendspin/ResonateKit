@@ -84,6 +84,8 @@ actor SpyAudioOutput: AudioOutput {
     var forcedPlayPCMThrow: Error?
     var decodeDelay: TimeInterval = 0
     var forcedDecodeThrow: Error?
+    private(set) var decodedInputs: [Data] = []
+    var decodeOutputs: [Data: Data] = [:]
     var playbackState: Bool = false
     var underrunCountValue: Int64 = 0
     var outputDeviceProbeDelay: Duration = .zero
@@ -93,7 +95,12 @@ actor SpyAudioOutput: AudioOutput {
     private var blockedOutputDeviceProbe: CheckedContinuation<Void, Never>?
     private var shouldBlockNextPCM = false
     private var blockedPCM: CheckedContinuation<Void, Never>?
+    private var shouldBlockNextDecode = false
+    private var blockedDecode: CheckedContinuation<Void, Never>?
+    private var shouldBlockNextSwitch = false
+    private var blockedSwitch: CheckedContinuation<Void, Never>?
     private(set) var playedPCMTimestamps: [Int64] = []
+    private(set) var playedPCMData: [Data] = []
 
     func blockNextOutputDeviceProbe() {
         shouldBlockNextOutputDeviceProbe = true
@@ -111,6 +118,15 @@ actor SpyAudioOutput: AudioOutput {
     func releaseBlockedPCM() {
         blockedPCM?.resume()
         blockedPCM = nil
+    }
+
+    func blockNextSwitch() {
+        shouldBlockNextSwitch = true
+    }
+
+    func releaseBlockedSwitch() {
+        blockedSwitch?.resume()
+        blockedSwitch = nil
     }
 
     var isPlaying: Bool {
@@ -205,8 +221,29 @@ actor SpyAudioOutput: AudioOutput {
         }
     }
 
+    func switchHardwareFormat(format: AudioFormatSpec) async throws {
+        recordedCalls.append("switchHardwareFormat(\(format.codec))")
+        if shouldBlockNextSwitch {
+            shouldBlockNextSwitch = false
+            await withCheckedContinuation { continuation in
+                blockedSwitch = continuation
+            }
+        }
+        if let error = forcedStartThrow {
+            throw error
+        }
+        playbackState = true
+    }
+
     func decode(_ data: Data) async throws -> Data {
+        decodedInputs.append(data)
         recordedCalls.append("decode(\(data.count) bytes)")
+        if shouldBlockNextDecode {
+            shouldBlockNextDecode = false
+            await withCheckedContinuation { continuation in
+                blockedDecode = continuation
+            }
+        }
         if decodeDelay > 0 {
             try? await Task.sleep(nanoseconds: UInt64(decodeDelay * 1_000_000_000))
         }
@@ -214,7 +251,7 @@ actor SpyAudioOutput: AudioOutput {
             throw error
         }
         // Return a minimal PCM payload (2 samples per channel for testing)
-        return Data(repeating: 0, count: 4)
+        return decodeOutputs[data] ?? Data(repeating: 0, count: 4)
     }
 
     func playPCM(
@@ -224,6 +261,7 @@ actor SpyAudioOutput: AudioOutput {
     ) async throws {
         recordedCalls.append("playPCM(\(pcm.count) bytes)")
         playedPCMTimestamps.append(serverTimestamp)
+        playedPCMData.append(pcm)
         if shouldBlockNextPCM {
             shouldBlockNextPCM = false
             await withCheckedContinuation { continuation in
@@ -430,11 +468,302 @@ struct AudioEngineTests {
         #expect(stats.dropped == stats.droppedLate)
     }
 
-    /// A format change must discard PCM already scheduled for the previous output format.
-    /// Leaving that private queue intact delays the new AudioQueue behind old-format audio
-    /// and can feed a new decoder's PCM into the old output path.
-    @Test("format changes flush pre-scheduled old-format output")
-    func formatChangeFlushesPreScheduledOutput() async throws {
+    @Test("route invalidation drops old ingress and preserves FIFO clear/end")
+    func routeInvalidationDropsOldIngressAndPreservesFIFO() async throws {
+        let clock = StubClock()
+        let output = SpyAudioOutput()
+        let scheduler = AudioScheduler(clockSync: clock, playbackWindow: 30)
+        let engine = AudioEngine(output: output, scheduler: scheduler, clock: clock)
+        await engine.start()
+
+        let oldFormat = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 44_100, bitDepth: 16)
+        let newFormat = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 48_000, bitDepth: 16)
+        let inFlightOld = Data([0xA1])
+        let invalidatedOld = Data([0xA2])
+        let postRouteNew = Data([0xB1])
+        await engine.commands.enqueue(.streamStart(oldFormat, codecHeader: nil))
+        #expect(
+            await waitUntil { await engine.appliedCommandKinds().contains(.streamStart) },
+            "the initial stream start must apply before testing the route barrier"
+        )
+
+        await output.blockNextDecode()
+        engine.enqueueAudioChunk(data: inFlightOld, timestamp: 1)
+        #expect(
+            await waitUntil { await output.recordedCalls.contains("decode(1 bytes)") },
+            "the pre-invalidation chunk must be in flight"
+        )
+
+        // Invalidation precedes the replacement stream announcement. Bytes arriving in this
+        // window are old-format wire data and must be discarded, not retained for the new decoder.
+        engine.beginRouteInvalidation()
+        engine.enqueueAudioChunk(data: invalidatedOld, timestamp: 2)
+        engine.enqueueRouteInvalidatedFormatChange(format: newFormat, codecHeader: nil)
+        engine.enqueueAudioChunk(data: postRouteNew, timestamp: 3)
+        await output.releaseBlockedDecode()
+
+        let rebuilt = await waitUntil(timeout: .seconds(3)) {
+            let calls = await output.recordedCalls
+            let kinds = await engine.appliedCommandKinds()
+            let decodedInputs = await output.decodedInputs
+            return calls.contains("stop()")
+                && kinds.contains(.routeInvalidatedFormatChange)
+                && decodedInputs.contains(postRouteNew)
+        }
+        #expect(rebuilt)
+
+        let decoded = await output.decodedInputs
+        #expect(decoded.contains(inFlightOld), "the pre-invalidation in-flight decode may finish under the old decoder")
+        #expect(!decoded.contains(invalidatedOld), "old bytes received during invalidation must never be decoded")
+        #expect(decoded.contains(postRouteNew), "bytes after the route command must use the new decoder")
+        #expect(decoded.last == postRouteNew, "the post-route sentinel must remain after the route barrier")
+
+        // Clear and end stay in the same FIFO; no hidden route buffer may release data after them.
+        engine.commands.enqueue(.streamClear(roles: ["player"]))
+        engine.commands.enqueue(.streamEnd(roles: ["player"]))
+        #expect(
+            await waitUntil {
+                let kinds = await engine.appliedCommandKinds()
+                return kinds.suffix(2).elementsEqual([.streamClear, .streamEnd])
+            }
+        )
+        let decodedAfterLifecycle = await output.decodedInputs
+        await engine.shutdown()
+
+        #expect(decodedAfterLifecycle == decoded, "clear/end must not release invalidated chunks later")
+        #expect(await output.recordedCalls.contains("stop()"))
+    }
+
+    @Test("route invalidation closes at end and reopens for the next stream")
+    func routeInvalidationResetsAtStreamBoundary() async throws {
+        let clock = StubClock(anchorToNow: true)
+        let output = SpyAudioOutput()
+        let scheduler = AudioScheduler(clockSync: clock, playbackWindow: 30)
+        let engine = AudioEngine(output: output, scheduler: scheduler, clock: clock)
+        let oldFormat = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 44_100, bitDepth: 16)
+        let newFormat = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 48_000, bitDepth: 16)
+        let inFlightOld = Data([0xC1])
+        let invalidatedOld = Data([0xC2])
+        let newInput = Data([0xD1])
+        let oldPCM = Data([0xE1])
+        let newPCM = Data([0xF1])
+
+        await engine.start()
+        engine.enqueueStreamStart(format: oldFormat, codecHeader: nil)
+        #expect(await waitUntil { await engine.appliedCommandKinds().contains(.streamStart) })
+        await output.setDecodeOutput(inFlightOld, pcm: oldPCM)
+        await output.setDecodeOutput(invalidatedOld, pcm: oldPCM)
+        await output.setDecodeOutput(newInput, pcm: newPCM)
+        await output.blockNextDecode()
+        engine.enqueueAudioChunk(data: inFlightOld, timestamp: 0)
+        #expect(
+            await waitUntil { await output.recordedCalls.contains("decode(1 bytes)") },
+            "the old decode must be in flight before the lifecycle boundary"
+        )
+
+        engine.beginRouteInvalidation()
+        #expect(await engine.isRouteInvalidatedForTesting())
+        engine.enqueueAudioChunk(data: invalidatedOld, timestamp: 1)
+        engine.enqueueStreamEnd(roles: [StreamRole.player.rawValue])
+        #expect(await engine.isRouteInvalidatedForTesting())
+        engine.enqueueStreamStart(format: newFormat, codecHeader: nil)
+        let routeIsOpen = await engine.isRouteInvalidatedForTesting() == false
+        #expect(routeIsOpen)
+        engine.enqueueAudioChunk(data: newInput, timestamp: 0)
+        await output.releaseBlockedDecode()
+
+        #expect(
+            await waitUntil(timeout: .seconds(3)) { await output.playedPCMData.contains(newPCM) },
+            "the first PCM of the new stream must reach output"
+        )
+        let played = await output.playedPCMData
+        let decoded = await output.decodedInputs
+        await engine.shutdown()
+
+        #expect(played == [newPCM], "neither invalidated nor in-flight old PCM may reach output")
+        #expect(!decoded.contains(invalidatedOld), "bytes received while invalidated must be dropped")
+        #expect(decoded.contains(inFlightOld), "the in-flight decode may finish but must not be scheduled")
+    }
+
+    @Test("a plain stream generation delivers its first PCM chunk")
+    func plainGenerationFirstDelivery() async throws {
+        let clock = StubClock(anchorToNow: true)
+        let output = SpyAudioOutput()
+        let scheduler = AudioScheduler(clockSync: clock, playbackWindow: 30)
+        let engine = AudioEngine(output: output, scheduler: scheduler, clock: clock)
+        let format = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 48_000, bitDepth: 16)
+        let sentinel = Data([0xF1, 0x01])
+        await engine.start()
+        await engine.commands.enqueue(.streamStart(format, codecHeader: nil))
+        await output.setDecodeOutput(sentinel, pcm: Data([0xA1, 0x01]))
+        await engine.commands.enqueue(.chunk(sentinel, ts: 0))
+
+        #expect(
+            await waitUntil(timeout: .seconds(3)) { await output.playedPCMData.contains(Data([0xA1, 0x01])) },
+            "the first boundaryless stream chunk must reach playback"
+        )
+        let played = await output.playedPCMData
+        await engine.shutdown()
+        #expect(played == [Data([0xA1, 0x01])])
+    }
+
+    @Test("startup buffering delivers its first PCM chunk")
+    func startupGenerationFirstDelivery() async throws {
+        let clock = StubClock(anchorToNow: true)
+        let output = SpyAudioOutput()
+        let scheduler = AudioScheduler(clockSync: clock)
+        let engine = AudioEngine(output: output, scheduler: scheduler, clock: clock, enableStartupBuffering: true)
+        let format = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 48_000, bitDepth: 16)
+        let sentinel = Data([0xF2, 0x02])
+        let pcm = Data([0xA2, 0x02])
+        await engine.start()
+        await engine.commands.enqueue(.streamStart(format, codecHeader: nil))
+        await output.setDecodeOutput(sentinel, pcm: pcm)
+        await engine.commands.enqueue(.chunk(sentinel, ts: 1_000_000))
+
+        #expect(
+            await waitUntil(timeout: .seconds(3)) { await output.playedPCMData.contains(pcm) },
+            "startup buffering must deliver the first primed chunk"
+        )
+        let calls = await output.recordedCalls
+        await engine.shutdown()
+        #expect(calls.contains("startPrepared()"))
+    }
+
+    @Test("a route rebuild delivers its first replacement PCM chunk")
+    func routeRebuildFirstDelivery() async throws {
+        let clock = StubClock(anchorToNow: true)
+        let output = SpyAudioOutput()
+        let scheduler = AudioScheduler(clockSync: clock, playbackWindow: 30)
+        let engine = AudioEngine(output: output, scheduler: scheduler, clock: clock)
+        let oldFormat = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 44_100, bitDepth: 16)
+        let newFormat = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 48_000, bitDepth: 16)
+        let oldSentinel = Data([0xE3, 0x03])
+        let oldPCM = Data([0x91, 0x03])
+        let newSentinel = Data([0xF3, 0x03])
+        let newPCM = Data([0xA3, 0x03])
+        await engine.start()
+        await engine.commands.enqueue(.streamStart(oldFormat, codecHeader: nil))
+        #expect(await waitUntil { await engine.appliedCommandKinds().contains(.streamStart) })
+        await output.setDecodeOutput(oldSentinel, pcm: oldPCM)
+        await output.setDecodeOutput(newSentinel, pcm: newPCM)
+        await engine.commands.enqueue(
+            .chunk(oldSentinel, ts: MonotonicClock.absoluteMicroseconds() + 10_000_000)
+        )
+        #expect(await waitUntil { await scheduler.stats.received == 1 })
+
+        engine.enqueueRouteInvalidatedFormatChange(format: newFormat, codecHeader: nil)
+        engine.enqueueAudioChunk(data: newSentinel, timestamp: 0)
+
+        #expect(
+            await waitUntil(timeout: .seconds(3)) { await output.playedPCMData.contains(newPCM) },
+            "the first chunk after a route rebuild must not be dropped"
+        )
+        let played = await output.playedPCMData
+        let calls = await output.recordedCalls
+        await engine.shutdown()
+        #expect(played.contains(newPCM))
+        #expect(!played.contains(oldPCM), "route rebuild must discard queued old-format PCM")
+        #expect(calls.contains("start(pcm)"))
+    }
+
+    @Test("stream clear in active production buffering does not restart startup")
+    func activeProductionBufferingClearContinuesPlayback() async throws {
+        let clock = StubClock(anchorToNow: true)
+        let output = SpyAudioOutput()
+        let scheduler = AudioScheduler(clockSync: clock, playbackWindow: 30)
+        let engine = AudioEngine(output: output, scheduler: scheduler, clock: clock, enableStartupBuffering: true)
+        let format = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 48_000, bitDepth: 16)
+        let first = Data([0xF4, 0x04])
+        let replacement = Data([0xA4, 0x04])
+        await engine.start()
+        await engine.commands.enqueue(.streamStart(format, codecHeader: nil))
+        await output.setDecodeOutput(first, pcm: Data([0xB4, 0x04]))
+        await engine.commands.enqueue(.chunk(first, ts: 1_000_000))
+        #expect(await waitUntil(timeout: .seconds(3)) { await output.recordedCalls.contains("startPrepared()") })
+        let callsBeforeClear = await output.recordedCalls
+
+        engine.commands.enqueue(.streamClear(roles: ["player"]))
+        #expect(await waitUntil { await engine.appliedCommandKinds().count(where: { $0 == .streamClear }) == 1 })
+        await output.setDecodeOutput(replacement, pcm: Data([0xB5, 0x04]))
+        await engine.commands.enqueue(.chunk(replacement, ts: 0))
+
+        #expect(
+            await waitUntil(timeout: .seconds(3)) { await output.playedPCMData.contains(Data([0xB5, 0x04])) },
+            "active buffering must continue directly after stream clear"
+        )
+        let callsAfterClear = await output.recordedCalls
+        #expect(callsAfterClear.count(where: { $0.hasPrefix("prepare(") }) == callsBeforeClear.count(where: { $0.hasPrefix("prepare(") }))
+        #expect(callsAfterClear.count(where: { $0 == "startPrepared()" }) == callsBeforeClear.count(where: { $0 == "startPrepared()" }))
+        #expect(callsAfterClear.count(where: { $0 == "stop()" }) == callsBeforeClear.count(where: { $0 == "stop()" }))
+        await engine.shutdown()
+    }
+
+    @Test("ordered clear invalidates a suspended hardware switch")
+    func orderedClearWhileSwitchSuspendedDropsPendingChunk() async throws {
+        let clock = StubClock(anchorToNow: true)
+        let output = SpyAudioOutput()
+        let scheduler = AudioScheduler(clockSync: clock, playbackWindow: 30)
+        let engine = AudioEngine(output: output, scheduler: scheduler, clock: clock)
+        let oldFormat = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 48_000, bitDepth: 16)
+        let newFormat = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 44_100, bitDepth: 16)
+        let stale = Data([0xF5, 0x05])
+        let replacement = Data([0xA5, 0x05])
+        await engine.start()
+        await engine.commands.enqueue(.streamStart(oldFormat, codecHeader: nil))
+        await output.blockNextSwitch()
+        await engine.commands.enqueue(.formatChange(newFormat, codecHeader: nil))
+        await output.setDecodeOutput(stale, pcm: Data([0xB6, 0x05]))
+        await engine.commands.enqueue(.chunk(stale, ts: 0))
+        #expect(await waitUntil { await output.recordedCalls.contains("switchHardwareFormat(pcm)") })
+
+        engine.commands.enqueue(.streamClear(roles: ["player"]))
+        #expect(await waitUntil { await engine.appliedCommandKinds().count(where: { $0 == .streamClear }) == 1 })
+        await output.releaseBlockedSwitch()
+        await output.setDecodeOutput(replacement, pcm: Data([0xB7, 0x05]))
+        await engine.commands.enqueue(.chunk(replacement, ts: 0))
+
+        #expect(await waitUntil(timeout: .seconds(3)) { await output.playedPCMData.contains(Data([0xB7, 0x05])) })
+        let played = await output.playedPCMData
+        await engine.shutdown()
+        #expect(!played.contains(Data([0xB6, 0x05])))
+    }
+
+    @Test("rapid ordered changes deliver each generation in order")
+    func rapidOrderedChangesDeliverSentinelsInOrder() async throws {
+        let clock = StubClock(anchorToNow: true)
+        let output = SpyAudioOutput()
+        let scheduler = AudioScheduler(clockSync: clock, playbackWindow: 30)
+        let engine = AudioEngine(output: output, scheduler: scheduler, clock: clock)
+        let initial = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 48_000, bitDepth: 16)
+        let firstFormat = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 44_100, bitDepth: 16)
+        let secondFormat = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 32_000, bitDepth: 16)
+        let first = Data([0xF6, 0x06])
+        let second = Data([0xF7, 0x07])
+        let firstPCM = Data([0xB8, 0x06])
+        let secondPCM = Data([0xB9, 0x07])
+        await engine.start()
+        await engine.commands.enqueue(.streamStart(initial, codecHeader: nil))
+        await output.setDecodeOutput(first, pcm: firstPCM)
+        await output.setDecodeOutput(second, pcm: secondPCM)
+        await engine.commands.enqueue(.formatChange(firstFormat, codecHeader: nil))
+        await engine.commands.enqueue(.chunk(first, ts: 0))
+        await engine.commands.enqueue(.formatChange(secondFormat, codecHeader: nil))
+        await engine.commands.enqueue(.chunk(second, ts: 0))
+
+        #expect(
+            await waitUntil(timeout: .seconds(3)) { await output.playedPCMData.count == 2 },
+            "rapid ordered generations must both reach playback"
+        )
+        let played = await output.playedPCMData
+        await engine.shutdown()
+        #expect(played == [firstPCM, secondPCM])
+    }
+
+    /// A format change preserves PCM already scheduled for the previous output format.
+    /// The render boundary must let that audio drain before switching hardware format.
+    @Test("format changes preserve pre-scheduled old-format output")
+    func formatChangePreservesPreScheduledOutput() async throws {
         let clock = StubClock()
         let output = SpyAudioOutput()
         let scheduler = AudioScheduler(clockSync: clock, playbackWindow: 30)
@@ -457,16 +786,18 @@ struct AudioEngineTests {
             await output.recordedCalls.contains("swapDecoder(pcm)")
         }
         #expect(decoderSwapped, "the replacement decoder should be ready")
-        #expect(await scheduler.queuedChunks.isEmpty, "old-format scheduled PCM must be flushed")
+        #expect(
+            await scheduler.queuedChunks.contains(where: { $0.originalTimestamp == oldFormatTimestamp }),
+            "old-format scheduled PCM must remain until its render boundary"
+        )
 
         await engine.shutdown()
     }
 
     /// Chunks already in the command FIFO when renegotiation is announced are old-format
-    /// audio too. The ingress generation barrier must discard them before decode, even though
-    /// the format command is FIFO-ordered behind them.
-    @Test("format renegotiation invalidates queued old-format commands before decode")
-    func formatChangeInvalidatesQueuedOldFormatCommands() async throws {
+    /// audio too. FIFO application must decode them before the format boundary.
+    @Test("format renegotiation preserves queued old-format commands before decode")
+    func formatChangePreservesQueuedOldFormatCommands() async throws {
         let clock = StubClock()
         let output = SpyAudioOutput()
         let scheduler = AudioScheduler(clockSync: clock, playbackWindow: 30)
@@ -491,8 +822,10 @@ struct AudioEngineTests {
 
         let calls = await output.recordedCalls
         let decodeCalls = calls.filter { $0.hasPrefix("decode(") }
-        #expect(decodeCalls.count == 1, "only the post-renegotiation chunk may be decoded")
-        #expect(await scheduler.queuedChunks.allSatisfy { $0.generation == 1 })
+        #expect(decodeCalls.count == 2, "both FIFO-ordered chunks must be decoded")
+        // streamStart establishes generation 1; the format command advances to generation 2.
+        #expect(await scheduler.queuedChunks.contains(where: { $0.generation == 1 }))
+        #expect(await scheduler.queuedChunks.contains(where: { $0.generation == 2 }))
 
         await engine.shutdown()
     }
@@ -604,15 +937,14 @@ struct AudioEngineTests {
         await engine.shutdown()
     }
 
-    /// A `swapDecoder` failure falls back to a full `output.start()`, re-establishing
-    /// a valid decoder for new-format chunks, and still surfaces `.formatApplied`.
-    @Test("swapDecoder failure restarts output and reports .formatApplied")
-    func swapDecoderFailureFallsBackToRestart() async throws {
+    /// A decoder failure leaves the old queue alive and quarantines the new generation.
+    @Test("swapDecoder failure preserves old output and reports .startFailed")
+    func swapDecoderFailurePreservesOldOutput() async throws {
         struct TestError: Error {}
 
-        let clock = StubClock()
+        let clock = StubClock(anchorToNow: true)
         let output = SpyAudioOutput()
-        let scheduler = AudioScheduler(clockSync: clock)
+        let scheduler = AudioScheduler(clockSync: clock, playbackWindow: 30)
         let engine = AudioEngine(output: output, scheduler: scheduler, clock: clock)
 
         await engine.start()
@@ -625,22 +957,23 @@ struct AudioEngineTests {
 
         await output.setForcedSwapThrow(TestError())
         await engine.commands.enqueue(.formatChange(fmt1, codecHeader: nil))
+        await engine.commands.enqueue(.chunk(Data(repeating: 2, count: 100), ts: 0))
         try? await Task.sleep(for: .milliseconds(150))
 
-        let formatApplied = await awaitReport(from: engine, timeoutMs: 100) {
-            if case let .formatApplied(applied) = $0 {
-                applied == fmt1
+        let startFailed = await awaitReport(from: engine, timeoutMs: 100) {
+            if case .startFailed = $0 {
+                true
             } else {
                 false
             }
         }
+        let calls = await output.recordedCalls
         await engine.shutdown()
 
-        #expect(formatApplied, "swap-failure fallback must still report .formatApplied")
-
-        // Two start() calls: the initial streamStart and the swap-failure restart.
-        let starts = await output.recordedCalls.filter { $0.hasPrefix("start(") }
-        #expect(starts.count >= 2, "swap failure must trigger a fallback output.start(); got \(starts)")
+        #expect(startFailed, "swap failure must report .startFailed")
+        #expect(calls.filter { $0.hasPrefix("start(") }.count == 1, "old output must not restart")
+        #expect(!calls.contains("stop()"), "decoder failure must not stop old hardware")
+        #expect(!calls.contains("playPCM(4 bytes)"), "quarantined new-generation PCM must not render")
     }
 
     /// Helper: run the telemetry loop across `ticks` underrun increments (one rise per
@@ -1071,8 +1404,21 @@ extension SpyAudioOutput {
         forcedPlayPCMThrow = error
     }
 
+    func setDecodeOutput(_ input: Data, pcm: Data) {
+        decodeOutputs[input] = pcm
+    }
+
     func setDecodeDelay(_ delay: TimeInterval) {
         decodeDelay = delay
+    }
+
+    func blockNextDecode() {
+        shouldBlockNextDecode = true
+    }
+
+    func releaseBlockedDecode() {
+        blockedDecode?.resume()
+        blockedDecode = nil
     }
 
     func setUnderrunCount(_ count: Int64) {

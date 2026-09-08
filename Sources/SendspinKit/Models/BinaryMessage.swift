@@ -21,8 +21,32 @@ enum BinaryMessageType: UInt8 {
     case artworkChannel2 = 10
     case artworkChannel3 = 11
 
-    /// Visualizer role (16-23).
-    case visualizerData = 16
+    /// Visualizer role: loudness (16).
+    case visualizerLoudness = 16
+    /// Visualizer role: beat (17).
+    case visualizerBeat = 17
+    /// Visualizer role: dominant frequency peak (18).
+    case visualizerFPeak = 18
+    /// Visualizer role: spectrum (19).
+    case visualizerSpectrum = 19
+    /// Visualizer role: energy peak (20).
+    case visualizerPeak = 20
+
+    /// Source compatibility alias for the original visualizer message case.
+    static var visualizerData: BinaryMessageType {
+        .visualizerLoudness
+    }
+
+    var visualizerType: VisualizerType? {
+        switch self {
+        case .visualizerLoudness: .loudness
+        case .visualizerBeat: .beat
+        case .visualizerFPeak: .fPeak
+        case .visualizerSpectrum: .spectrum
+        case .visualizerPeak: .peak
+        default: nil
+        }
+    }
 
     /// The artwork channel index (0-3) for artwork message types, or `nil` for non-artwork types.
     var artworkChannel: Int? {
@@ -205,7 +229,7 @@ struct BinaryMessage {
             digit = nil
             self.data = data.subdata(in: 1 ..< data.count)
 
-        case .visualizerData:
+        case .visualizerLoudness, .visualizerBeat, .visualizerFPeak, .visualizerSpectrum, .visualizerPeak:
             digit = nil
             guard data.count >= Self.headerSize else { return nil }
             let extractedTimestamp = Self.readInt64(data, offset: 1)

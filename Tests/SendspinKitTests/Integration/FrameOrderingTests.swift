@@ -36,12 +36,12 @@ private func artworkPart(channel: Int, bytes: Data) -> Data {
 }
 
 /// Build a binary `visualizer` frame (type byte + big-endian timestamp + visualizer data).
-private func visualizerFrame(index: Int = 0, baseTimestamp: Int64 = 1_000_000) -> Data {
+private func visualizerFrame(index: Int = 0, baseTimestamp: Int64 = MonotonicClock.absoluteMicroseconds() + 500_000) -> Data {
     var frame = Data()
     frame.append(BinaryMessageType.visualizerData.rawValue)
     var timestamp = (baseTimestamp + Int64(index) * 25_000).bigEndian
     frame.append(Data(bytes: &timestamp, count: 8))
-    frame.append(Data(repeating: 0xAB, count: 64)) // Dummy visualizer data
+    frame.append(Data([0x00, 0x01])) // Valid loudness payload
     return frame
 }
 

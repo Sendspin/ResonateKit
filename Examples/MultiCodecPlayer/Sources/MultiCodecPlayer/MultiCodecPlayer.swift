@@ -168,7 +168,7 @@ struct MultiCodecPlayer: AsyncParsableCommand {
 
             case .paired, .pairingCodeChanged, .pairingAttemptEnded, .audioOutputChanged, .outputFormatStatusChanged, .streamingFailed,
                  .streamCleared, .controllerStateUpdated, .controllerStateCleared, .colorStateUpdated, .colorStateCleared,
-                 .artworkStreamStarted, .outputDelayChanged, .lastPlayedServerChanged:
+                 .artworkStreamStarted, .visualizerStreamStarted, .outputDelayChanged, .lastPlayedServerChanged:
                 break
             }
         }

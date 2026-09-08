@@ -647,8 +647,12 @@ protocol AudioOutput: Actor, Sendable {
     func stop()
 
     /// Swap the decoder for seamless format transitions.
-    /// Called before chunks in the new format arrive.
+    /// Called in wire order before chunks in the new format arrive.
     func swapDecoder(format: AudioFormatSpec, codecHeader: Data?) throws
+
+    /// Rebuild only the hardware queue at the render boundary. The decoder selected by
+    /// ``swapDecoder`` remains installed, so stateful compressed decoders are not reset.
+    func switchHardwareFormat(format: AudioFormatSpec) async throws
 
     /// Decode a chunk of encoded audio into PCM.
     /// Throws if decoding fails.

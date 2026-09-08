@@ -74,4 +74,27 @@ struct StreamMessageTests {
         #expect(message.payload.player?.bitDepth == 16)
         #expect(message.payload.player?.codecHeader == "AQIDBA==")
     }
+
+    @Test
+    func decodeVisualizerStreamConfigurationUsesConditionalWireKeys() throws {
+        let spectrum = SpectrumConfiguration(nDispBins: 32, scale: .log, fMin: 40, fMax: 16_000)
+        let message = StreamStartMessage(payload: StreamStartPayload(
+            player: nil,
+            artwork: nil,
+            visualizer: StreamStartVisualizer(
+                types: [.beat, .spectrum], rateMax: 60, tracksDownbeats: true, spectrum: spectrum
+            )
+        ))
+        let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(message)) as? [String: Any]
+        let payload = try #require(object?["payload"] as? [String: Any])
+        let visualizer = try #require(payload["visualizer"] as? [String: Any])
+        #expect(visualizer["types"] as? [String] == ["beat", "spectrum"])
+        #expect(visualizer["rate_max"] as? Int == 60)
+        #expect(visualizer["tracks_downbeats"] as? Bool == true)
+        #expect(visualizer["spectrum"] != nil)
+
+        let noBeat = StreamStartVisualizer(types: [.loudness], rateMax: 30)
+        let noBeatObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(noBeat)) as? [String: Any]
+        #expect(noBeatObject?["tracks_downbeats"] == nil)
+    }
 }

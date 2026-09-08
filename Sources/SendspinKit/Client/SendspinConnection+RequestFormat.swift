@@ -1,5 +1,10 @@
 import Foundation
 
+enum OutputFormatStreamStartDecision: Sendable {
+    case rejected
+    case accepted(AudioFormatTransitionPolicy?)
+}
+
 struct PendingOutputFormatRequest: Sendable, Equatable {
     enum Origin: Sendable, Equatable {
         case automatic
@@ -9,6 +14,7 @@ struct PendingOutputFormatRequest: Sendable, Equatable {
     let target: AudioFormatSpec
     let origin: Origin
     let generation: UInt64
+    let routeEpoch: UInt64
 }
 
 extension SendspinConnection {
@@ -29,7 +35,8 @@ extension SendspinConnection {
             pendingOutputFormatRequest = PendingOutputFormatRequest(
                 target: target,
                 origin: .application,
-                generation: outputNegotiationGeneration
+                generation: outputNegotiationGeneration,
+                routeEpoch: outputRouteEpoch
             )
             automaticRequestsSuppressed = true
             outputRequestDeadlineTask?.cancel()
@@ -105,6 +112,12 @@ extension SendspinConnection {
         publishTruthfulOutputFormatStatus()
 
         let sampleRate = AudioOutputCapabilityService.normalizedSampleRateKey(for: snapshot)
+        let activeSampleRate = announcedPlayerStream?.format.sampleRate
+        if playerStreamActive, let activeSampleRate, sampleRate != activeSampleRate {
+            outputRouteEpoch &+= 1
+            routeInvalidationPending = true
+            audioEngine.beginRouteInvalidation()
+        }
         guard sampleRate != settledOutputSampleRate else {
             outputNegotiationGeneration &+= 1
             outputSettleTask?.cancel()
@@ -127,29 +140,35 @@ extension SendspinConnection {
         }
     }
 
-    func handleOutputFormatStreamStart(_ format: AudioFormatSpec) async -> Bool {
+    func handleOutputFormatStreamStart(_ format: AudioFormatSpec) async -> OutputFormatStreamStartDecision {
         if outputSampleRatePolicy == .requireCurrentOutput {
             guard let outputRate = settledOutputSampleRate else {
                 await failOutputFormat(.routeUnavailable)
-                return false
+                return .rejected
             }
             guard format.sampleRate == outputRate, effectivePlayerFormats?.contains(format) == true else {
                 await failOutputFormat(.noMatchingFormat)
-                return false
+                return .rejected
             }
         }
 
         outputRequestDeadlineTask?.cancel()
         outputRequestDeadlineTask = nil
+        var transitionPolicy: AudioFormatTransitionPolicy?
         if let pending = pendingOutputFormatRequest {
             pendingOutputFormatRequest = nil
             if pending.target != format {
                 handledAutomaticSampleRate = settledOutputSampleRate
             }
         }
+        if routeInvalidationPending,
+           format.sampleRate == outputSnapshot?.sampleRate {
+            transitionPolicy = .routeInvalidated
+            routeInvalidationPending = false
+        }
         publishTruthfulOutputFormatStatus(activeFormat: format)
         await requestAutomaticFormatIfNeeded(sampleRate: settledOutputSampleRate)
-        return true
+        return .accepted(transitionPolicy)
     }
 
     func resetOutputFormatNegotiationForStreamBoundary() {
@@ -159,6 +178,7 @@ extension SendspinConnection {
         outputRequestDeadlineTask?.cancel()
         outputRequestDeadlineTask = nil
         pendingOutputFormatRequest = nil
+        routeInvalidationPending = false
         automaticRequestsSuppressed = false
         handledAutomaticSampleRate = nil
         publishTruthfulOutputFormatStatus()
@@ -210,7 +230,8 @@ extension SendspinConnection {
         pendingOutputFormatRequest = PendingOutputFormatRequest(
             target: target,
             origin: .automatic,
-            generation: requestGeneration
+            generation: requestGeneration,
+            routeEpoch: outputRouteEpoch
         )
         publishOutputFormatStatus(.requesting(target))
 

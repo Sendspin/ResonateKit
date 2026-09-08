@@ -91,4 +91,30 @@ struct PlayerCommandObject: Codable, Equatable {
         self.mute = mute
         self.outputDelayMs = outputDelayMs
     }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        command = try container.decode(PlayerCommand.self, forKey: .command)
+        volume = try container.decodeIfPresent(Int.self, forKey: .volume)
+        mute = try container.decodeIfPresent(Bool.self, forKey: .mute)
+        outputDelayMs = try container.decodeIfPresent(Int.self, forKey: .outputDelayMs)
+
+        let valid: Bool = switch command {
+        case .volume:
+            volume.map { (0 ... 100).contains($0) } == true
+                && !container.contains(.mute) && !container.contains(.outputDelayMs)
+        case .mute:
+            mute != nil && !container.contains(.volume) && !container.contains(.outputDelayMs)
+        case .setOutputDelay:
+            outputDelayMs.map { (0 ... maxOutputDelayMs).contains($0) } == true
+                && !container.contains(.volume) && !container.contains(.mute)
+        }
+        guard valid else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .command,
+                in: container,
+                debugDescription: "Player command has an invalid argument set or range"
+            )
+        }
+    }
 }

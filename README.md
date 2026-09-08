@@ -197,8 +197,15 @@ schedule color changes alongside audio, artwork, or visualizer updates.
 ### Visualizer Configuration
 
 Configure the visualizer role when creating the client. The requested types, maximum update rate,
-and optional spectrum parameters are published in `client/state`; visualizer bytes are delivered
-through `client.visualizerData`.
+and optional spectrum parameters are published in `client/state`; the server's negotiated types,
+rate, conditional `tracks_downbeats`, and spectrum parameters are exposed by the
+`.visualizerStreamStarted` event and `currentVisualizerStreamConfiguration`. Visualizer frames are
+delivered through `client.visualizerData`; each `VisualizerData` includes its `type`, raw payload,
+local display deadline, and a stream-generation validity token. Consumers must check
+`frame.isRenderable` immediately before drawing: this rejects frames invalidated by
+`stream/clear`, `stream/end`, configuration changes, or session replacement, and also rejects
+frames whose display deadline has become stale while queued. Frames whose translated deadline
+has already passed at arrival are discarded.
 
 ```swift
 let visualizer = try SendspinClient(

@@ -183,7 +183,10 @@ public struct VisualizerConfiguration: Sendable {
         bufferCapacity: Int = 65_536
     ) throws(ConfigurationError) {
         guard bufferCapacity > 0 else { throw .nonPositiveBufferCapacity }
-        guard !types.contains(.spectrum) || spectrum != nil else { throw .missingSpectrumConfiguration }
+        guard !types.isEmpty else { throw .emptyVisualizerTypes }
+        guard rateMax > 0 else { throw .nonPositiveVisualizerRate }
+        guard types.contains(.spectrum) == (spectrum != nil) else { throw .missingSpectrumConfiguration }
+        try spectrum?.validate()
         self.types = types
         self.rateMax = rateMax
         self.spectrum = spectrum
@@ -202,7 +205,10 @@ public struct VisualizerStateObject: Codable, Equatable, Sendable {
     public let spectrum: SpectrumConfiguration?
     enum CodingKeys: String, CodingKey { case types; case rateMax = "rate_max"; case spectrum }
     public init(types: [VisualizerType], rateMax: Int, spectrum: SpectrumConfiguration? = nil) throws(ConfigurationError) {
-        guard !types.contains(.spectrum) || spectrum != nil else { throw .missingSpectrumConfiguration }
+        guard !types.isEmpty else { throw .emptyVisualizerTypes }
+        guard rateMax > 0 else { throw .nonPositiveVisualizerRate }
+        guard types.contains(.spectrum) == (spectrum != nil) else { throw .missingSpectrumConfiguration }
+        try spectrum?.validate()
         self.init(uncheckedTypes: types, rateMax: rateMax, spectrum: spectrum)
     }
 
@@ -222,6 +228,10 @@ public struct SpectrumConfiguration: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey { case nDispBins = "n_disp_bins"; case scale; case fMin = "f_min"; case fMax = "f_max" }
     public init(nDispBins: Int, scale: SpectrumScale, fMin: Int, fMax: Int) {
         self.nDispBins = nDispBins; self.scale = scale; self.fMin = fMin; self.fMax = fMax
+    }
+
+    func validate() throws(ConfigurationError) {
+        guard nDispBins > 0, fMin >= 0, fMax > fMin else { throw .invalidSpectrumConfiguration }
     }
 }
 

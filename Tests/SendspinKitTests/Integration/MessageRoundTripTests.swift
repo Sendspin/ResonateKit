@@ -132,27 +132,19 @@ struct MessageRoundTripTests {
     }
 
     @Test
-    func groupUpdate_withNullFields() throws {
-        // Test partial updates with null fields (common in delta updates)
-        let jsonWithNulls = Data("""
+    func groupUpdate_requiresCompleteSnapshot() throws {
+        let jsonWithMissingField = Data("""
         {
             "type": "group/update",
             "payload": {
                 "playback_state": "playing",
-                "group_id": "group-123",
-                "group_name": null
+                "group_id": "group-123"
             }
         }
         """.utf8)
 
-        // Now uses custom CodingKeys, no strategy needed
-        let decoder = JSONDecoder()
-
-        let message = try decoder.decode(GroupUpdateMessage.self, from: jsonWithNulls)
-
-        #expect(message.type == "group/update")
-        #expect(message.payload.playbackState == .playing)
-        #expect(message.payload.groupId == "group-123")
-        #expect(message.payload.groupName == nil)
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder().decode(GroupUpdateMessage.self, from: jsonWithMissingField)
+        }
     }
 }

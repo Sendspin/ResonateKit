@@ -41,6 +41,9 @@ enum ConnectionEvent: Equatable {
     /// Artwork stream started with channel configs
     case artworkStreamStarted([StreamArtworkChannelConfig])
 
+    /// Visualizer stream started with the server-negotiated configuration.
+    case visualizerStreamStarted(VisualizerStreamConfiguration)
+
     /// Audio stream was accepted by the control plane and its format validated.
     case streamAccepted(AudioFormatSpec)
 

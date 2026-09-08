@@ -77,7 +77,7 @@ struct BinaryMessageTests {
 
     @Test
     func decodeVisualizerDataMessage() throws {
-        let fftData = Data([0x10, 0x20, 0x30, 0x40])
+        let fftData = Data([0x10, 0x20])
         let frame = Self.makeFrame(
             type: BinaryMessageType.visualizerData.rawValue,
             timestamp: 5_000_000,
@@ -87,6 +87,7 @@ struct BinaryMessageTests {
         let message = try #require(BinaryMessage(data: frame))
 
         #expect(message.type == .visualizerData)
+        #expect(message.type.visualizerType == .loudness)
         #expect(message.timestamp == 5_000_000)
         #expect(message.data == fftData)
     }
@@ -250,6 +251,10 @@ struct BinaryMessageTests {
         #expect(BinaryMessageType.artworkChannel2.rawValue == 10)
         #expect(BinaryMessageType.artworkChannel3.rawValue == 11)
         #expect(BinaryMessageType.visualizerData.rawValue == 16)
+        #expect(BinaryMessageType.visualizerBeat.rawValue == 17)
+        #expect(BinaryMessageType.visualizerFPeak.rawValue == 18)
+        #expect(BinaryMessageType.visualizerSpectrum.rawValue == 19)
+        #expect(BinaryMessageType.visualizerPeak.rawValue == 20)
     }
 
     @Test

@@ -38,7 +38,6 @@ actor AudioScheduler {
     private var readIndex: Int = 0
     private var counters = SchedulerStats()
     private var timerTask: Task<Void, Never>?
-
     // AsyncStream for output
     private let chunkContinuation: AsyncStream<ScheduledChunk>.Continuation
     let scheduledChunks: AsyncStream<ScheduledChunk>
@@ -102,7 +101,10 @@ actor AudioScheduler {
 
         while low < high {
             let mid = (low + high) / 2
-            if queue[mid].playTimeMicroseconds < chunk.playTimeMicroseconds {
+            let existing = queue[mid]
+            if existing.generation < chunk.generation
+                || (existing.generation == chunk.generation
+                    && existing.playTimeMicroseconds < chunk.playTimeMicroseconds) {
                 low = mid + 1
             } else {
                 high = mid
@@ -182,7 +184,8 @@ actor AudioScheduler {
         chunkContinuation.finish()
     }
 
-    /// Clear all queued chunks
+    /// Clear all queued chunks. Values already yielded by AsyncStream are rejected by the
+    /// engine lifecycle token; the scheduler itself has no format commit gate.
     func clear() {
         queue.removeAll()
         readIndex = 0

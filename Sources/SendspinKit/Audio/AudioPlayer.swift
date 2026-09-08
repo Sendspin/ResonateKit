@@ -114,6 +114,16 @@ private struct LockedState: @unchecked Sendable {
     /// written to the ring now will be audible.
     var totalFramesEnqueued: Int64 = 0
 
+    /// Number of buffers currently owned by AudioQueue. Unlike the cumulative frame count this
+    /// reaches zero when a finite drain stops re-enqueuing buffers.
+    var enqueuedBufferCount: Int64 = 0
+    /// Stops the callback from manufacturing silence after the ring tail is consumed.
+    var draining = false
+    /// True once the last old-format buffer has returned from AudioQueue.
+    var drainComplete = false
+    /// The one buffer containing the final ring tail, when a tail buffer had to be enqueued.
+    var drainTailBuffer: AudioQueueBufferRef?
+
     /// True from `prepare()` until the first real PCM reaches the ring. The queue is running
     /// on silence in that window so the device pays its spin-up before audio depends on it,
     /// and an empty ring there is the intent rather than a dropout.
@@ -194,6 +204,9 @@ actor AudioPlayer {
     private nonisolated(unsafe) var audioQueueForDeinit: AudioQueueRef?
     private var decoder: AudioDecoder?
     private var currentFormat: AudioFormatSpec?
+    /// Changes whenever the AudioQueue handle is replaced or disposed. Boundary waits capture
+    /// this identity and never dereference a handle after a lifecycle change.
+    private var queueIdentity: UInt64 = 0
 
     /// Buffers held back for `startPrepared()` when pre-warm is disabled; empty otherwise.
     private var pendingStartBuffers: [AudioQueueBufferRef] = []
@@ -277,20 +290,40 @@ actor AudioPlayer {
     /// - `deinit` disposes the queue directly (can't call actor-isolated `stop()`)
     /// Do not insert throwing calls between `AudioQueueNewOutput` and `audioQueue = queue`.
     func prepare(format: AudioFormatSpec, codecHeader: Data?) throws {
+        try prepareQueue(format: format, codecHeader: codecHeader, createDecoder: true, preserveDecoder: false)
+    }
+
+    private func prepareQueue(
+        format: AudioFormatSpec,
+        codecHeader: Data?,
+        createDecoder: Bool,
+        preserveDecoder: Bool
+    ) throws {
         let currentPlayerID = playerID
         let currentlyPlaying = _isPlaying
+        let selectedDecoder = preserveDecoder ? decoder : nil
+        defer {
+            if preserveDecoder {
+                decoder = selectedDecoder
+            }
+        }
         let prepareLog = "prepare player=\(currentPlayerID) format=\(format.codec.rawValue) isPlaying=\(currentlyPlaying)"
         Log.audio.debug("\(prepareLog, privacy: .public)")
         stop()
+        if preserveDecoder {
+            decoder = selectedDecoder
+        }
         outputTransitionCallback?(.willBegin(sampleRate: format.sampleRate))
 
-        decoder = try AudioDecoderFactory.create(
-            codec: format.codec,
-            sampleRate: format.sampleRate,
-            channels: format.channels,
-            bitDepth: format.bitDepth,
-            header: codecHeader
-        )
+        if createDecoder {
+            decoder = try AudioDecoderFactory.create(
+                codec: format.codec,
+                sampleRate: format.sampleRate,
+                channels: format.channels,
+                bitDepth: format.bitDepth,
+                header: codecHeader
+            )
+        }
 
         var audioFormat = AudioStreamBasicDescription()
         audioFormat.mSampleRate = Float64(format.sampleRate)
@@ -322,6 +355,7 @@ actor AudioPlayer {
         }
 
         audioQueue = queue
+        queueIdentity &+= 1
         currentFormat = format
 
         // Build the effective format for the process callback — uses the actual
@@ -360,6 +394,10 @@ actor AudioPlayer {
             state.spinUpUs = -1
             state.prewarming = true
             state.totalFramesEnqueued = 0
+            state.enqueuedBufferCount = 0
+            state.draining = false
+            state.drainComplete = false
+            state.drainTailBuffer = nil
             state.startupPadFrames = 0
             state.enqueueFailures = 0
             state.startupOffsetUs = nil
@@ -387,6 +425,10 @@ actor AudioPlayer {
         }
 
         try allocateAndPrewarm(queue: queue)
+    }
+
+    private func prepareHardwareQueue(format: AudioFormatSpec) throws {
+        try prepareQueue(format: format, codecHeader: nil, createDecoder: false, preserveDecoder: true)
     }
 
     /// Allocate the queue's buffers and start it on silence.
@@ -559,12 +601,17 @@ actor AudioPlayer {
         AudioQueueDispose(queue, true)
 
         audioQueue = nil
+        queueIdentity &+= 1
         decoder = nil
         currentFormat = nil
         _isPlaying = false
 
         lockedState.withLock { state in
             state.pcmRingBuffer.reset()
+            state.enqueuedBufferCount = 0
+            state.draining = false
+            state.drainComplete = false
+            state.drainTailBuffer = nil
             state.cursorMicroseconds = 0
             state.cursorRemainder = 0
             state.framesConsumed = 0
@@ -584,7 +631,57 @@ actor AudioPlayer {
             bitDepth: format.bitDepth,
             header: codecHeader
         )
-        currentFormat = format
+        // The hardware queue continues to use its existing format until the render boundary.
+        // `currentFormat` describes that queue, not the decoder selected for future chunks.
+    }
+
+    /// Reconfigure the hardware queue at an ordered render boundary. The engine invokes this
+    /// after older scheduled chunks have been handed to the current queue; finite-drain the queue's
+    /// existing buffers before disposing it so old PCM is not truncated or replaced with silence.
+    func switchHardwareFormat(format: AudioFormatSpec) async throws {
+        guard audioQueue != nil, _isPlaying else {
+            throw AudioPlayerError.notStarted
+        }
+        let identity = queueIdentity
+        lockedState.withLock {
+            $0.draining = true
+            $0.drainComplete = false
+            $0.drainTailBuffer = nil
+        }
+        var switched = false
+        defer {
+            if !switched {
+                lockedState.withLock {
+                    $0.draining = false
+                    $0.drainComplete = false
+                    $0.drainTailBuffer = nil
+                }
+            }
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while true {
+            // The queue is only borrowed for this synchronous snapshot. Never retain its
+            // pointer across the sleep: stop() can dispose it while this task is suspended.
+            guard queueIdentity == identity, audioQueue != nil, _isPlaying else {
+                throw AudioPlayerError.notStarted
+            }
+            let state = lockedState.withLock { locked in
+                (locked.enqueuedBufferCount, locked.pcmRingBuffer.availableToRead, locked.drainComplete)
+            }
+            if state.2, state.0 == 0, state.1 == 0 {
+                break
+            }
+            guard ContinuousClock.now < deadline else {
+                throw AudioPlayerError.queueStartFailed(-1)
+            }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        guard queueIdentity == identity, audioQueue != nil, _isPlaying else {
+            throw AudioPlayerError.notStarted
+        }
+        try prepareHardwareQueue(format: format)
+        try startPrepared()
+        switched = true
     }
 
     /// Decode compressed audio data to PCM
@@ -879,6 +976,7 @@ actor AudioPlayer {
         let outOffset: Int
         let cb: AudioProcessCallback?
         let cbFormat: AudioFormatSpec?
+        let enqueue: Bool
     }
 
     private static func updateCorrectionSchedule(
@@ -979,8 +1077,19 @@ actor AudioPlayer {
         // audio thread and `dest` is a stack-local pointer to the AQ buffer.
         let result = lockedState.withLockUnchecked { state -> FillResult in
             let fs = state.frameSize
+            if state.enqueuedBufferCount > 0 {
+                state.enqueuedBufferCount -= 1
+            }
+            if state.draining, buffer == state.drainTailBuffer {
+                state.drainTailBuffer = nil
+                state.drainComplete = true
+                return FillResult(outOffset: 0, cb: nil, cbFormat: nil, enqueue: false)
+            }
             guard fs > 0 else {
-                return FillResult(outOffset: 0, cb: nil, cbFormat: nil)
+                return FillResult(outOffset: 0, cb: nil, cbFormat: nil, enqueue: false)
+            }
+            if state.draining, state.drainComplete {
+                return FillResult(outOffset: 0, cb: nil, cbFormat: nil, enqueue: false)
             }
 
             let sr = state.sampleRate
@@ -1051,12 +1160,27 @@ actor AudioPlayer {
             let peak = Self.peakMagnitude(dest, byteCount: outOffset, bytesPerSample: fs / max(1, channels))
             state.peakOutputLevel = max(state.peakOutputLevel, peak)
 
-            return FillResult(outOffset: outOffset, cb: cb, cbFormat: cbFormat)
+            var enqueue = true
+            if state.draining, state.pcmRingBuffer.availableToRead == 0 {
+                if outOffset > 0 {
+                    // Keep the tail buffer in AudioQueue once. Its next callback proves the
+                    // final old-format PCM has played and can complete the drain.
+                    state.drainTailBuffer = buffer
+                } else if state.enqueuedBufferCount == 0 {
+                    state.drainComplete = true
+                } else {
+                    // Silence buffers already in flight are allowed to return, but must not
+                    // be manufactured again while the queue is draining.
+                    enqueue = false
+                }
+            }
+            return FillResult(outOffset: outOffset, cb: cb, cbFormat: cbFormat, enqueue: enqueue)
         }
 
         // --- Post-lock: silence fill, process callback, enqueue ---
         // None of this touches shared state.
 
+        guard result.enqueue else { return }
         if result.outOffset < capacity {
             memset(dest + result.outOffset, 0, capacity - result.outOffset)
         }
@@ -1070,10 +1194,15 @@ actor AudioPlayer {
             cb(mutableBuffer, cbFormat)
         }
 
+        enqueueFilledBuffer(queue: queue, buffer: buffer, capacity: capacity)
+    }
+
+    private nonisolated func enqueueFilledBuffer(queue: AudioQueueRef, buffer: AudioQueueBufferRef, capacity: Int) {
         buffer.pointee.mAudioDataByteSize = UInt32(capacity)
         let enqueueStatus = AudioQueueEnqueueBuffer(queue, buffer, 0, nil)
-        // Only touched on failure, so the normal path pays nothing for the check.
-        if enqueueStatus != noErr {
+        if enqueueStatus == noErr {
+            lockedState.withLock { $0.enqueuedBufferCount += 1 }
+        } else {
             lockedState.withLock { $0.enqueueFailures += 1 }
         }
     }

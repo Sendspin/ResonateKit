@@ -72,6 +72,8 @@ public final class SendspinClient {
     /// `stream/clear` leaves both untouched — the stream continues (per spec).
     var playerStreamActive = false
     var artworkStreamActive = false
+    /// The server-negotiated visualizer stream configuration, or nil when inactive.
+    public private(set) var currentVisualizerStreamConfiguration: VisualizerStreamConfiguration?
     /// Cached from `playerConfig?.emitRawAudioEvents` to avoid optional chaining on every audio chunk.
     var shouldEmitRawAudio = false
 
@@ -509,8 +511,10 @@ public final class SendspinClient {
         try requireOpen()
         let pendingID = registerPendingTransport(transport)
         defer { pendingTransports.removeValue(forKey: pendingID) }
-        if connectionState == .disconnected {
-            connectionState = .connecting
+        if connection == nil {
+            if connectionState == .disconnected {
+                connectionState = .connecting
+            }
             // Claim the epoch before the first suspension: the dial window holds no
             // `connection`, so only the epoch tracks caller intent.
             sessionEpoch += 1
@@ -648,6 +652,7 @@ public final class SendspinClient {
 
         let outcomeServerId = outcome.serverId
         let outcomeActivities = outcome.activities
+        let outcomePairing = outcome.pairing
         let outcomeServerName = outcome.serverName
         let outcomeActiveRoles = outcome.activeRoles
         let outcomeCategory = outcome.matchedCandidate.category
@@ -749,12 +754,17 @@ public final class SendspinClient {
         connection = newConnection
         currentOutputFormatStatus = nil
 
-        // Spawn a task to start the connection and drain its control events.
-        // `self` is held weakly and upgraded per event: a parked drain must not
-        // be a self-retain cycle (client → task → closure → client), or dropping
-        // the last user reference can never reach deinit and its safety net.
+        // Pairing setup sends its first protocol message. Mark the connection
+        // running for that handoff send, but defer the supervisor until setup is
+        // complete so the live reader cannot race the initial activation replay.
+        if let outcomePairing {
+            await newConnection.prepareInitialPairingActivation(outcomePairing)
+        }
+        await newConnection.start()
+
+        // Drain control events without retaining the client: upgrade weak `self` per event.
+        // Otherwise a parked task prevents deinit and its cleanup safety net.
         drainConnectionEventsTask = Task { [weak self] in
-            await newConnection.start()
             guard newConnection === self?.connection else { return }
             if let sequence = self?.audioOutputSnapshotSequence,
                sequence > negotiation.outputSnapshotSequence,
@@ -1021,6 +1031,10 @@ public final class SendspinClient {
             artworkStreamActive = true
             emitEvent(.artworkStreamStarted(channels))
 
+        case let .visualizerStreamStarted(configuration):
+            currentVisualizerStreamConfiguration = configuration
+            emitEvent(.visualizerStreamStarted(configuration))
+
         case let .streamAccepted(format):
             playerStreamActive = true
             updateStreamFormat(format)
@@ -1043,6 +1057,9 @@ public final class SendspinClient {
             }
             if roles == nil || roles?.contains(StreamRole.artwork.rawValue) == true {
                 artworkStreamActive = false
+            }
+            if roles == nil || roles?.contains(StreamRole.visualizer.rawValue) == true {
+                currentVisualizerStreamConfiguration = nil
             }
             emitEvent(.streamEnded(roles: roles))
 
@@ -1151,6 +1168,7 @@ public final class SendspinClient {
         shouldEmitRawAudio = false
         playerStreamActive = false
         artworkStreamActive = false
+        currentVisualizerStreamConfiguration = nil
     }
 
     /// Clear server-reported state that is scoped to a single connection. A

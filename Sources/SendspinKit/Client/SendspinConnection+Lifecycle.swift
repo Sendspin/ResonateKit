@@ -56,7 +56,7 @@ extension SendspinConnection {
                     }
                     await handleAudioChunk(message, arrival: applicationArrival)
                 } else {
-                    await route(binary: plaintext)
+                    await route(binary: plaintext, arrival: applicationArrival)
                 }
             } catch let error as NoiseError {
                 Log.client.error("Noise frame rejected: \(String(describing: error))")
@@ -179,8 +179,11 @@ extension SendspinConnection {
 
         stopOutputFormatNegotiation()
 
-        // Invalidate the token
+        // Invalidate both the session and any queued visualizer frames.
         validity.invalidate()
+        visualizerFrameValidity.invalidate()
+        pairingAttemptActive = false
+        pendingPairingPsk = nil
         if dynamicPairingAttempt != nil {
             controlSink.enqueue(.pairingCodeChanged(nil))
             dynamicPairingAttempt = nil
@@ -209,6 +212,7 @@ extension SendspinConnection {
         stopOutputFormatNegotiation()
         lifecycle = .stopped
         validity.invalidate()
+        visualizerFrameValidity.invalidate()
         controlSink.finish()
         await transport.disconnect()
     }

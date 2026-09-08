@@ -56,6 +56,10 @@ actor SendspinConnection {
     var settledOutputSampleRate: Int?
     var outputFormatStatus: OutputFormatStatus?
     var pendingOutputFormatRequest: PendingOutputFormatRequest?
+    /// Advances only when the observed output sample rate changes while a stream is active.
+    var outputRouteEpoch: UInt64 = 0
+    /// Remains set until an accepted stream start retires PCM from the invalidated route.
+    var routeInvalidationPending = false
     var automaticRequestsSuppressed = false
     var handledAutomaticSampleRate: Int?
     var outputSettleTask: Task<Void, Never>?
@@ -78,6 +82,9 @@ actor SendspinConnection {
     var playerStreamActive = false
     var artworkStreamActive = false
     var visualizerStreamActive = false
+    var visualizerStreamConfiguration: VisualizerStreamConfiguration?
+    /// Invalidates queued public frames when the visualizer stream boundary advances.
+    var visualizerFrameValidity = VisualizerFrameValidity()
     var artworkStateSent = false
     var artworkStreamChannels: [StreamArtworkChannelConfig] = []
     var artworkTransfer: ArtworkTransfer?
@@ -138,6 +145,10 @@ actor SendspinConnection {
 
     var awaitingRehandshakeActivation = false
     var activeRoles: Set<VersionedRole>
+    /// Set synchronously when an admitted pairing activation starts setup. It
+    /// covers the suspension before a concrete PSK/code attempt is installed.
+    var pairingAttemptActive = false
+    var initialPairingActivation: PairingDirective?
     var pendingPairingPsk: Psk?
     var pairingAttemptTask: Task<Void, Never>?
 
@@ -286,6 +297,8 @@ actor SendspinConnection {
         self.serverName = serverName
         self.activities = activities
         self.activeRoles = activeRoles
+        pairingAttemptActive = false
+        initialPairingActivation = nil
         pendingPairingPsk = nil
         pairingAttemptTask = nil
         self.pskCategory = pskCategory
@@ -455,10 +468,15 @@ actor SendspinConnection {
         }
     }
 
-    /// Start the connection and spawn the supervisor task.
+    /// Mark the connection running and spawn its supervisor after any handoff setup.
     /// Idempotent: calling multiple times is a no-op.
-    func start() {
+    func prepareInitialPairingActivation(_ pairing: PairingDirective) {
         guard lifecycle == .idle else { return }
+        initialPairingActivation = pairing
+    }
+
+    func start() {
+        guard supervisorTask == nil, lifecycle == .idle || lifecycle == .running else { return }
         lifecycle = .running
         if case .longTerm = pskCategory, let pairingStore {
             let pskId = matchedPskId
@@ -467,6 +485,10 @@ actor SendspinConnection {
         supervisorSpawnCount += 1
 
         supervisorTask = Task {
+            if let initialPairingActivation {
+                self.initialPairingActivation = nil
+                await applyInitialPairingActivation(initialPairingActivation)
+            }
             await runLoop()
             // An explicit local disconnect still wins; it is recorded before its first
             // suspension precisely so it beats the loss path.

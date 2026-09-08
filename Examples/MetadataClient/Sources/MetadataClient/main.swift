@@ -171,7 +171,7 @@ struct MetadataClient: AsyncParsableCommand {
 
             case .paired, .pairingCodeChanged, .pairingAttemptEnded, .audioOutputChanged, .outputFormatStatusChanged, .streamingFailed,
                  .streamFormatChanged, .streamCleared, .controllerStateUpdated, .controllerStateCleared,
-                 .colorStateUpdated, .colorStateCleared, .artworkStreamStarted,
+                 .colorStateUpdated, .colorStateCleared, .artworkStreamStarted, .visualizerStreamStarted,
                  .outputDelayChanged, .lastPlayedServerChanged:
                 break
             }

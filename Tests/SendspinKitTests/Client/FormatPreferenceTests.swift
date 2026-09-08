@@ -53,6 +53,36 @@ struct FormatPreferenceTests {
         await provider.stopMonitoring()
     }
 
+    @Test("route reversal keeps invalidation sticky until the delayed stream start")
+    func routeReversalKeepsInvalidationStickyUntilStreamStart() async throws {
+        let provider = AudioOutputCapabilityService(
+            initialSnapshot: output(44_100, "Initial"),
+            platformMonitor: InertAudioOutputPlatformMonitor()
+        )
+        let client = try makeClient(formats: [fallback, native], provider: provider, settle: .zero)
+        let server = try await connect(client)
+        try await server.injectText(streamStart(format: fallback))
+        #expect(await waitUntil(timeout: .seconds(3)) { await client.connection?.announcedPlayerStream?.format == fallback })
+
+        await provider.update(output(48_000, "Changed route"))
+        #expect(await waitUntil(timeout: .seconds(3)) { await client.connection?.routeInvalidationPending == true })
+        await provider.update(output(44_100, "Returned route"))
+        #expect(await waitUntil(timeout: .seconds(3)) { await client.connection?.settledOutputSampleRate == 44_100 })
+        #expect(await client.connection?.routeInvalidationPending == true)
+
+        try await server.injectText(streamStart(format: fallback))
+        let engine = try #require(await client.connection?.audioEngineForTesting)
+        #expect(
+            await waitUntil(timeout: .seconds(3)) {
+                await engine.appliedCommandKinds().contains(.routeInvalidatedFormatChange)
+            },
+            "the delayed old-format response must retire invalidated PCM rather than reuse it"
+        )
+        #expect(await client.connection?.routeInvalidationPending == false)
+        await client.disconnect()
+        await provider.stopMonitoring()
+    }
+
     @Test("automatic deadline expiry publishes truthful fallback status")
     func automaticDeadlineExpiryPublishesFallbackStatus() async throws {
         let provider = AudioOutputCapabilityService(initialSnapshot: output(44_100, "Initial"), platformMonitor: InertAudioOutputPlatformMonitor())

@@ -204,7 +204,7 @@ struct ClockSyncDiagnostics: AsyncParsableCommand {
                 case .paired, .pairingCodeChanged, .pairingAttemptEnded, .audioOutputChanged, .outputFormatStatusChanged, .streamingFailed,
                      .streamStarted, .streamFormatChanged, .streamEnded, .streamCleared,
                      .groupUpdated, .metadataReceived, .controllerStateUpdated, .controllerStateCleared, .colorStateUpdated,
-                     .colorStateCleared, .artworkStreamStarted, .outputDelayChanged,
+                     .colorStateCleared, .artworkStreamStarted, .visualizerStreamStarted, .outputDelayChanged,
                      .lastPlayedServerChanged:
                     break
                 }
