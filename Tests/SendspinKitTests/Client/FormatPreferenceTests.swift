@@ -71,7 +71,7 @@ struct FormatPreferenceTests {
         #expect(await client.connection?.routeInvalidationPending == true)
 
         try await server.injectText(streamStart(format: fallback))
-        let engine = try #require(await client.connection?.audioEngineForTesting)
+        let engine = try #require(client.connection?.audioEngineForTesting)
         #expect(
             await waitUntil(timeout: .seconds(3)) {
                 await engine.appliedCommandKinds().contains(.routeInvalidatedFormatChange)
