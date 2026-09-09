@@ -301,8 +301,8 @@ actor MockNoiseServer {
 
     /// Send the server hello and consume the client's hello, leaving activation
     /// for the caller so tests can queue encrypted frames behind the handshake.
-    func beginAdmission(name: String = "Test Server") async throws {
-        try await respondToHandshake()
+    func beginAdmission(name: String = "Test Server", pskCategory: PskCategory? = nil) async throws {
+        try await respondToHandshake(pskCategoryOverride: pskCategory)
         try await sendJSON(#"{"type":"server/hello","payload":{"name":"\#(name)"}}"#)
         let hello = try await nextClientJSON()
         let object = try #require(JSONSerialization.jsonObject(with: hello) as? [String: Any])

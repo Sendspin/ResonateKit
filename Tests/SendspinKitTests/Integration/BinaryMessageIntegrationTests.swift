@@ -175,13 +175,13 @@ struct BinaryMessageIntegrationTests {
 
     @Test
     func visualizerDataWithFFTSpectrum() throws {
-        // Simulate FFT spectrum data (32 frequency bins)
+        // Simulate spectrum data (32 big-endian uint16 display bins).
         let binCount = 32
         var fftData = Data()
 
         for binIndex in 0 ..< binCount {
-            // Simulate decreasing amplitude at higher frequencies
-            let amplitude = Float(255 - (binIndex * 8))
+            // Simulate decreasing amplitude at higher frequencies.
+            let amplitude = UInt16(255 - (binIndex * 8)).bigEndian
             withUnsafeBytes(of: amplitude) { fftData.append(contentsOf: $0) }
         }
 
@@ -199,7 +199,7 @@ struct BinaryMessageIntegrationTests {
 
         #expect(message.type == .visualizerData)
         #expect(message.timestamp == 3_000_000)
-        #expect(message.data.count == binCount * 4) // 32 bins * 4 bytes per float
+        #expect(message.data.count == binCount * 2) // 32 bins * 2 bytes per uint16
     }
 
     @Test

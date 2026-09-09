@@ -15,7 +15,7 @@ struct ConnectionLostTeardownTests {
 
     private func groupUpdateJSON(groupId: String, groupName: String) throws -> String {
         let message = GroupUpdateMessage(payload: GroupUpdatePayload(
-            playbackState: nil,
+            playbackState: .stopped,
             groupId: groupId,
             groupName: groupName
         ))

@@ -46,15 +46,31 @@ struct StreamStartArtwork: Codable, Equatable {
     let channels: [StreamArtworkChannelConfig]
 }
 
-/// Empty `stream/start` visualizer block. The visualizer role is not yet
-/// implemented; this exists so a server `stream/start` carrying a visualizer
-/// block decodes (and re-encodes) without error rather than failing the message.
+/// Negotiated visualizer stream configuration in `stream/start`.
 struct StreamStartVisualizer: Codable, Equatable {
-    init() {}
+    let types: [VisualizerType]
+    let rateMax: Int
+    let tracksDownbeats: Bool?
+    let spectrum: SpectrumConfiguration?
 
-    // Explicit Codable implementation for empty struct
-    init(from _: Decoder) throws {}
-    func encode(to _: Encoder) throws {}
+    enum CodingKeys: String, CodingKey {
+        case types
+        case rateMax = "rate_max"
+        case tracksDownbeats = "tracks_downbeats"
+        case spectrum
+    }
+
+    init(
+        types: [VisualizerType] = [.loudness],
+        rateMax: Int = 1,
+        tracksDownbeats: Bool? = nil,
+        spectrum: SpectrumConfiguration? = nil
+    ) {
+        self.types = types
+        self.rateMax = rateMax
+        self.tracksDownbeats = tracksDownbeats
+        self.spectrum = spectrum
+    }
 }
 
 /// Stream end message — ends streams for specified roles (or all if omitted)
@@ -93,52 +109,14 @@ struct GroupUpdateMessage: SendspinMessage, Equatable {
 struct GroupUpdatePayload: Codable, Equatable {
     /// Per spec, playback_state is a closed set: `'playing' | 'stopped'`.
     /// Unlike roles, there's no extensibility mechanism for custom states.
-    let playbackState: PlaybackState?
-    let groupId: String?
-    let groupName: String?
-
-    /// Key-presence flags for delta merging. Plain optionals cannot distinguish
-    /// an absent key (keep previous value) from an explicit null (clear value).
-    let hasPlaybackState: Bool
-    let hasGroupId: Bool
-    let hasGroupName: Bool
+    let playbackState: PlaybackState
+    let groupId: String
+    let groupName: String
 
     enum CodingKeys: String, CodingKey {
         case playbackState = "playback_state"
         case groupId = "group_id"
         case groupName = "group_name"
-    }
-
-    init(playbackState: PlaybackState? = nil, groupId: String? = nil, groupName: String? = nil) {
-        self.playbackState = playbackState
-        self.groupId = groupId
-        self.groupName = groupName
-        hasPlaybackState = playbackState != nil
-        hasGroupId = groupId != nil
-        hasGroupName = groupName != nil
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        hasPlaybackState = container.contains(.playbackState)
-        hasGroupId = container.contains(.groupId)
-        hasGroupName = container.contains(.groupName)
-        playbackState = try container.decodeIfPresent(PlaybackState.self, forKey: .playbackState)
-        groupId = try container.decodeIfPresent(String.self, forKey: .groupId)
-        groupName = try container.decodeIfPresent(String.self, forKey: .groupName)
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        if hasPlaybackState {
-            try container.encodeIfPresent(playbackState, forKey: .playbackState)
-        }
-        if hasGroupId {
-            try container.encodeIfPresent(groupId, forKey: .groupId)
-        }
-        if hasGroupName {
-            try container.encodeIfPresent(groupName, forKey: .groupName)
-        }
     }
 }
 

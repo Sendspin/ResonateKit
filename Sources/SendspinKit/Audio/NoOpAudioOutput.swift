@@ -52,6 +52,8 @@ actor NoOpAudioOutput: AudioOutput {
 
     func swapDecoder(format _: AudioFormatSpec, codecHeader _: Data?) throws {}
 
+    func switchHardwareFormat(format _: AudioFormatSpec) async throws {}
+
     func decode(_ data: Data) async throws -> Data {
         data
     }

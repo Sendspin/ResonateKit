@@ -42,9 +42,9 @@ struct SessionStateResetTests {
     }
 
     private func groupUpdateJSON(
-        groupId: String? = nil,
-        groupName: String? = nil,
-        playbackState: PlaybackState? = nil
+        groupId: String,
+        groupName: String,
+        playbackState: PlaybackState
     ) throws -> String {
         let message = GroupUpdateMessage(payload: GroupUpdatePayload(
             playbackState: playbackState,
@@ -306,7 +306,7 @@ struct SessionStateResetTests {
     }
 
     @Test
-    func groupUpdateDeltasMergeWithinConnection() async throws {
+    func groupUpdateSnapshotsReplaceWithinConnection() async throws {
         let client = try makeTestClient()
         let mock = try await connectClient(client)
 
@@ -319,25 +319,14 @@ struct SessionStateResetTests {
         }
         #expect(gotInitial)
 
-        try await mock.injectText(groupUpdateJSON(playbackState: .playing))
-        let preservedGroup = await waitUntil {
+        try await mock.injectText(groupUpdateJSON(groupId: "g2", groupName: "Office", playbackState: .playing))
+        let replacedGroup = await waitUntil {
             await MainActor.run {
-                client.currentGroup?.groupId == "g1" && client.currentGroup?.groupName == "Kitchen"
+                client.currentGroup?.groupId == "g2" && client.currentGroup?.groupName == "Office"
                     && client.currentGroup?.playbackState == .playing
             }
         }
-        #expect(preservedGroup, "Absent group/update fields in a delta must keep previous values")
-
-        await mock.injectText("""
-        {"type":"group/update","payload":{"group_name":null}}
-        """)
-        let clearedName = await waitUntil {
-            await MainActor.run {
-                client.currentGroup?.groupId == "g1" && client.currentGroup?.groupName == ""
-                    && client.currentGroup?.playbackState == .playing
-            }
-        }
-        #expect(clearedName, "Explicit null group/update fields in a delta must clear previous values")
+        #expect(replacedGroup, "Each complete group/update snapshot must replace the previous group")
 
         await client.disconnect()
     }
@@ -385,7 +374,7 @@ struct SessionStateResetTests {
         let gotPaused = await waitUntil { await MainActor.run { client.currentPlaybackStatus == .paused } }
         #expect(gotPaused)
 
-        try await mock.injectText(groupUpdateJSON(playbackState: .stopped))
+        try await mock.injectText(groupUpdateJSON(groupId: "g1", groupName: "Kitchen", playbackState: .stopped))
         let gotStopped = await waitUntil { await MainActor.run { client.currentPlaybackStatus == .stopped } }
         #expect(gotStopped)
 
@@ -404,7 +393,7 @@ struct SessionStateResetTests {
         let gotStopped = await waitUntil { await MainActor.run { client.currentPlaybackStatus == .stopped } }
         #expect(gotStopped)
 
-        try await mock.injectText(groupUpdateJSON(playbackState: .playing))
+        try await mock.injectText(groupUpdateJSON(groupId: "g1", groupName: "Kitchen", playbackState: .playing))
         let staleProgressMakesPaused = await waitUntil { await MainActor.run { client.currentPlaybackStatus == .paused } }
         #expect(staleProgressMakesPaused)
 

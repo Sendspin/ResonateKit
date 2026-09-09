@@ -101,6 +101,31 @@ struct SendspinClientTests {
         #expect(candidates.contains(where: { $0.psk == longTermPsk && $0.category == .longTerm }))
     }
 
+    @Test("initial client/hello advertises enabled Pairing PSK on the wire")
+    func initialClientHelloAdvertisesPairingPsk() async throws {
+        let pairingPsk = Psk.generate()
+        let pairing = PairingConfiguration(pairingPsk: pairingPsk, enabled: true)
+        let client = try SendspinClient(
+            identity: .generate(),
+            name: "Initial Pairing Hello Test",
+            roles: [.metadataV1],
+            pairing: pairing
+        )
+        let transport = MockTransport()
+        let server = MockNoiseServer(transport: transport, psk: .sentinel)
+
+        async let accepted: Void = client.acceptConnection(transport)
+        try await server.establishSession()
+        try await accepted
+
+        let helloData = try #require(await server.clientJSONMessages(ofType: ClientHelloMessage.typeString).first)
+        let hello = try JSONDecoder().decode(ClientHelloMessage.self, from: helloData)
+        let descriptor = try #require(hello.payload.supportedPairMethods[PairMethod.pairingPsk])
+        #expect(descriptor.locations == ["operator"])
+        #expect(Set(hello.payload.supportedPairMethods.keys) == Set([PairMethod.pairingPsk]))
+        await client.disconnect()
+    }
+
     @Test
     func colorRoleIsAdvertisedWithoutASupportObject() throws {
         let client = try SendspinClient(
@@ -871,6 +896,13 @@ struct SendspinClientTests {
         #expect(await client.connection?.automaticRequestsSuppressed == true)
         #expect(await client.connection?.pendingOutputFormatRequest?.origin == .application)
         #expect(await stateSnapshots(transport).count == 2)
+
+        try await transport.injectText(streamStartJSON(application))
+        let engine = try #require(client.connection?.audioEngineForTesting)
+        #expect(
+            await waitUntil { await engine.appliedCommandKinds().contains(.routeInvalidatedFormatChange) },
+            "an application-selected format after a route change must discard invalidated PCM"
+        )
 
         try await transport.injectText(streamEndJSON())
         try await transport.injectText(streamStartJSON(initial))

@@ -213,6 +213,7 @@ final class CLIPlayer {
              .colorStateUpdated,
              .colorStateCleared,
              .artworkStreamStarted,
+             .visualizerStreamStarted,
              .streamCleared,
              .outputDelayChanged,
              .lastPlayedServerChanged,
@@ -282,6 +283,9 @@ final class CLIPlayer {
                 .map { "ch\($0): \($1.source)/\($1.format) \($1.width)x\($1.height)" }
                 .joined(separator: ", ")
             print("[EVENT] Artwork stream started: \(desc)")
+
+        case let .visualizerStreamStarted(configuration):
+            print("[EVENT] Visualizer stream started: \(configuration.types)")
 
         case .streamCleared:
             print("[EVENT] Stream cleared (seek)")

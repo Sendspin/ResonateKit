@@ -1,5 +1,91 @@
 import Foundation
 
+/// Synchronous ingress barrier for route-invalidated compressed chunks.
+///
+/// Invalidation drops ingress; it never owns a second queue. The route command opens a new
+/// epoch atomically with its FIFO enqueue, so chunks already in flight cannot cross the format
+/// boundary while chunks after the command retain normal sink ordering.
+final class AudioRouteInvalidationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var epoch: UInt64 = 0
+    private var invalidated = false
+
+    func invalidate() {
+        lock.lock()
+        epoch &+= 1
+        invalidated = true
+        lock.unlock()
+    }
+
+    func enqueueChunk(data: Data, timestamp: Int64, to sink: DataPlaneSink) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !invalidated else { return }
+        sink.enqueue(.chunkAtRouteEpoch(data, ts: timestamp, epoch: epoch))
+    }
+
+    func enqueueStreamStart(
+        format: AudioFormatSpec,
+        codecHeader: Data?,
+        to sink: DataPlaneSink
+    ) {
+        lock.lock()
+        epoch &+= 1
+        invalidated = false
+        sink.enqueue(.streamStart(format, codecHeader: codecHeader))
+        lock.unlock()
+    }
+
+    func enqueueStreamEnd(roles: [String]?, to sink: DataPlaneSink) {
+        lock.lock()
+        epoch &+= 1
+        invalidated = true
+        sink.enqueue(.streamEnd(roles: roles))
+        lock.unlock()
+    }
+
+    func clear() {
+        lock.lock()
+        epoch &+= 1
+        invalidated = false
+        lock.unlock()
+    }
+
+    func enqueueRouteInvalidatedFormatChange(
+        format: AudioFormatSpec,
+        codecHeader: Data?,
+        to sink: DataPlaneSink
+    ) {
+        lock.lock()
+        epoch &+= 1
+        invalidated = false
+        let routeEpoch = epoch
+        sink.enqueue(.formatChangeRouteInvalidated(format, codecHeader: codecHeader, epoch: routeEpoch))
+        lock.unlock()
+    }
+
+    func isCurrent(epoch candidate: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return candidate == epoch
+    }
+
+    func isInvalidated() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return invalidated
+    }
+}
+
+/// The engine policy for a mid-stream format transition.
+enum AudioFormatTransitionPolicy: Sendable {
+    /// Keep wire-ordered PCM and switch hardware at the render boundary.
+    case ordered
+
+    /// The route invalidated the old PCM; drop it and rebuild the output now.
+    case routeInvalidated
+}
+
 /// Commands that flow from the message loop (MainActor) to the AudioEngine.
 ///
 /// Each command represents a unit of work the engine processes: starting/stopping
@@ -12,6 +98,9 @@ enum DataPlaneCommand {
     /// Schedule a chunk of PCM audio for playback at the given server timestamp (microseconds).
     case chunk(Data, ts: Int64)
 
+    /// Route-epoch-tagged compressed chunk. The epoch is checked before and after decoding.
+    case chunkAtRouteEpoch(Data, ts: Int64, epoch: UInt64)
+
     /// Generation-tagged audio chunk with measurement-only send-ahead.
     case chunkAtGenerationWithSendAhead(Data, ts: Int64, sendAhead: UInt32, generation: UInt64)
 
@@ -21,8 +110,11 @@ enum DataPlaneCommand {
     /// End the audio stream, truncating unplayed audio for the given roles (nil = all roles).
     case streamEnd(roles: [String]?)
 
-    /// Change format mid-stream (seamless format swap).
+    /// Change format mid-stream with the ordered transition policy.
     case formatChange(AudioFormatSpec, codecHeader: Data?)
+
+    /// Change format after the current output route invalidated queued PCM.
+    case formatChangeRouteInvalidated(AudioFormatSpec, codecHeader: Data?, epoch: UInt64)
 
     /// Change format at an explicitly announced input generation.
     case formatChangeAtGeneration(AudioFormatSpec, codecHeader: Data?, generation: UInt64)
@@ -38,6 +130,7 @@ enum DataPlaneCommandKind {
     case streamClear
     case streamEnd
     case formatChange
+    case routeInvalidatedFormatChange
     case setOutputDelay
 }
 
@@ -49,7 +142,7 @@ extension DataPlaneCommand {
         switch self {
         case .streamStart:
             .streamStart
-        case .chunk, .chunkAtGenerationWithSendAhead:
+        case .chunk, .chunkAtRouteEpoch, .chunkAtGenerationWithSendAhead:
             .chunk
         case .streamClear:
             .streamClear
@@ -57,6 +150,8 @@ extension DataPlaneCommand {
             .streamEnd
         case .formatChange, .formatChangeAtGeneration:
             .formatChange
+        case .formatChangeRouteInvalidated:
+            .routeInvalidatedFormatChange
         case .setOutputDelay:
             .setOutputDelay
         }

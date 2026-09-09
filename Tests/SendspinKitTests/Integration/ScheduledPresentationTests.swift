@@ -145,15 +145,18 @@ struct ScheduledPresentationTests {
         await fixture.connection.handleStreamStart(streamStart)
         try await fixture.connection.handleArtworkBinary(announce(timestamp: 100, totalSize: 1))
         try await fixture.connection.handleArtworkBinary(part(data: Data([8])))
+        #expect(
+            await waitUntil(timeout: .seconds(2)) { await sleeper.waitingCount == 3 },
+            "Metadata, color, and artwork updates must park before stream end"
+        )
         await fixture.connection.handleStreamEnd(StreamEndMessage())
         #expect(await fixture.connection.metadataPending != nil)
         #expect(await fixture.connection.colorPending != nil)
         #expect(await fixture.connection.artworkPending.isEmpty)
-        #expect(await waitUntil(timeout: .seconds(2)) { await sleeper.waitingCount >= 1 })
         schedule.now = 100
-        await sleeper.fireNext()
-        #expect(await waitUntil(timeout: .seconds(2)) { await sleeper.waitingCount >= 1 })
-        await sleeper.fireNext()
+        while await sleeper.waitingCount > 0 {
+            await sleeper.fireNext()
+        }
         let connection = fixture.connection
         #expect(await waitUntil(timeout: .seconds(2)) { await connection.currentMetadata?.title == "metadata" })
         #expect(await waitUntil(timeout: .seconds(2)) { await connection.currentColorState?.primary?.red == 1 })

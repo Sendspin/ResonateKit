@@ -161,10 +161,11 @@ struct MessageEncodingTests {
 
     @Test
     func serverCommandIgnoresStaleStaticDelayField() throws {
-        let data = Data(#"{"type":"server/command","payload":{"player":{"command":"set_output_delay","static_delay_ms":250}}}"#.utf8)
+        let data = Data(#"{"type":"server/command","payload":{"player":{"command":"set_output_delay","output_delay_ms":250,"static_delay_ms":125}}}"#
+            .utf8)
         let message = try JSONDecoder().decode(ServerCommandMessage.self, from: data)
         #expect(message.payload.player?.command == .setOutputDelay)
-        #expect(message.payload.player?.outputDelayMs == nil)
+        #expect(message.payload.player?.outputDelayMs == 250)
     }
 
     @Test

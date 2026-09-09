@@ -692,40 +692,22 @@ struct SendspinConnectionTests {
         await connection.shutdown()
     }
 
-    @Test("server/command volume is clamped to the spec's 0...100 range")
-    func serverCommandVolumeIsClamped() async throws {
-        // The server is not trusted to stay in range. Each case is (volume sent by
-        // the server, value the client must apply after clamping). The in-range 50
-        // case is the control proving the clamp does not distort valid values.
-        let cases = [(sent: 150, expected: 100), (sent: -5, expected: 0), (sent: 50, expected: 50)]
-        for testCase in cases {
+    @Test("server/command volume rejects values outside the spec's 0...100 range")
+    func serverCommandVolumeRejectsOutOfRangeValues() async throws {
+        for sent in [150, -5] {
             let transport = MockTransport()
             let clock = StubClock()
             let (connection, _, _, _, _) = try await makeConnectionWithSpyEngine(clock, transport, advertisedCommands: [.volume])
+            let original = await connection.currentVolume
 
             await connection.start()
             try await transport.injectText(serverHelloJSON())
             try await transport.injectText(
-                serverCommandJSON(PlayerCommandObject(command: .volume, volume: testCase.sent))
+                serverCommandJSON(PlayerCommandObject(command: .volume, volume: sent))
             )
+            try await Task.sleep(for: .milliseconds(50))
 
-            let event = await collectConnectionEvent(from: connection) {
-                if case .playerVolumeChanged = $0 {
-                    true
-                } else {
-                    false
-                }
-            }
-            guard case let .playerVolumeChanged(applied)? = event else {
-                Issue.record("server/command volume \(testCase.sent): expected a .playerVolumeChanged event")
-                await connection.shutdown()
-                continue
-            }
-            #expect(
-                applied == testCase.expected,
-                "server volume \(testCase.sent) must clamp to \(testCase.expected), got \(applied)"
-            )
-
+            #expect(await connection.currentVolume == original)
             await connection.shutdown()
         }
     }

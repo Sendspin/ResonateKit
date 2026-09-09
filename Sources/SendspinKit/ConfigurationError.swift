@@ -52,8 +52,14 @@ public enum ConfigurationError: SendspinError, Hashable {
     case missingRequiredStateField(String)
     /// Artwork state channel fields are inconsistent with its source.
     case invalidArtworkStateChannel
-    /// Spectrum configuration is required when spectrum is requested.
+    /// Spectrum configuration is required exactly when spectrum is requested.
     case missingSpectrumConfiguration
+    /// At least one visualizer type is required.
+    case emptyVisualizerTypes
+    /// Visualizer periodic frame rate must be positive.
+    case nonPositiveVisualizerRate
+    /// Spectrum dimensions and frequency bounds are invalid.
+    case invalidSpectrumConfiguration
 
     // MARK: - ClientAdvertiser
 
@@ -108,7 +114,13 @@ extension ConfigurationError: LocalizedError {
         case .invalidArtworkStateChannel:
             "Artwork state channel fields do not match its source"
         case .missingSpectrumConfiguration:
-            "Visualizer spectrum configuration is required when spectrum is requested"
+            "Visualizer spectrum configuration is required exactly when spectrum is requested"
+        case .emptyVisualizerTypes:
+            "Visualizer configuration must request at least one type"
+        case .nonPositiveVisualizerRate:
+            "Visualizer rate_max must be positive"
+        case .invalidSpectrumConfiguration:
+            "Visualizer spectrum configuration has invalid bins or frequency bounds"
         case let .invalidWebSocketPath(v):
             "WebSocket path must be absolute (begin with \"/\"), got \"\(v)\""
         case .playerRoleRequiresConfiguration:

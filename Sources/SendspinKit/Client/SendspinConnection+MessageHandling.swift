@@ -102,7 +102,7 @@ extension SendspinConnection {
     }
 
     /// Route a binary frame to the matching role data stream if its stream gate is open.
-    func route(binary data: Data) async {
+    func route(binary data: Data, arrival: Int64 = MonotonicClock.absoluteMicroseconds()) async {
         if let type = data.first,
            type >= BinaryMessageType.artworkChannel0.rawValue,
            type <= BinaryMessageType.artworkChannel3.rawValue {
@@ -134,8 +134,8 @@ extension SendspinConnection {
                 await transport.disconnect()
             }
 
-        case .visualizerData:
-            await handleVisualizerBinary(message)
+        case .visualizerLoudness, .visualizerBeat, .visualizerFPeak, .visualizerSpectrum, .visualizerPeak:
+            await handleVisualizerBinary(message, arrival: arrival)
 
         default:
             preconditionFailure("Artwork messages are routed by the range pre-check")
@@ -255,6 +255,25 @@ extension SendspinConnection {
         }
     }
 
+    /// Apply the activation already consumed by `HandshakeDriver` during handoff.
+    /// The live message loop starts after setup, so pairing must be initialized here
+    /// rather than waiting for another server/activate frame.
+    func applyInitialPairingActivation(_ pairing: PairingDirective) async {
+        guard activities == [.pairing], pairingAttemptActive == false else { return }
+        pairingAttemptActive = true
+        pairingActivateCounter = pairingActivateCounter == .max ? 0 : pairingActivateCounter + 1
+        switch pairing.method {
+        case PairMethod.pairingPsk:
+            await beginPairingAttempt()
+        case PairMethod.dynamicPairingCode:
+            await beginDynamicPairingAttempt(format: pairing.format)
+        case PairMethod.staticPairingCode:
+            await beginStaticPairingAttempt(format: pairing.format)
+        default:
+            clearPairingAttempt(reason: .methodNotSupported)
+        }
+    }
+
     func handleServerActivate(_ message: ServerActivateMessage) async {
         let advertisement = await livePairingAdvertisement()
         sessionContext = ActivationAdmissibility.SessionContext(
@@ -286,6 +305,7 @@ extension SendspinConnection {
         ) {
         case .admit:
             activities = nextActivities
+            pairingAttemptActive = nextActivities == [.pairing]
             let completedRehandshake = awaitingRehandshakeActivation
             if completedRehandshake {
                 awaitingRehandshakeActivation = false
@@ -299,6 +319,12 @@ extension SendspinConnection {
                 visualizerStateSent = false
                 artworkStateSent = false
                 artworkTransfer = nil
+                if !activeRoles.contains(.visualizerV1) {
+                    visualizerStreamActive = false
+                    visualizerStreamConfiguration = nil
+                    visualizerFrameValidity.invalidate()
+                    visualizerFrameValidity = VisualizerFrameValidity()
+                }
             }
             try? await publishClientState(bypassRehandshakeGate: completedRehandshake)
             if completedRehandshake {
@@ -311,7 +337,7 @@ extension SendspinConnection {
                 await beginDynamicPairingAttempt(format: message.payload.pairing?.format)
             } else if nextActivities == [.pairing], message.payload.pairing?.method == PairMethod.staticPairingCode {
                 await beginStaticPairingAttempt(format: message.payload.pairing?.format)
-            } else if pendingPairingPsk != nil || dynamicPairingAttempt != nil || staticPairingAttempt != nil {
+            } else if pairingAttemptActive || pendingPairingPsk != nil || dynamicPairingAttempt != nil || staticPairingAttempt != nil {
                 if dynamicPairingAttempt != nil {
                     controlSink.enqueue(.pairingCodeChanged(nil))
                 }
@@ -322,7 +348,7 @@ extension SendspinConnection {
             disconnectReason = .explicit(reason)
             await transport.disconnect()
         case .abortPairing:
-            if pendingPairingPsk != nil || dynamicPairingAttempt != nil || staticPairingAttempt != nil {
+            if pairingAttemptActive || pendingPairingPsk != nil || dynamicPairingAttempt != nil || staticPairingAttempt != nil {
                 clearPairingAttempt(reason: .methodNotSupported)
             }
             try? await sendWrapped(
@@ -348,6 +374,7 @@ extension SendspinConnection {
             return
         }
         let generated = await selectPairingLongTermPsk()
+        guard pairingAttemptActive else { return }
         pendingPairingPsk = generated
         pairingAttemptTask?.cancel()
         pairingAttemptTask = Task { [weak self] in
@@ -779,6 +806,7 @@ extension SendspinConnection {
     }
 
     func clearPairingAttempt(reason: PairAbortReason? = nil) {
+        pairingAttemptActive = false
         pendingPairingPsk = nil
         dynamicPairingAttempt = nil
         staticPairingAttempt = nil
@@ -979,6 +1007,7 @@ extension SendspinConnection {
         controlSink.enqueue(.colorStateUpdated(pending.color))
     }
 
+    // swiftlint:disable:next function_body_length
     func handleStreamStart(_ message: StreamStartMessage) async {
         // Handle artwork stream
         if let artworkInfo = message.payload.artwork {
@@ -999,9 +1028,39 @@ extension SendspinConnection {
             controlSink.enqueue(.artworkStreamStarted(artworkInfo.channels))
         }
 
-        // Handle visualizer stream
-        if message.payload.visualizer != nil {
-            visualizerStreamActive = true
+        // Handle visualizer stream. The server's configuration is authoritative for
+        // decoding each subsequent binary type until stream/end.
+        if let visualizerInfo = message.payload.visualizer {
+            let isValid = !visualizerInfo.types.isEmpty
+                && visualizerInfo.rateMax > 0
+                && visualizerInfo.types.contains(.spectrum) == (visualizerInfo.spectrum != nil)
+                && visualizerInfo.types.contains(.beat) == (visualizerInfo.tracksDownbeats != nil)
+                && (visualizerInfo.spectrum.map { $0.nDispBins > 0 && $0.fMin >= 0 && $0.fMax > $0.fMin } ?? true)
+                && (visualizerState.map { requested in
+                    visualizerInfo.types.allSatisfy { requested.types.contains($0) }
+                        && visualizerInfo.rateMax <= requested.rateMax
+                        && visualizerInfo.spectrum == requested.spectrum
+                } ?? false)
+            if !isValid {
+                Log.client.warning("Discarding invalid visualizer stream configuration")
+                visualizerStreamActive = false
+                visualizerStreamConfiguration = nil
+                visualizerFrameValidity.invalidate()
+                visualizerFrameValidity = VisualizerFrameValidity()
+            } else {
+                visualizerFrameValidity.invalidate()
+                visualizerFrameValidity = VisualizerFrameValidity()
+                visualizerStreamConfiguration = VisualizerStreamConfiguration(
+                    types: visualizerInfo.types,
+                    rateMax: visualizerInfo.rateMax,
+                    tracksDownbeats: visualizerInfo.tracksDownbeats,
+                    spectrum: visualizerInfo.spectrum
+                )
+                visualizerStreamActive = true
+                if let visualizerStreamConfiguration {
+                    controlSink.enqueue(.visualizerStreamStarted(visualizerStreamConfiguration))
+                }
+            }
         }
 
         // Handle player stream
@@ -1041,8 +1100,14 @@ extension SendspinConnection {
             return
         }
 
+        var transitionPolicy: AudioFormatTransitionPolicy?
         if outputSampleRatePolicy == .requireCurrentOutput {
-            guard await handleOutputFormatStreamStart(format) else { return }
+            switch await handleOutputFormatStreamStart(format) {
+            case .rejected:
+                return
+            case let .accepted(policy):
+                transitionPolicy = policy
+            }
         }
 
         // Parse codec header. A present-but-malformed (non-base64) header is a
@@ -1069,11 +1134,18 @@ extension SendspinConnection {
         let isFormatChange = previous.map { $0.format != format || $0.codecHeader != codecHeader } ?? false
         announcedPlayerStream = (format: format, codecHeader: codecHeader)
         if outputSampleRatePolicy != .requireCurrentOutput {
-            _ = await handleOutputFormatStreamStart(format)
+            if case let .accepted(policy) = await handleOutputFormatStreamStart(format) {
+                transitionPolicy = policy
+            }
         }
 
-        if isFormatChange {
-            audioEngine.enqueueFormatChange(format: format, codecHeader: codecHeader)
+        if isFormatChange || transitionPolicy == .routeInvalidated {
+            switch transitionPolicy ?? .ordered {
+            case .ordered:
+                audioEngine.enqueueFormatChange(format: format, codecHeader: codecHeader)
+            case .routeInvalidated:
+                audioEngine.enqueueRouteInvalidatedFormatChange(format: format, codecHeader: codecHeader)
+            }
         } else {
             if clientOperationalState == .error {
                 clientOperationalState = .synchronized
@@ -1081,7 +1153,7 @@ extension SendspinConnection {
                 try? await publishClientState()
             }
             controlSink.enqueue(.streamAccepted(format))
-            audioEngine.commands.enqueue(.streamStart(format, codecHeader: codecHeader))
+            audioEngine.enqueueStreamStart(format: format, codecHeader: codecHeader)
         }
     }
 
@@ -1091,6 +1163,11 @@ extension SendspinConnection {
         if roles == nil || roles?.contains("player") == true {
             audioEngine.commands.enqueue(.streamClear(roles: roles))
         }
+        if roles == nil || roles?.contains("visualizer") == true {
+            visualizerFrameValidity.invalidate()
+            visualizerFrameValidity = VisualizerFrameValidity()
+        }
+        // stream/clear invalidates queued visualizer frames without ending the negotiated stream.
 
         controlSink.enqueue(.streamCleared(roles: roles))
     }
@@ -1100,7 +1177,7 @@ extension SendspinConnection {
 
         if endedRoles == nil || endedRoles?.contains("player") == true {
             playerStreamActive = false
-            audioEngine.commands.enqueue(.streamEnd(roles: endedRoles))
+            audioEngine.enqueueStreamEnd(roles: endedRoles)
             announcedPlayerStream = nil
             resetOutputFormatNegotiationForStreamBoundary()
         }
@@ -1113,6 +1190,9 @@ extension SendspinConnection {
 
         if endedRoles == nil || endedRoles?.contains("visualizer") == true {
             visualizerStreamActive = false
+            visualizerStreamConfiguration = nil
+            visualizerFrameValidity.invalidate()
+            visualizerFrameValidity = VisualizerFrameValidity()
         }
 
         // Per spec, entering external_source causes the server to end active streams.
@@ -1128,7 +1208,7 @@ extension SendspinConnection {
     func handleServerCommand(_ message: ServerCommandMessage) async {
         guard let playerCmd = message.payload.player else { return }
 
-        // Gate: only apply commands in the advertised supported set.
+        // Apply commands only when advertised and when their argument shape is exact.
         guard advertisedCommands.contains(playerCmd.command) else {
             Log.client.debug("Ignoring server/command: not in advertised supported_commands")
             return
@@ -1136,42 +1216,46 @@ extension SendspinConnection {
 
         switch playerCmd.command {
         case .volume:
-            if let volume = playerCmd.volume {
-                // Clamp to the spec's 0–100 range rather than trusting the server,
-                // matching set_output_delay below and the local setVolume API.
-                let clamped = max(0, min(100, volume))
-                currentVolume = clamped
-                await audioEngine.setGain(Float(clamped) / 100.0)
-                controlSink.enqueue(.playerVolumeChanged(clamped))
-                try? await publishClientState()
+            guard let volume = playerCmd.volume, (0 ... 100).contains(volume),
+                  playerCmd.mute == nil, playerCmd.outputDelayMs == nil else {
+                Log.client.debug("Ignoring malformed server/command volume")
+                return
             }
+            currentVolume = volume
+            await audioEngine.setGain(Float(volume) / 100.0)
+            controlSink.enqueue(.playerVolumeChanged(volume))
+            try? await publishClientState()
 
         case .mute:
-            if let mute = playerCmd.mute {
-                currentMuted = mute
-                await audioEngine.setMuted(mute)
-                controlSink.enqueue(.playerMutedChanged(mute))
-                try? await publishClientState()
+            guard let mute = playerCmd.mute,
+                  playerCmd.volume == nil, playerCmd.outputDelayMs == nil else {
+                Log.client.debug("Ignoring malformed server/command mute")
+                return
             }
+            currentMuted = mute
+            await audioEngine.setMuted(mute)
+            controlSink.enqueue(.playerMutedChanged(mute))
+            try? await publishClientState()
 
         case .setOutputDelay:
-            if let delayMs = playerCmd.outputDelayMs {
-                // Clamp to the spec range rather than trusting the server.
-                let clamped = max(0, min(maxOutputDelayMs, delayMs))
-                currentOutputDelayMs = clamped
-                audioEngine.commands.enqueue(.setOutputDelay(clamped))
-                controlSink.enqueue(.outputDelayChanged(milliseconds: clamped))
-                try? await publishClientState()
+            guard let delayMs = playerCmd.outputDelayMs,
+                  (0 ... maxOutputDelayMs).contains(delayMs),
+                  playerCmd.volume == nil, playerCmd.mute == nil else {
+                Log.client.debug("Ignoring malformed server/command set_output_delay")
+                return
             }
+            currentOutputDelayMs = delayMs
+            audioEngine.commands.enqueue(.setOutputDelay(delayMs))
+            controlSink.enqueue(.outputDelayChanged(milliseconds: delayMs))
+            try? await publishClientState()
         }
     }
 
     func handleGroupUpdate(_ message: GroupUpdateMessage) async {
-        let prev = currentGroup
         let info = GroupInfo(
-            groupId: message.payload.hasGroupId ? message.payload.groupId ?? "" : prev?.groupId ?? "",
-            groupName: message.payload.hasGroupName ? message.payload.groupName ?? "" : prev?.groupName ?? "",
-            playbackState: message.payload.hasPlaybackState ? message.payload.playbackState : prev?.playbackState
+            groupId: message.payload.groupId,
+            groupName: message.payload.groupName,
+            playbackState: message.payload.playbackState
         )
         currentGroup = info
         controlSink.enqueue(.groupUpdated(info))
@@ -1348,9 +1432,22 @@ extension SendspinConnection {
         }
     }
 
-    func handleVisualizerBinary(_ message: BinaryMessage) async {
-        guard visualizerStateSent, visualizerStreamActive else {
-            Log.client.warning("Discarding visualizer binary: visualizer state or stream is not active")
+    func handleVisualizerBinary(_ message: BinaryMessage, arrival: Int64 = MonotonicClock.absoluteMicroseconds()) async {
+        guard visualizerStateSent, visualizerStreamActive,
+              activeRoles.contains(.visualizerV1),
+              let configuration = visualizerStreamConfiguration,
+              let type = message.type.visualizerType,
+              configuration.types.contains(type) else {
+            Log.client.warning("Discarding visualizer binary: visualizer state, stream, role, or type is not active")
+            return
+        }
+
+        guard VisualizerBinaryPayloadValidator.isValid(
+            type: type,
+            data: message.data,
+            configuration: configuration
+        ) else {
+            Log.client.warning("Discarding malformed visualizer binary payload for \(type.rawValue, privacy: .public)")
             return
         }
 
@@ -1360,7 +1457,16 @@ extension SendspinConnection {
         }
 
         let localDisplayTime = await clock.serverTimeToLocal(message.timestamp)
-        let visualizerData = VisualizerData(data: message.data, localDisplayTime: localDisplayTime)
+        guard localDisplayTime > arrival else {
+            Log.client.warning("Discarding stale visualizer binary")
+            return
+        }
+        let visualizerData = VisualizerData(
+            type: type,
+            data: message.data,
+            localDisplayTime: localDisplayTime,
+            validity: visualizerFrameValidity
+        )
         validity.yieldIfValid(visualizerData, to: visualizerSink)
     }
 }

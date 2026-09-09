@@ -13,6 +13,7 @@ enum HandshakeDriver {
         let matchedCandidate: PskCandidate
         let activities: Set<Activity>
         let activeRoles: Set<VersionedRole>
+        let pairing: PairingDirective?
         let session: ActivationAdmissibility.SessionContext
 
         consuming func takeChannel() -> NoiseChannel {
@@ -89,6 +90,7 @@ enum HandshakeDriver {
                         matchedCandidate: outcome.matchedCandidate,
                         activities: activities,
                         activeRoles: resolvedRoles,
+                        pairing: activate.payload.pairing,
                         session: session
                     )
                 case let .close(reason):
@@ -120,11 +122,19 @@ enum HandshakeDriver {
     ) async {
         let outcome = outcome
         var channel = outcome.channel
-        try? await sendJSON(
-            ClientGoodbyeMessage(payload: GoodbyePayload(reason: reason)),
-            on: transport,
-            channel: &channel
-        )
+        if outcome.activities == [.pairing], reason == .concurrentAttempt {
+            try? await sendJSON(
+                PairAbortMessage(payload: PairAbortPayload(reason: .concurrentAttempt)),
+                on: transport,
+                channel: &channel
+            )
+        } else {
+            try? await sendJSON(
+                ClientGoodbyeMessage(payload: GoodbyePayload(reason: reason)),
+                on: transport,
+                channel: &channel
+            )
+        }
         await transport.disconnect()
     }
 

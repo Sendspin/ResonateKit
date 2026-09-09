@@ -18,9 +18,9 @@ private func streamClearJSON() throws -> String {
 /// `GroupUpdatePayload` uses custom `CodingKeys` that already produce snake_case
 /// wire names, so no `.convertToSnakeCase` strategy is needed.
 private func groupUpdateJSON(
-    groupId: String? = nil,
-    groupName: String? = nil,
-    playbackState: PlaybackState? = nil
+    groupId: String,
+    groupName: String,
+    playbackState: PlaybackState
 ) throws -> String {
     let message = GroupUpdateMessage(
         payload: GroupUpdatePayload(
@@ -1556,14 +1556,13 @@ struct ClientIntegrationTests {
         await client.disconnect()
     }
 
-    // MARK: set_output_delay clamps out-of-range server input to the spec maximum
+    // MARK: set_output_delay rejects out-of-range server input
 
     @Test
-    func serverSetOutputDelay_clampsAboveMaximumToSpecLimit() async throws {
+    func serverSetOutputDelay_rejectsAboveMaximumWithoutEffect() async throws {
         let client = try makeTestClient()
         let mock = try await connectClient(client)
-
-        // Server-provided output delay clamps to the public configuration range.
+        let connection = try #require(client.connection)
         let maxDelayMs = maxOutputDelayMs
         let eventTask = Task {
             await collectEvent(from: client) { event in
@@ -1574,11 +1573,18 @@ struct ClientIntegrationTests {
             }
         }
 
-        try await mock.injectText(setOutputDelayCommandJSON(maxDelayMs + 1_000))
+        // Inject malformed input as raw JSON because the typed fixture rejects it before transport.
+        await mock.injectText("""
+        {"type":"server/command","payload":{"player":{"command":"set_output_delay","output_delay_ms":\(maxDelayMs + 1_000)}}}
+        """)
+        // A valid command is an ordered barrier: seeing its event proves the malformed command
+        // was already decoded and ignored by the message loop.
+        try await mock.injectText(setOutputDelayCommandJSON(250))
 
         let event = await eventTask.value
-        #expect(event == .outputDelayChanged(milliseconds: maxDelayMs))
-        #expect(client.outputDelayMs == maxDelayMs)
+        #expect(event == .outputDelayChanged(milliseconds: 250))
+        #expect(client.outputDelayMs == 250)
+        #expect(await waitUntil { await connection.currentOutputDelayMs == 250 })
 
         await client.disconnect()
     }
