@@ -78,6 +78,7 @@ actor SpyAudioOutput: AudioOutput {
     /// Stands in for the device path a real output would measure. Zero keeps engine timing
     /// dependent only on buffer depth, which is what the startup-release tests reason about.
     var stubDeviceLatencyUs: Int64 = 0
+    var outputDelayUs: Int64 = 0
     var forcedStartThrow: Error?
     var forcedStartPreparedThrow: Error?
     var forcedSwapThrow: Error?
@@ -171,6 +172,10 @@ actor SpyAudioOutput: AudioOutput {
         let depth = Int64(audioQueueBufferCount) * Int64(audioQueueBufferByteSize) * 1_000_000
             / Int64(format.sampleRate * bytesPerFrame)
         return depth + stubDeviceLatencyUs
+    }
+
+    func setOutputDelayMicroseconds(_ delay: Int64) {
+        outputDelayUs = delay
     }
 
     /// Tests drive release timing directly; no real device to wait on.
@@ -361,8 +366,27 @@ struct AudioEngineTests {
 
         #expect(received, "Expected the chunk to reach the scheduler")
         let chunk = try #require(queued.first)
-        #expect(chunk.originalTimestamp == serverTimestamp - Int64(delayMs) * 1_000)
+        #expect(chunk.originalTimestamp == serverTimestamp)
         #expect(chunk.playTimeMicroseconds == serverTimestamp - Int64(delayMs) * 1_000)
+        let appliedDelayUs = await output.outputDelayUs
+        #expect(appliedDelayUs == Int64(delayMs) * 1_000)
+    }
+
+    @Test("local output delay is applied after clock mapping exactly once")
+    func localOutputDelayIsIndependentOfClockOffsetAndDrift() {
+        let mappedLocalTime: Int64 = 9_876_543
+        let delayUs: Int64 = 237_000
+        #expect(
+            AudioEngine.localPlayTime(mappedLocalTime: mappedLocalTime, outputDelayMicroseconds: delayUs)
+                == mappedLocalTime - delayUs
+        )
+        #expect(
+            AudioEngine.localPlayTime(mappedLocalTime: mappedLocalTime, outputDelayMicroseconds: -1)
+                == mappedLocalTime
+        )
+        #expect(
+            AudioEngine.localPlayTime(mappedLocalTime: .min, outputDelayMicroseconds: 1) == nil
+        )
     }
 
     @Test("send_ahead never changes timestamp-based scheduling")

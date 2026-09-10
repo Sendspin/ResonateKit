@@ -171,6 +171,9 @@ public struct VisualizerData: Sendable, Equatable {
     public let data: Data
     /// Local absolute display time in microseconds.
     public let localDisplayTime: Int64
+    /// The negotiated configuration used to validate this frame. Consumers should
+    /// use this snapshot when rendering queued frames after a configuration update.
+    public let streamConfiguration: VisualizerStreamConfiguration?
     /// Stream-generation validity. Check this immediately before rendering.
     public let validity: VisualizerFrameValidity
 
@@ -188,16 +191,19 @@ public struct VisualizerData: Sendable, Equatable {
         type: VisualizerType,
         data: Data,
         localDisplayTime: Int64,
+        streamConfiguration: VisualizerStreamConfiguration? = nil,
         validity: VisualizerFrameValidity = VisualizerFrameValidity()
     ) {
         self.type = type
         self.data = data
         self.localDisplayTime = localDisplayTime
+        self.streamConfiguration = streamConfiguration
         self.validity = validity
     }
 
     public static func == (lhs: VisualizerData, rhs: VisualizerData) -> Bool {
         lhs.type == rhs.type && lhs.data == rhs.data && lhs.localDisplayTime == rhs.localDisplayTime
+            && lhs.streamConfiguration == rhs.streamConfiguration
             && lhs.validity === rhs.validity
     }
 }

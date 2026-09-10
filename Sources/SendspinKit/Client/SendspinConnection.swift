@@ -24,6 +24,9 @@ actor SendspinConnection {
     let audioSink: AsyncStream<AudioChunk>.Continuation
     let artworkSink: AsyncStream<ArtworkData>.Continuation
     let visualizerSink: AsyncStream<VisualizerData>.Continuation
+    let visualizerDelivery: VisualizerDataMailbox?
+    let dataDelivery: ConnectionDataDelivery?
+    let activationGate: ConnectionActivationGate?
     let emitRawAudio: Bool
     let artworkObserver: (@Sendable (ArtworkData) -> Void)?
     let validity: SessionValidityToken
@@ -85,6 +88,8 @@ actor SendspinConnection {
     var visualizerStreamConfiguration: VisualizerStreamConfiguration?
     /// Invalidates queued public frames when the visualizer stream boundary advances.
     var visualizerFrameValidity = VisualizerFrameValidity()
+    /// Local display timestamps must not rewind during an in-place stream/start.
+    var visualizerTimestampFloor: Int64?
     var artworkStateSent = false
     var artworkStreamChannels: [StreamArtworkChannelConfig] = []
     var artworkTransfer: ArtworkTransfer?
@@ -155,12 +160,15 @@ actor SendspinConnection {
     struct DynamicPairingAttempt {
         let format: PairingCodeFormat
         let pairingIndex: UInt32
-        let sid: Data
         let nonceB: Data
         let commitB: Data
         let digitAudioDescriptor: DigitAudioDescriptor?
         var digitAudioValidator: DigitAudioPackValidator?
         var nonceA: Data?
+        var prs: Data?
+        var emission: PairingCodeEmission?
+        var round: UInt32
+        var sid: Data?
         var pairInitSent: Bool
         var serverShare: Data?
         var cpace: CPace?
@@ -275,6 +283,9 @@ actor SendspinConnection {
         audioSink: AsyncStream<AudioChunk>.Continuation = AsyncStream<AudioChunk>.makeStream().1,
         artworkSink: AsyncStream<ArtworkData>.Continuation = AsyncStream<ArtworkData>.makeStream().1,
         visualizerSink: AsyncStream<VisualizerData>.Continuation = AsyncStream<VisualizerData>.makeStream().1,
+        visualizerDelivery: VisualizerDataMailbox? = nil,
+        dataDelivery: ConnectionDataDelivery? = nil,
+        activationGate: ConnectionActivationGate? = nil,
         emitRawAudio: Bool = true,
         artworkObserver: (@Sendable (ArtworkData) -> Void)? = nil,
         validity: SessionValidityToken,
@@ -339,6 +350,9 @@ actor SendspinConnection {
         self.audioSink = audioSink
         self.artworkSink = artworkSink
         self.visualizerSink = visualizerSink
+        self.visualizerDelivery = visualizerDelivery
+        self.dataDelivery = dataDelivery
+        self.activationGate = activationGate
         self.emitRawAudio = emitRawAudio
         self.artworkObserver = artworkObserver
         self.validity = validity

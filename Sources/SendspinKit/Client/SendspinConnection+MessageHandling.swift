@@ -51,7 +51,7 @@ extension SendspinConnection {
                 let abort = try JSONDecoder().decode(PairAbortMessage.self, from: data)
                 clearPairingAttempt(reason: abort.payload.reason)
 
-            case "client/pair-pending", "client/pair-init", "client/pair-auth", "client/pair-confirm":
+            case "client/pair-pending", "client/pair-init", "client/pair-auth", "client/pair-retry", "client/pair-confirm":
                 throw PairingProtocolError.invalidSequence
 
             case "server/time":
@@ -92,6 +92,7 @@ extension SendspinConnection {
                 || msgType == "client/pair-pending"
                 || msgType == "client/pair-init"
                 || msgType == "client/pair-auth"
+                || msgType == "client/pair-retry"
                 || msgType == "client/pair-confirm"
                 || msgType == "pair/abort"
                 || (msgType == ServerHelloMessage.typeString && awaitingRehandshakeActivation) {
@@ -304,6 +305,20 @@ extension SendspinConnection {
             session: sessionContext
         ) {
         case .admit:
+            if activities == [.pairing], nextActivities != [.pairing], let activationGate {
+                let verdict = await activationGate.request(
+                    activities: nextActivities,
+                    activeRoles: nextRoles
+                )
+                guard case .admit = verdict else {
+                    if case let .reject(reason) = verdict {
+                        try? await sendWrapped(ClientGoodbyeMessage(payload: GoodbyePayload(reason: reason)))
+                    }
+                    disconnectReason = .explicit(.concurrentAttempt)
+                    await transport.disconnect()
+                    return
+                }
+            }
             activities = nextActivities
             pairingAttemptActive = nextActivities == [.pairing]
             let completedRehandshake = awaitingRehandshakeActivation
@@ -322,8 +337,7 @@ extension SendspinConnection {
                 if !activeRoles.contains(.visualizerV1) {
                     visualizerStreamActive = false
                     visualizerStreamConfiguration = nil
-                    visualizerFrameValidity.invalidate()
-                    visualizerFrameValidity = VisualizerFrameValidity()
+                    resetVisualizerDelivery(resetTimestampFloor: true)
                 }
             }
             try? await publishClientState(bypassRehandshakeGate: completedRehandshake)
@@ -440,7 +454,6 @@ extension SendspinConnection {
         #else
             let pairingHandshakeHash = channel.handshakeHash
         #endif
-        let sid = CPaceSessionIdentifier.make(handshakeHash: pairingHandshakeHash, counter: pairingActivateCounter)
         let advertisement = await livePairingAdvertisement()
         let dynamicDescriptor = advertisement.supportedPairMethods[PairMethod.dynamicPairingCode]
         let digitAudioDescriptor = selectedFormat == .digits && dynamicDescriptor?.outChannels?.contains("speaker") == true
@@ -449,21 +462,22 @@ extension SendspinConnection {
         dynamicPairingAttempt = DynamicPairingAttempt(
             format: selectedFormat,
             pairingIndex: pairingActivateCounter,
-            sid: sid,
             nonceB: nonceB,
             commitB: commitB,
             digitAudioDescriptor: digitAudioDescriptor,
             digitAudioValidator: digitAudioDescriptor.map { DigitAudioPackValidator(descriptor: $0) },
             nonceA: nil,
+            prs: nil,
+            round: 0,
+            sid: nil,
             pairInitSent: false,
             serverShare: nil,
             cpace: nil,
             secrets: nil,
             clientConfirmationSent: false
         )
-        let count = await pairingStore?.dynamicPairingFailureCount() ?? 0
-        let escalated = count >= dynamicPairingFailureEscalationThreshold
-        if escalated, !pairingWindowOpen {
+        let roundCount = await pairingStore?.dynamicPairingRoundCount() ?? 0
+        if roundCount >= dynamicPairingRoundLimit, !pairingWindowOpen {
             try? await sendWrapped(ClientPairPendingMessage(
                 payload: ClientPairPendingPayload(pairingIndex: pairingActivateCounter)
             ))
@@ -504,7 +518,7 @@ extension SendspinConnection {
         #else
             let pairingHandshakeHash = channel.handshakeHash
         #endif
-        let sid = CPaceSessionIdentifier.make(handshakeHash: pairingHandshakeHash, counter: pairingActivateCounter)
+        let sid = CPaceSessionIdentifier.make(handshakeHash: pairingHandshakeHash, counter: pairingActivateCounter, round: 1)
         staticPairingAttempt = StaticPairingAttempt(
             pairingIndex: pairingActivateCounter,
             sid: sid,
@@ -528,13 +542,18 @@ extension SendspinConnection {
         pairingWindowOpen = false
         pairingWindowTask?.cancel()
         pairingWindowTask = nil
-        pairingAttemptTask?.cancel()
-        pairingAttemptTask = Task { [weak self] in
-            try? await Task.sleep(for: self?.pairingAttemptTimeout ?? .seconds(120))
-            guard !Task.isCancelled else { return }
-            await self?.pairingAttemptTimedOut()
+        if attempt.round == 0 {
+            pairingAttemptTask = Task { [weak self] in
+                try? await Task.sleep(for: self?.pairingAttemptTimeout ?? .seconds(120))
+                guard !Task.isCancelled else { return }
+                await self?.pairingAttemptTimedOut()
+            }
         }
-        attempt.nonceA = nil
+        attempt.pairInitSent = false
+        attempt.serverShare = nil
+        attempt.cpace = nil
+        attempt.secrets = nil
+        attempt.clientConfirmationSent = false
         dynamicPairingAttempt = attempt
         do {
             try await sendWrapped(ClientPairInitMessage(payload: ClientPairInitPayload(
@@ -550,6 +569,8 @@ extension SendspinConnection {
 
     func openPairingWindow() async {
         guard !pairingWindowOpen else { return }
+        await pairingStore?.resetDynamicPairingFailureCount()
+        await pairingStore?.resetDynamicPairingRoundCount()
         pairingWindowOpen = true
         pairingWindowTask?.cancel()
         pairingWindowTask = Task { [weak self] in
@@ -621,51 +642,100 @@ extension SendspinConnection {
     }
 
     func handleServerPairInit(_ message: ServerPairInitMessage) async throws {
-        // A server message left over after an ended attempt is discarded silently.
         guard dynamicPairingAttempt != nil || staticPairingAttempt != nil else { return }
-        guard var attempt = dynamicPairingAttempt, attempt.pairInitSent, attempt.nonceA == nil,
-              let nonceA = Base64URL.decode(message.payload.nonceA, count: 32)
+        guard var attempt = dynamicPairingAttempt, attempt.pairInitSent,
+              attempt.cpace == nil, attempt.serverShare == nil
         else { throw PairingProtocolError.invalidSequence }
-        let digitAudioPack: DigitAudioPack? = if let validator = attempt.digitAudioValidator {
-            try validator.finish()
-        } else {
-            nil
-        }
-        attempt.nonceA = nonceA
-        var input = Data("sendspin-pairing-code-derive-v1".utf8)
-        #if DEBUG
-            input.append(pairingHandshakeHashOverride ?? channel.handshakeHash)
-        #else
-            input.append(channel.handshakeHash)
-        #endif
-        input.append(nonceA); input.append(attempt.nonceB)
-        let digest = Data(SHA256.hash(data: input))
-        let prs: Data
-        let emission: PairingCodeEmission
-        switch attempt.format {
-        case .digits:
-            var value: UInt64 = 0
-            for byte in digest {
-                value = (value * 256 + UInt64(byte)) % 1_000_000
+        let nextRound = attempt.round == 0 ? 1 : attempt.round + 1
+        if let pairingStore {
+            guard await pairingStore.dynamicPairingRoundCount() < dynamicPairingRoundLimit else {
+                clearPairingAttempt(reason: .pairingCodeMismatch)
+                try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .pairingCodeMismatch)))
+                return
             }
-            prs = Data(String(format: "%06llu", value).utf8)
-            emission = PairingCodeEmission(
-                format: .digits,
-                payload: String(data: prs, encoding: .utf8)!,
-                digitAudioPack: digitAudioPack
-            )
-        case .qrCode:
-            prs = digest.prefix(24)
-            emission = PairingCodeEmission(format: .qrCode, payload: PairingToken.dynamicCodeToken(Data(prs)))
+            guard await pairingStore.incrementDynamicPairingRoundCount() <= dynamicPairingRoundLimit else {
+                clearPairingAttempt(reason: .pairingCodeMismatch)
+                try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .pairingCodeMismatch)))
+                return
+            }
+        } else if nextRound > dynamicPairingRoundLimit {
+            clearPairingAttempt(reason: .pairingCodeMismatch)
+            try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .pairingCodeMismatch)))
+            return
         }
+        attempt.round = nextRound
+        if attempt.prs == nil {
+            guard let encodedNonceA = message.payload.nonceA,
+                  let nonceA = Base64URL.decode(encodedNonceA, count: 32)
+            else { throw PairingProtocolError.invalidSequence }
+            let digitAudioPack: DigitAudioPack? = if let validator = attempt.digitAudioValidator {
+                try validator.finish()
+            } else {
+                nil
+            }
+            attempt.nonceA = nonceA
+            var input = Data("sendspin-pairing-code-derive-v1".utf8)
+            #if DEBUG
+                input.append(pairingHandshakeHashOverride ?? channel.handshakeHash)
+            #else
+                input.append(channel.handshakeHash)
+            #endif
+            input.append(nonceA); input.append(attempt.nonceB)
+            let digest = Data(SHA256.hash(data: input))
+            let prs: Data
+            let emission: PairingCodeEmission
+            switch attempt.format {
+            case .digits:
+                var value: UInt64 = 0
+                for byte in digest {
+                    value = (value * 256 + UInt64(byte)) % 1_000_000
+                }
+                prs = Data(String(format: "%06llu", value).utf8)
+                emission = PairingCodeEmission(
+                    format: .digits,
+                    payload: String(data: prs, encoding: .utf8)!,
+                    digitAudioPack: digitAudioPack
+                )
+            case .qrCode:
+                prs = digest.prefix(24)
+                emission = PairingCodeEmission(format: .qrCode, payload: PairingToken.dynamicCodeToken(Data(prs)))
+            }
+            attempt.prs = prs
+            attempt.emission = emission
+            controlSink.enqueue(.pairingCodeChanged(emission))
+        } else {
+            guard message.payload.nonceA == nil, let prs = attempt.prs else {
+                throw PairingProtocolError.invalidSequence
+            }
+            if let emission = attempt.emission {
+                controlSink.enqueue(.pairingCodeChanged(emission))
+            }
+            attempt.clientConfirmationSent = false
+            attempt.serverShare = nil
+            attempt.secrets = nil
+            attempt.sid = nil
+            attempt.cpace = nil
+            _ = prs
+        }
+        guard let prs = attempt.prs else { throw PairingProtocolError.invalidSequence }
+        #if DEBUG
+            let pairingHandshakeHash = pairingHandshakeHashOverride ?? channel.handshakeHash
+        #else
+            let pairingHandshakeHash = channel.handshakeHash
+        #endif
+        let sid = CPaceSessionIdentifier.make(
+            handshakeHash: pairingHandshakeHash,
+            counter: attempt.pairingIndex,
+            round: attempt.round
+        )
+        attempt.sid = sid
         attempt.cpace = try CPace(
             role: .responder,
             prs: prs,
-            sid: attempt.sid,
+            sid: sid,
             scalarOverride: pairingScalarBOverride
         )
         dynamicPairingAttempt = attempt
-        controlSink.enqueue(.pairingCodeChanged(emission))
     }
 
     func handleServerPairAuth(_ message: ServerPairAuthMessage) async throws {
@@ -745,29 +815,41 @@ extension SendspinConnection {
     private func handleDynamicServerPairConfirm(_ message: ServerPairConfirmMessage) async throws {
         guard var attempt = dynamicPairingAttempt,
               !attempt.clientConfirmationSent,
+              let sid = attempt.sid,
               let cpace = attempt.cpace,
               let secrets = attempt.secrets,
               let serverShare = attempt.serverShare,
               let tag = Base64URL.decode(message.payload.serverKc, count: 64)
         else { throw PairingProtocolError.invalidSequence }
-        let expected = CPaceX25519.mcfTag(isk: secrets.isk, sid: attempt.sid, share: serverShare, associatedData: CPaceX25519.defaultInitiatorAD)
+        let expected = CPaceX25519.mcfTag(isk: secrets.isk, sid: sid, share: serverShare, associatedData: CPaceX25519.defaultInitiatorAD)
         guard CPaceX25519.constantTimeEqual(tag, expected) else {
             _ = await pairingStore?.incrementDynamicPairingFailureCount()
-            clearPairingAttempt(reason: .pairingCodeMismatch)
-            try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .pairingCodeMismatch)))
+            let globalRounds = await pairingStore?.dynamicPairingRoundCount() ?? attempt.round
+            if attempt.round < dynamicPairingRoundLimit, globalRounds < dynamicPairingRoundLimit {
+                attempt.serverShare = nil
+                attempt.cpace = nil
+                attempt.secrets = nil
+                attempt.sid = nil
+                dynamicPairingAttempt = attempt
+                try? await sendWrapped(ClientPairRetryMessage(payload: ClientPairRetryPayload()))
+            } else {
+                clearPairingAttempt(reason: .pairingCodeMismatch)
+                try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .pairingCodeMismatch)))
+            }
             return
         }
         await pairingStore?.resetDynamicPairingFailureCount()
+        await pairingStore?.resetDynamicPairingRoundCount()
         let clientTag = CPaceX25519.mcfTag(
             isk: secrets.isk,
-            sid: attempt.sid,
+            sid: sid,
             share: cpace.publicShare,
             associatedData: CPaceX25519.defaultResponderAD
         )
         let wrappedNonce = try PairingWrap.wrap(
             plaintext: attempt.nonceB,
             label: Data("sendspin-pair-nonce-wrap-v1".utf8),
-            sid: attempt.sid,
+            sid: sid,
             isk: secrets.isk,
             suite: suite
         )
@@ -784,7 +866,7 @@ extension SendspinConnection {
         let wrappedPsk = try PairingWrap.wrap(
             plaintext: generated.bytes,
             label: Data("sendspin-pair-psk-wrap-v1".utf8),
-            sid: attempt.sid,
+            sid: sid,
             isk: secrets.isk,
             suite: suite
         )
@@ -1045,11 +1127,12 @@ extension SendspinConnection {
                 Log.client.warning("Discarding invalid visualizer stream configuration")
                 visualizerStreamActive = false
                 visualizerStreamConfiguration = nil
-                visualizerFrameValidity.invalidate()
-                visualizerFrameValidity = VisualizerFrameValidity()
+                resetVisualizerDelivery(resetTimestampFloor: true)
             } else {
-                visualizerFrameValidity.invalidate()
-                visualizerFrameValidity = VisualizerFrameValidity()
+                let startsNewStream = !visualizerStreamActive
+                if startsNewStream {
+                    resetVisualizerDelivery(resetTimestampFloor: true)
+                }
                 visualizerStreamConfiguration = VisualizerStreamConfiguration(
                     types: visualizerInfo.types,
                     rateMax: visualizerInfo.rateMax,
@@ -1164,8 +1247,7 @@ extension SendspinConnection {
             audioEngine.commands.enqueue(.streamClear(roles: roles))
         }
         if roles == nil || roles?.contains("visualizer") == true {
-            visualizerFrameValidity.invalidate()
-            visualizerFrameValidity = VisualizerFrameValidity()
+            resetVisualizerDelivery(resetTimestampFloor: true)
         }
         // stream/clear invalidates queued visualizer frames without ending the negotiated stream.
 
@@ -1191,8 +1273,7 @@ extension SendspinConnection {
         if endedRoles == nil || endedRoles?.contains("visualizer") == true {
             visualizerStreamActive = false
             visualizerStreamConfiguration = nil
-            visualizerFrameValidity.invalidate()
-            visualizerFrameValidity = VisualizerFrameValidity()
+            resetVisualizerDelivery(resetTimestampFloor: true)
         }
 
         // Per spec, entering external_source causes the server to end active streams.
@@ -1282,7 +1363,11 @@ extension SendspinConnection {
                 serverTimestamp: message.timestamp,
                 sendAhead: message.sendAhead
             )
-            validity.yieldIfValid(chunk, to: audioSink)
+            if let dataDelivery {
+                dataDelivery.yieldAudioIfValid(chunk, validity: validity)
+            } else {
+                validity.yieldIfValid(chunk, to: audioSink)
+            }
         }
 
         // Only enqueue to engine if clock is synced. Tag the frame at ingress so a format
@@ -1354,8 +1439,12 @@ extension SendspinConnection {
             artworkPending[result.channel] = nil
             artworkScheduleTasks[result.channel]?.cancel()
             artworkScheduleTasks[result.channel] = nil
-            artworkObserver?(artwork)
-            validity.yieldIfValid(artwork, to: artworkSink)
+            if let dataDelivery {
+                dataDelivery.yieldArtworkIfValid(artwork, validity: validity)
+            } else {
+                artworkObserver?(artwork)
+                validity.yieldIfValid(artwork, to: artworkSink)
+            }
         } else {
             artworkPending[result.channel] = ScheduledArtwork(artwork: artwork, localDisplayTime: localTime)
             artworkScheduleTasks[result.channel]?.cancel()
@@ -1373,8 +1462,12 @@ extension SendspinConnection {
         guard let pending = artworkPending[channel], pending.localDisplayTime <= scheduleNow() else { return }
         artworkPending[channel] = nil
         artworkScheduleTasks[channel] = nil
-        artworkObserver?(pending.artwork)
-        validity.yieldIfValid(pending.artwork, to: artworkSink)
+        if let dataDelivery {
+            dataDelivery.yieldArtworkIfValid(pending.artwork, validity: validity)
+        } else {
+            artworkObserver?(pending.artwork)
+            validity.yieldIfValid(pending.artwork, to: artworkSink)
+        }
     }
 
     private func recordArrivalDelay(message: BinaryMessage, arrival: Int64) async {
@@ -1461,12 +1554,37 @@ extension SendspinConnection {
             Log.client.warning("Discarding stale visualizer binary")
             return
         }
+        if let floor = visualizerTimestampFloor, localDisplayTime < floor {
+            Log.client.warning("Discarding out-of-order visualizer binary")
+            return
+        }
+        visualizerTimestampFloor = localDisplayTime
         let visualizerData = VisualizerData(
             type: type,
             data: message.data,
             localDisplayTime: localDisplayTime,
+            streamConfiguration: configuration,
             validity: visualizerFrameValidity
         )
-        validity.yieldIfValid(visualizerData, to: visualizerSink)
+        if let dataDelivery {
+            dataDelivery.offerVisualizerIfValid(visualizerData, validity: validity)
+        } else if let visualizerDelivery {
+            validity.offerIfValid(visualizerData, to: visualizerDelivery)
+        } else {
+            validity.yieldIfValid(visualizerData, to: visualizerSink)
+        }
+    }
+
+    private func resetVisualizerDelivery(resetTimestampFloor: Bool) {
+        visualizerFrameValidity.invalidate()
+        visualizerFrameValidity = VisualizerFrameValidity()
+        if let dataDelivery {
+            dataDelivery.clearVisualizer()
+        } else {
+            visualizerDelivery?.clear()
+        }
+        if resetTimestampFloor {
+            visualizerTimestampFloor = nil
+        }
     }
 }

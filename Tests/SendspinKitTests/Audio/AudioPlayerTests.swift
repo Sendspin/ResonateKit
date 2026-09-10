@@ -181,42 +181,61 @@ struct AudioPlayerTests {
     // MARK: - Perceptual volume
 
     @Test
-    func graceExpiryRebaselineCursorAbsorbsStartupBias() {
-        let formatSampleRate = 44_100
-        let formatChannels = 2
-        let expectedServerTime: Int64 = 10_000_000
-        // Only an input to the helper under test, not the thing being guarded — built from the
-        // primed buffer count so it stays a representative depth if that count changes.
-        let audioQueueLatencyUs = Int64(audioQueueBufferCount) * Int64(audioQueueBufferByteSize)
-            * 1_000_000 / Int64(formatSampleRate * formatChannels * 2)
-        let biasedRawCursor = expectedServerTime
-
-        /// The error a frame handed over now reports: it becomes audible one pipeline latency
-        /// from now, so in equilibrium the cursor must LEAD by that latency.
-        func syncError(cursor: Int64) -> Int64 {
-            (expectedServerTime + audioQueueLatencyUs) - cursor
-        }
-
-        let biasedSyncError = syncError(cursor: biasedRawCursor)
-        #expect(biasedSyncError > CorrectionPlanner.defaultEngageUs)
-        #expect(CorrectionPlanner().plan(
-            errorMicroseconds: biasedSyncError,
-            sampleRate: UInt32(formatSampleRate),
-            currentlyCorrecting: false
-        ).dropEveryNFrames > 0)
-
-        let rebaselinedCursor = AudioPlayer.graceExpiryRebaselineCursor(
-            expectedServerTime: expectedServerTime,
-            audioQueueLatencyUs: audioQueueLatencyUs
+    func graceExpiryRebaselineUsesDriftAwareSharedEquilibrium() {
+        let snapshot = TimeFilterSnapshot(
+            offset: 5_000,
+            drift: 0.1,
+            lastUpdate: 500_000,
+            useDrift: true,
+            clientProcessStartAbsolute: 1_000_000
         )
-        #expect(rebaselinedCursor == expectedServerTime + audioQueueLatencyUs)
+        let localNow: Int64 = 2_000_000
+        let pipelineLatencyUs: Int64 = 150_000
+        let outputDelayUs: Int64 = 237_000
+        let expectedLocalTarget = localNow + pipelineLatencyUs + outputDelayUs
+        // Independent calculation of localTimeToServer for this deliberately amplified drift.
+        let clientRelative = expectedLocalTarget - snapshot.clientProcessStartAbsolute
+        let expectedOffset = snapshot.offset + snapshot.drift * (Double(clientRelative) - Double(snapshot.lastUpdate))
+        let independentlyMappedTarget = clientRelative + Int64(expectedOffset.rounded())
 
-        #expect(syncError(cursor: rebaselinedCursor) == 0)
+        let correctionTarget = AudioPlayer.correctionEquilibriumServerTime(
+            snapshot: snapshot,
+            localNow: localNow,
+            pipelineLatencyUs: pipelineLatencyUs,
+            outputDelayUs: outputDelayUs
+        )
+        let rebaselinedCursor = AudioPlayer.graceExpiryRebaselineCursor(
+            snapshot: snapshot,
+            localNow: localNow,
+            pipelineLatencyUs: pipelineLatencyUs,
+            outputDelayUs: outputDelayUs
+        )
+
+        #expect(correctionTarget == independentlyMappedTarget)
+        #expect(rebaselinedCursor == independentlyMappedTarget)
+        #expect(correctionTarget != snapshot.localTimeToServer(localNow) + pipelineLatencyUs + outputDelayUs)
         #expect(CorrectionPlanner().plan(
-            errorMicroseconds: syncError(cursor: rebaselinedCursor),
-            sampleRate: UInt32(formatSampleRate),
+            errorMicroseconds: independentlyMappedTarget - rebaselinedCursor,
+            sampleRate: 48_000,
             currentlyCorrecting: false
         ) == CorrectionSchedule())
+    }
+
+    @Test
+    func correctionEquilibriumSaturatesLocalLatencyBeforeSnapshotMapping() {
+        let snapshot = TimeFilterSnapshot(
+            offset: 0,
+            drift: 0,
+            lastUpdate: 0,
+            useDrift: false,
+            clientProcessStartAbsolute: 0
+        )
+        #expect(AudioPlayer.correctionEquilibriumServerTime(
+            snapshot: snapshot,
+            localNow: .max - 10,
+            pipelineLatencyUs: 100,
+            outputDelayUs: 100
+        ) == .max)
     }
 
     @Test

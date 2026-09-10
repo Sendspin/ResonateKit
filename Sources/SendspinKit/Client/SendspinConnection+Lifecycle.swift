@@ -182,6 +182,11 @@ extension SendspinConnection {
         // Invalidate both the session and any queued visualizer frames.
         validity.invalidate()
         visualizerFrameValidity.invalidate()
+        if let dataDelivery {
+            dataDelivery.clearVisualizer()
+        } else {
+            visualizerDelivery?.clear()
+        }
         pairingAttemptActive = false
         pendingPairingPsk = nil
         if dynamicPairingAttempt != nil {
@@ -213,6 +218,11 @@ extension SendspinConnection {
         lifecycle = .stopped
         validity.invalidate()
         visualizerFrameValidity.invalidate()
+        if let dataDelivery {
+            dataDelivery.clearVisualizer()
+        } else {
+            visualizerDelivery?.clear()
+        }
         controlSink.finish()
         await transport.disconnect()
     }

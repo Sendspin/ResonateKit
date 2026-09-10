@@ -18,6 +18,9 @@ public extension SendspinClient {
     ///
     /// Call ``exitExternalSource()`` to return to normal operation.
     ///
+    /// This is the non-interruptible external-source path: the client remains
+    /// unavailable while the external activity owns its output.
+    ///
     /// - Throws: ``SendspinClientError/notConnected`` if not connected,
     ///   or ``SendspinClientError/sendFailed(_:)`` if the server notification fails.
     @MainActor
@@ -30,9 +33,9 @@ public extension SendspinClient {
 
     /// Return to normal synchronized operation after ``enterExternalSource()``.
     ///
-    /// Tells the server this client is ready to receive audio again.
-    /// The server will typically move the client back into its previous group
-    /// via `group/update`.
+    /// Tells the server this client is ready to receive audio again. The server
+    /// does not automatically rejoin the previous group; rejoining requires an
+    /// explicit group switch or another server-directed group change.
     ///
     /// The local state is rolled back if the server notification fails
     /// (see ``enterExternalSource()`` for rationale).
@@ -45,6 +48,26 @@ public extension SendspinClient {
         // Signal engine to resume underrun monitoring only after the server
         // accepted the state transition; failed sends leave engine/facade aligned.
         await connection?.setExternalSource(false)
+    }
+}
+
+// MARK: - Group membership
+
+public extension SendspinClient {
+    /// Leave the current server group without changing local group state.
+    ///
+    /// This operation is available to every client role. The server moves the
+    /// client to a stopped solo group; returning to the previous group requires
+    /// an explicit server-directed switch or group update.
+    ///
+    /// - Throws: ``SendspinClientError/notConnected`` when disconnected,
+    ///   ``SendspinClientError/handshakeIncomplete`` during re-handshake, or
+    ///   ``SendspinClientError/sendFailed(_:)`` when the encrypted send fails.
+    @MainActor
+    func leaveGroup() async throws {
+        try requireOpen()
+        guard let connection else { throw SendspinClientError.notConnected }
+        try await connection.leaveGroup()
     }
 }
 
@@ -150,7 +173,7 @@ public extension SendspinClient {
     @MainActor
     func openPairingWindow() async throws {
         try requireOpen()
-        guard let connection else { throw SendspinClientError.notConnected }
+        guard let connection = pairingTargetConnection() else { throw SendspinClientError.notConnected }
         await connection.openPairingWindow()
     }
 
@@ -158,7 +181,7 @@ public extension SendspinClient {
     @MainActor
     func cancelPairingAttempt() async throws {
         try requireOpen()
-        guard let connection else { throw SendspinClientError.notConnected }
+        guard let connection = pairingTargetConnection() else { throw SendspinClientError.notConnected }
         await connection.cancelPairingAttempt()
     }
 

@@ -67,8 +67,8 @@ public struct PairingStorageAccounting: Sendable, Equatable {
     }
 }
 
-/// Dynamic pairing failures required before a code attempt waits for the host gesture.
-let dynamicPairingFailureEscalationThreshold = 5
+/// Maximum dynamic pairing rounds allowed globally since the last verified confirmation or operator reset.
+let dynamicPairingRoundLimit: UInt32 = 20
 
 /// Host-local pairing settings shared by handshake candidates and active sessions.
 public struct PairingManagementConfiguration: Sendable, Equatable {
@@ -164,6 +164,16 @@ public protocol PairingRecordStore: Sendable {
 
     /// Reset the dynamic pairing failure count atomically.
     func resetDynamicPairingFailureCount() async
+
+    /// Return the global number of dynamic pairing rounds since the last verified key confirmation.
+    /// Implementations must persist this counter globally, not partition it by server or address.
+    func dynamicPairingRoundCount() async -> UInt32
+
+    /// Record an emitted dynamic pairing round and return the new global count.
+    func incrementDynamicPairingRoundCount() async -> UInt32
+
+    /// Reset the global dynamic pairing round count after successful confirmation or operator action.
+    func resetDynamicPairingRoundCount() async
 }
 
 public extension PairingRecordStore {
@@ -197,6 +207,7 @@ public enum PairingRecordStoreError: Error, Sendable, Equatable {
 public actor InMemoryPairingRecordStore: PairingRecordStore {
     private var records: [PairingRecord]
     private var dynamicPairingFailureCount = 0
+    private var dynamicPairingRoundCount = 0
     private let reservedPskIds: Set<String>
 
     public init(pairingPsk: Psk? = nil, preProvisionedRecord: PairingRecord? = nil) {
@@ -257,6 +268,19 @@ public actor InMemoryPairingRecordStore: PairingRecordStore {
 
     public func resetDynamicPairingFailureCount() async {
         dynamicPairingFailureCount = 0
+    }
+
+    public func dynamicPairingRoundCount() async -> UInt32 {
+        UInt32(dynamicPairingRoundCount)
+    }
+
+    public func incrementDynamicPairingRoundCount() async -> UInt32 {
+        dynamicPairingRoundCount += 1
+        return UInt32(dynamicPairingRoundCount)
+    }
+
+    public func resetDynamicPairingRoundCount() async {
+        dynamicPairingRoundCount = 0
     }
 }
 

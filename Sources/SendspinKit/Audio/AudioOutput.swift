@@ -630,6 +630,10 @@ protocol AudioOutput: Actor, Sendable {
     /// device path. Valid once `prepare(format:codecHeader:)` has run.
     func pipelineLatencyMicroseconds() -> Int64
 
+    /// Additional local-domain output delay applied to scheduled chunks.
+    /// This is included in render-correction equilibrium but never changes server timestamps.
+    func setOutputDelayMicroseconds(_ delay: Int64)
+
     /// Wait until the output device has actually begun producing. Releasing before this
     /// buffers audio into a pipeline that is not yet consuming.
     func waitUntilOutputDeviceIsLive() async throws

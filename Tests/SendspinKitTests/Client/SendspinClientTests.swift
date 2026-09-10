@@ -1115,12 +1115,13 @@ struct SendspinClientTests {
             .compactMap { (try? decoder.decode(ClientGoodbyeMessage.self, from: $0))?.payload.reason }
     }
 
-    private func streamFinishes(_ stream: AsyncStream<some Sendable>) async -> Bool {
+    private func streamFinishes<S: AsyncSequence & Sendable>(_ stream: S) async -> Bool
+        where S.Element: Sendable {
         let result = await outcomeOfUnstructuredOperation(
             timeout: .seconds(1),
             operation: {
                 var iterator = stream.makeAsyncIterator()
-                while await iterator.next() != nil {}
+                while try await iterator.next() != nil {}
                 return true
             }
         )

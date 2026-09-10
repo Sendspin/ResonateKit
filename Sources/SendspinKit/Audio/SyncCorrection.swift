@@ -32,6 +32,15 @@ struct AudioChunkPlaybackTimeline {
     private var previousDecodedDurationUs: Int64?
     private(set) var usesDecodedTimeline = false
 
+    /// Shift the local anchor when output delay changes. Wire timestamps and decoded cadence remain
+    /// untouched; only the local instant carried by this timeline moves once.
+    mutating func rebaseOutputDelay(from oldDelayUs: Int64, to newDelayUs: Int64) {
+        let delta = oldDelayUs.subtractingReportingOverflow(newDelayUs)
+        let shift = delta.overflow ? (oldDelayUs >= newDelayUs ? Int64.max : Int64.min) : delta.partialValue
+        guard shift != 0 else { return }
+        previousPlayTimeUs = previousPlayTimeUs?.saturatingAdding(shift)
+    }
+
     /// Return the local play time for one decoded chunk. Once a material cadence mismatch is
     /// observed, remain on the decoded-duration timeline for the rest of this stream generation;
     /// switching back to wire timestamps mid-buffer would reintroduce a discontinuity.

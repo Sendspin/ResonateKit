@@ -75,4 +75,12 @@ final class SessionValidityToken: Sendable {
             continuation.yield(element)
         }
     }
+
+    /// Atomically check validity before offering a frame to bounded delivery.
+    func offerIfValid(_ element: VisualizerData, to mailbox: VisualizerDataMailbox) {
+        lock.withLock { isValidNow in
+            guard isValidNow else { return }
+            mailbox.offer(element)
+        }
+    }
 }

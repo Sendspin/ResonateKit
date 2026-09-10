@@ -58,6 +58,18 @@ struct TimeFilterSnapshotTests {
     // MARK: - Negative offset
 
     @Test
+    func localDelayDoesNotChangeServerClockProgressInverse() {
+        let serverTimestamp: Int64 = 750_000
+        let localDue = Self.driftSnapshot.serverTimeToLocal(serverTimestamp)
+        let delayedLocalDue = localDue - 237_000
+
+        #expect(Self.driftSnapshot.localTimeToServer(localDue) == serverTimestamp)
+        // A local scheduling correction is not metadata progress; convert it back only
+        // when explicitly measuring the earlier handoff instant.
+        #expect(Self.driftSnapshot.localTimeToServer(delayedLocalDue) != serverTimestamp)
+    }
+
+    @Test
     func serverTimeToLocal_worksWithNegativeOffset() {
         // offset = -3_000 means client is ahead of server
         // server_time = 510_000

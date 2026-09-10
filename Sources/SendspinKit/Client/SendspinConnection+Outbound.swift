@@ -35,21 +35,28 @@ extension SendspinConnection {
         await transport.disconnect()
     }
 
-    func sendWrapped(_ message: some Codable & Sendable, bypassRehandshakeGate: Bool = false) async throws {
+    func sendWrapped(
+        _ message: some Codable & Sendable,
+        bypassRehandshakeGate: Bool = false,
+        requireRunningLifecycle: Bool = false
+    ) async throws {
         await acquireOutboundSlot()
         defer { releaseOutboundSlot() }
 
         guard !outboundFailed else {
             throw SendspinClientError.sendFailed("outbound channel is dead")
         }
-        // Gate check comes after acquisition: a sender that parked during the
-        // exchange must not encrypt under pre-swap keys.
+        // Gate checks come after acquisition: a sender parked during an exchange
+        // or shutdown must not proceed under stale keys or a closing session.
         guard bypassRehandshakeGate || !rehandshakeInProgress else {
             throw SendspinClientError.handshakeIncomplete
         }
-        guard lifecycle == .running || lifecycle == .shuttingDown else {
-            // `.shuttingDown` permits the intentional goodbye; everything else
-            // on a stopped connection is rejected.
+        let lifecycleAllowsSend = requireRunningLifecycle
+            ? lifecycle == .running
+            : lifecycle == .running || lifecycle == .shuttingDown
+        guard lifecycleAllowsSend else {
+            // `.shuttingDown` permits the intentional goodbye; leave opts out so
+            // a queued leave cannot follow that goodbye onto a closing transport.
             throw SendspinClientError.notConnected
         }
         if Task.isCancelled {

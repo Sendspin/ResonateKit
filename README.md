@@ -108,6 +108,20 @@ to select a supported audio format, and `setArtworkChannelPreference(channel:pre
 `ArtworkChannelPreference.set(source:format:width:height:)` or `.disable` to update an artwork
 channel. These preferences can be changed while connected and apply to the active or next stream.
 
+### Group membership and external sources
+
+A client can leave its current group without requiring the controller role:
+
+```swift
+try await client.leaveGroup()
+```
+
+This sends `client/leave` with an empty payload. The server stops playback for this client and
+places it in a solo group; the client does not invent or clear local group state, and returning to
+the previous group requires an explicit server-directed group change. For non-interruptible local
+playback, use `enterExternalSource()` and `exitExternalSource()` instead. Exiting an external source
+makes the client available again but does not automatically rejoin its previous group.
+
 ## Pairing codes
 
 Pairing-code flows are app-facing setup hooks. Enable a method in `PairingConfiguration`, then
@@ -203,9 +217,10 @@ rate, conditional `tracks_downbeats`, and spectrum parameters are exposed by the
 delivered through `client.visualizerData`; each `VisualizerData` includes its `type`, raw payload,
 local display deadline, and a stream-generation validity token. Consumers must check
 `frame.isRenderable` immediately before drawing: this rejects frames invalidated by
-`stream/clear`, `stream/end`, configuration changes, or session replacement, and also rejects
-frames whose display deadline has become stale while queued. Frames whose translated deadline
-has already passed at arrival are discarded.
+`stream/clear`, `stream/end`, or session replacement, and also rejects frames whose display
+deadline has become stale while queued. Each frame retains the negotiated configuration that
+validated it, including across an in-place configuration update. Frames whose translated
+deadline has already passed at arrival are discarded.
 
 ```swift
 let visualizer = try SendspinClient(

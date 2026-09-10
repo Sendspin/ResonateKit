@@ -47,6 +47,20 @@ include ``SpectrumConfiguration`` whenever the requested types contain ``Visuali
 These role configurations seed the initial `client/state` snapshot; dynamic preference changes use the
 corresponding state-preference APIs.
 
+## Leave a group
+
+Any client role can leave its current server group:
+
+```swift
+try await client.leaveGroup()
+```
+
+This sends `client/leave` with an empty payload. The server places the client in a stopped solo group;
+SendspinKit does not invent or clear local group state, and returning to the previous group requires an
+explicit server-directed group change. For non-interruptible local playback, use
+``SendspinClient/enterExternalSource()`` and ``SendspinClient/exitExternalSource()``. Exiting an external
+source makes the client available again but does not automatically rejoin its previous group.
+
 ## Connect to a server
 
 There are two connection patterns:

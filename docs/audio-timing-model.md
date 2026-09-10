@@ -46,10 +46,9 @@ is deliberately not combined with drift correction.
 
 ## What the implementation now does
 
-- The correction formula reads `(expected + L) − cursor`. Three sites shared the old, inverted
-  equilibrium — `updateCorrectionSchedule`, `graceExpiryRebaselineCursor` and the reanchor
-  target — and are now one definition.
-- `L` includes the device path, read from the HAL at `prepare()` (`OutputDeviceLatency`).
+- The correction target is one shared mapping: `snapshot.localTimeToServer(localNow + physicalPipeline + localOutputDelay)`, with saturating local arithmetic. The callback error, grace-expiry rebaseline, and reanchor target all use that exact helper, including nonzero clock drift.
+- `L` includes the device path, read from the HAL at `prepare()` (`OutputDeviceLatency`), while the commanded output delay remains a separate local-domain term.
+- A runtime output-delay change shifts every pending scheduler/startup/deferred local play instant by `oldDelay - newDelay` exactly once. Wire timestamps and decoded cadence remain unchanged; chunks already yielded to the output are immutable and are corrected by render pacing rather than rewriting PCM.
 - The queue starts on silence at `prepare()`, so the device pays its spin-up during the window
   already being spent buffering.
 - The first real frame is placed to the sample: once the queue is running the device consumes at
