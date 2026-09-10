@@ -122,7 +122,8 @@ struct LivePairingArbitrationTests {
             : ClientPairInitMessage.typeString
         _ = try await waitForLivePairingMessage(incumbent, type: firstMessageType)
         if kind == .staticCode {
-            try await client.openPairingWindow()
+            let attemptID = try #require(await MainActor.run { client.currentPairing?.id })
+            try await client.openPairingWindow(for: attemptID)
             _ = try await waitForLivePairingMessage(incumbent, type: ClientPairInitMessage.typeString)
         }
 

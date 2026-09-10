@@ -2,20 +2,33 @@ import Foundation
 
 extension SendspinClient {
     @MainActor
-    func pairingTargetConnection() -> SendspinConnection? {
-        pairingConnection ?? connection
-    }
-
-    @MainActor
     func applyPairingConnectionEvent(_ event: ConnectionEvent) {
         guard pairingConnection != nil else { return }
         switch event {
-        case let .paired(serverId):
-            emitEvent(.paired(serverId: serverId))
-        case let .pairingCodeChanged(emission):
-            emitEvent(.pairingCodeChanged(emission))
-        case let .pairingAttemptEnded(reason):
-            emitEvent(.pairingAttemptEnded(reason))
+        case let .paired(snapshot):
+            updateCurrentPairing(snapshot)
+            // A late success from an older attempt must not close a newer window.
+            if pairingWindow?.attemptID == snapshot.id {
+                clearPairingWindow()
+            }
+            emitEvent(.paired(snapshot))
+        case let .pairingCodeChanged(snapshot):
+            // The terminal event is followed by a nil-code projection so observers
+            // can see code removal without losing the terminal lifecycle state.
+            if case .ended = currentPairing?.phase, snapshot.code == nil,
+               snapshot.id == currentPairing?.id {
+                emitEvent(.pairingCodeChanged(snapshot))
+            } else {
+                updateCurrentPairing(snapshot)
+                emitEvent(.pairingCodeChanged(snapshot))
+            }
+        case let .pairingAttemptEnded(snapshot):
+            updateCurrentPairing(snapshot)
+            clearPairingWindow()
+            emitEvent(.pairingAttemptEnded(snapshot))
+        case let .pairingWindowChanged(window):
+            updatePairingWindow(window)
+            emitEvent(.pairingWindowChanged(window))
         case .disconnected:
             if let side = pairingConnection {
                 dropPairingConnection(side)

@@ -75,10 +75,11 @@ enum ConnectionEvent: Equatable {
     case playerMutedChanged(Bool)
 
     /// Pairing persisted a new long-term record.
-    case paired(serverId: String)
+    case paired(PairingAttemptSnapshot)
 
-    case pairingCodeChanged(PairingCodeEmission?)
-    case pairingAttemptEnded(PairAbortReason)
+    case pairingCodeChanged(PairingAttemptSnapshot)
+    case pairingAttemptEnded(PairingAttemptSnapshot)
+    case pairingWindowChanged(PairingWindowSnapshot?)
 
     /// Server changed admitted activities or active roles.
     case serverActivated(activities: Set<Activity>, activeRoles: Set<VersionedRole>)

@@ -31,7 +31,7 @@ func makeEstablishedConnection(
     engine: AudioEngine? = nil,
     audioSink: AsyncStream<AudioChunk>.Continuation = AsyncStream<AudioChunk>.makeStream().1,
     artworkSink: AsyncStream<ArtworkData>.Continuation = AsyncStream<ArtworkData>.makeStream().1,
-    visualizerSink: AsyncStream<VisualizerData>.Continuation = AsyncStream<VisualizerData>.makeStream().1,
+    visualizerSink: AsyncStream<VisualizerFrame>.Continuation = AsyncStream<VisualizerFrame>.makeStream().1,
     emitRawAudio: Bool = true,
     validity: SessionValidityToken = SessionValidityToken(),
     advertisedCommands: Set<PlayerCommand> = [.setOutputDelay],

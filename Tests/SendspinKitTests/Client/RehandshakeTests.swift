@@ -603,15 +603,15 @@ private actor ThrowingPairingRecordStore: PairingRecordStore {
 
     func markUsed(pskId _: String) async {}
 
-    func dynamicPairingRoundCount() async -> UInt32 {
+    func dynamicPairingRoundCount() async throws -> UInt32 {
         0
     }
 
-    func incrementDynamicPairingRoundCount() async -> UInt32 {
-        0
+    func reserveDynamicPairingRound(limit: UInt32) async throws -> DynamicPairingRoundReservation {
+        .reserved(round: 1, remaining: limit > 0 ? limit - 1 : 0)
     }
 
-    func resetDynamicPairingRoundCount() async {}
+    func resetDynamicPairingBudget() async throws {}
 }
 
 /// A bounded store whose free space cannot fit a stored-pubkey record. The
@@ -652,16 +652,17 @@ private actor ExhaustedPairingRecordStore: PairingRecordStore {
         PairingStorageAccounting(free: 0, capacity: 10, costIndividual: 1, costShared: 1)
     }
 
-    func dynamicPairingRoundCount() async -> UInt32 {
+    func dynamicPairingRoundCount() async throws -> UInt32 {
         rounds
     }
 
-    func incrementDynamicPairingRoundCount() async -> UInt32 {
+    func reserveDynamicPairingRound(limit: UInt32) async throws -> DynamicPairingRoundReservation {
+        guard rounds < limit else { return .exhausted }
         rounds += 1
-        return rounds
+        return .reserved(round: rounds, remaining: limit - rounds)
     }
 
-    func resetDynamicPairingRoundCount() async {
+    func resetDynamicPairingBudget() async throws {
         rounds = 0
     }
 }

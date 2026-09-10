@@ -14,13 +14,13 @@ final class ConnectionDataDelivery: @unchecked Sendable {
 
     private let audio: AsyncStream<AudioChunk>.Continuation
     private let artwork: AsyncStream<ArtworkData>.Continuation
-    private let visualizer: VisualizerDataMailbox
+    private let visualizer: VisualizerFrameMailbox
     private let artworkObserver: (@Sendable (ArtworkData) -> Void)?
 
     init(
         audio: AsyncStream<AudioChunk>.Continuation,
         artwork: AsyncStream<ArtworkData>.Continuation,
-        visualizer: VisualizerDataMailbox,
+        visualizer: VisualizerFrameMailbox,
         artworkObserver: (@Sendable (ArtworkData) -> Void)?
     ) {
         self.audio = audio
@@ -52,7 +52,7 @@ final class ConnectionDataDelivery: @unchecked Sendable {
         }
     }
 
-    func offerVisualizerIfValid(_ value: VisualizerData, validity: SessionValidityToken) {
+    func offerVisualizerIfValid(_ value: VisualizerFrame, validity: SessionValidityToken) {
         lock.withLock {
             guard mode == .primary else { return }
             validity.offerIfValid(value, to: visualizer)

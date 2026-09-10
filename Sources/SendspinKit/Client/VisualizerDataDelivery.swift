@@ -1,50 +1,104 @@
 import Foundation
 
-/// A bounded async sequence for visualizer frames.
-/// The mailbox has one pending consumer and a configured wire-byte budget.
-/// Oldest retained frames are discarded when a new frame does not fit.
-///
-/// A stream has a single-consumer contract: only one iterator may consume it at
-/// a time. A second live iterator returns `nil` rather than replacing the
-/// current consumer. If the owning iterator is abandoned or cancelled, a later
-/// iterator may take ownership.
-public struct VisualizerDataStream: AsyncSequence, Sendable {
-    public typealias Element = VisualizerData
+/// The error thrown when an app attempts to acquire a second visualizer consumer.
+public enum VisualizerFrameAcquisitionError: Error, Sendable, Equatable {
+    case consumerAlreadyActive
+}
 
-    private let mailbox: VisualizerDataMailbox
+/// Bounded async sequence with one mailbox consumer.
+/// Acquire it with ``SendspinClient/acquireVisualizerFrames()``; ownership lasts until
+/// `cancel()` or deallocation, and cancelling a pending `next()` releases the consumer.
+/// Copied iterators share one read; a concurrent copy ends without canceling that read.
+public final class VisualizerFrameSubscription: AsyncSequence, @unchecked Sendable {
+    public typealias Element = VisualizerFrame
 
-    init(mailbox: VisualizerDataMailbox) {
+    private let mailbox: VisualizerFrameMailbox
+    private let token: VisualizerIteratorToken
+    private let iteratorLock = NSLock()
+    private var iteratorIssued = false
+
+    init(acquiring mailbox: VisualizerFrameMailbox) throws(VisualizerFrameAcquisitionError) {
         self.mailbox = mailbox
+        let candidate = VisualizerIteratorToken(mailbox: mailbox)
+        guard mailbox.claim(lease: candidate.lease) else {
+            throw .consumerAlreadyActive
+        }
+        token = candidate
+    }
+
+    fileprivate init(mailbox: VisualizerFrameMailbox, token: VisualizerIteratorToken) {
+        self.mailbox = mailbox
+        self.token = token
     }
 
     public struct Iterator: AsyncIteratorProtocol, Sendable {
-        private let mailbox: VisualizerDataMailbox
-        private let token: VisualizerIteratorToken
+        private let mailbox: VisualizerFrameMailbox?
+        private let token: VisualizerIteratorToken?
 
-        fileprivate init(mailbox: VisualizerDataMailbox) {
+        fileprivate init(
+            mailbox: VisualizerFrameMailbox?,
+            token: VisualizerIteratorToken?
+        ) {
             self.mailbox = mailbox
-            token = VisualizerIteratorToken(mailbox: mailbox)
+            self.token = token
         }
 
-        public mutating func next() async -> VisualizerData? {
-            await mailbox.next(owner: token)
+        public mutating func next() async -> VisualizerFrame? {
+            guard let mailbox, let token, token.beginRead() else { return nil }
+            defer { token.endRead() }
+            return await mailbox.next(owner: token)
         }
     }
 
+    /// Release this subscription's mailbox ownership immediately.
+    public func cancel() {
+        mailbox.cancel(lease: token.lease)
+    }
+
+    deinit {
+        cancel()
+    }
+
+    /// A subscription has one consumer; repeated iterator requests end immediately.
     public func makeAsyncIterator() -> Iterator {
-        Iterator(mailbox: mailbox)
+        let isFirst = iteratorLock.withLock {
+            guard !iteratorIssued else { return false }
+            iteratorIssued = true
+            return true
+        }
+        guard isFirst else { return Iterator(mailbox: nil, token: nil) }
+        return Iterator(mailbox: mailbox, token: token)
     }
 }
 
 /// Identity for the one iterator allowed to consume a mailbox.
-private final class VisualizerIteratorLease: @unchecked Sendable {}
+private final class VisualizerIteratorLease: @unchecked Sendable {
+    /// Access is serialized by the mailbox lock and remains true for the lease lifetime.
+    var revoked = false
+}
 
 private final class VisualizerIteratorToken: @unchecked Sendable {
-    weak var mailbox: VisualizerDataMailbox?
+    weak var mailbox: VisualizerFrameMailbox?
     let lease = VisualizerIteratorLease()
+    private let readLock = NSLock()
+    private var readInFlight = false
 
-    init(mailbox: VisualizerDataMailbox) {
+    init(mailbox: VisualizerFrameMailbox) {
         self.mailbox = mailbox
+    }
+
+    /// Copied iterator structs share this single-flight boundary. A losing read ends
+    /// immediately and must not cancel the read that owns the mailbox waiter.
+    func beginRead() -> Bool {
+        readLock.withLock {
+            guard !readInFlight else { return false }
+            readInFlight = true
+            return true
+        }
+    }
+
+    func endRead() {
+        readLock.withLock { readInFlight = false }
     }
 
     deinit {
@@ -54,18 +108,18 @@ private final class VisualizerIteratorToken: @unchecked Sendable {
 
 /// Lock-based delivery storage keeps the message loop non-blocking and avoids
 /// an unbounded task or `AsyncStream` buffer when the host does not consume.
-final class VisualizerDataMailbox: @unchecked Sendable {
+final class VisualizerFrameMailbox: @unchecked Sendable {
     private enum ReadResult {
-        case value(VisualizerData)
+        case value(VisualizerFrame)
         case end
         case retry
     }
 
     private final class QueueNode {
-        let value: VisualizerData
+        let value: VisualizerFrame
         var next: QueueNode?
 
-        init(_ value: VisualizerData) {
+        init(_ value: VisualizerFrame) {
             self.value = value
         }
     }
@@ -82,7 +136,9 @@ final class VisualizerDataMailbox: @unchecked Sendable {
 
     private let lock = NSLock()
     private let capacityBytes: Int
-    private let now: @Sendable () -> Int64
+    private let now: @Sendable () -> PresentationInstant
+    private let beforePark: (@Sendable () -> Void)?
+    private let beforePostHandoffCheck: (@Sendable () -> Void)?
     private var queueHead: QueueNode?
     private var queueTail: QueueNode?
     private var queuedBytes = 0
@@ -94,16 +150,38 @@ final class VisualizerDataMailbox: @unchecked Sendable {
         lock.withLock { queuedBytes }
     }
 
+    var claimable: Bool {
+        lock.withLock { !finished && ownerLease == nil }
+    }
+
+    fileprivate func claim(lease: VisualizerIteratorLease) -> Bool {
+        lock.withLock {
+            guard !finished, !lease.revoked, ownerLease == nil else { return false }
+            ownerLease = lease
+            return true
+        }
+    }
+
+    private func leaseIsActive(_ lease: VisualizerIteratorLease) -> Bool {
+        lock.withLock {
+            !finished && !lease.revoked && ownerLease === lease
+        }
+    }
+
     init(
         capacityBytes: Int,
-        now: @escaping @Sendable () -> Int64 = { MonotonicClock.absoluteMicroseconds() }
+        now: @escaping @Sendable () -> PresentationInstant = { .now },
+        beforePark: (@Sendable () -> Void)? = nil,
+        beforePostHandoffCheck: (@Sendable () -> Void)? = nil
     ) {
         precondition(capacityBytes > 0)
         self.capacityBytes = capacityBytes
         self.now = now
+        self.beforePark = beforePark
+        self.beforePostHandoffCheck = beforePostHandoffCheck
     }
 
-    func offer(_ value: VisualizerData, now arrivalNow: Int64? = nil) {
+    func offer(_ value: VisualizerFrame, now arrivalNow: PresentationInstant? = nil) {
         lock.lock()
         guard !finished else {
             lock.unlock()
@@ -112,7 +190,7 @@ final class VisualizerDataMailbox: @unchecked Sendable {
 
         let currentNow = arrivalNow ?? now()
         discardExpiredLocked(now: currentNow)
-        guard value.localDisplayTime > currentNow else {
+        guard value.eligibilityForScheduling(at: currentNow) else {
             lock.unlock()
             return
         }
@@ -137,7 +215,7 @@ final class VisualizerDataMailbox: @unchecked Sendable {
         lock.unlock()
     }
 
-    fileprivate func next(owner iterator: VisualizerIteratorToken) async -> VisualizerData? {
+    fileprivate func next(owner iterator: VisualizerIteratorToken) async -> VisualizerFrame? {
         while true {
             guard !Task.isCancelled else {
                 cancel(lease: iterator.lease)
@@ -145,13 +223,14 @@ final class VisualizerDataMailbox: @unchecked Sendable {
             }
 
             enum Immediate {
-                case value(VisualizerData)
+                case value(VisualizerFrame)
                 case empty
                 case finished
                 case notOwner
             }
 
             let immediate: Immediate = lock.withLock {
+                guard !finished, !iterator.lease.revoked else { return .finished }
                 if let ownerLease, ownerLease !== iterator.lease {
                     return .notOwner
                 }
@@ -160,19 +239,19 @@ final class VisualizerDataMailbox: @unchecked Sendable {
                 }
                 discardExpiredLocked(now: now())
                 if let value = dequeueHeadLocked() {
+                    guard !iterator.lease.revoked, self.ownerLease === iterator.lease else {
+                        return .finished
+                    }
                     return .value(value)
-                }
-                if finished {
-                    return .finished
                 }
                 return .empty
             }
 
             switch immediate {
             case let .value(value):
-                // A frame can be invalidated or expire after it was dequeued.
-                // Never deliver it merely because it was fresh at dequeue time.
-                if value.isRenderable(at: now()) {
+                // Recheck both stream generation and deadline after dequeue. A
+                // consumer must never receive a frame that became stale while waking.
+                if value.isValid, value.eligibilityForScheduling(at: now()), leaseIsActive(iterator.lease) {
                     return value
                 }
                 continue
@@ -182,6 +261,7 @@ final class VisualizerDataMailbox: @unchecked Sendable {
                 break
             }
 
+            beforePark?()
             let result = await withTaskCancellationHandler {
                 await withCheckedContinuation { (continuation: CheckedContinuation<ReadResult, Never>) in
                     park(owner: iterator, continuation: continuation)
@@ -189,20 +269,17 @@ final class VisualizerDataMailbox: @unchecked Sendable {
             } onCancel: {
                 cancel(lease: iterator.lease)
             }
+            beforePostHandoffCheck?()
             switch result {
             case let .value(value):
-                // Cancellation owns the handoff decision. A frame already
-                // resumed to a canceled read is dropped; requeueing it would
-                // transfer ownership across iterator lifetimes and can strand
-                // a new waiter's continuation.
-                guard !Task.isCancelled else {
-                    cancel(lease: iterator.lease)
+                // An explicitly canceled lease drops a frame already handed to its continuation.
+                guard !Task.isCancelled, leaseIsActive(iterator.lease) else {
                     return nil
                 }
-                if value.isRenderable(at: now()) {
+                if value.isValid, value.eligibilityForScheduling(at: now()) {
                     return value
                 }
-            // The directly delivered frame expired or was invalidated
+            // The directly delivered frame was invalidated or became stale
             // while this task was waking. Wait for a fresh frame.
             // Loop to wait for the next frame rather than returning stale data.
             case .retry:
@@ -237,7 +314,8 @@ final class VisualizerDataMailbox: @unchecked Sendable {
         continuation: CheckedContinuation<ReadResult, Never>
     ) {
         let result: ReadResult? = lock.withLock {
-            guard !finished, ownerLease == nil || ownerLease === iterator.lease else { return .end }
+            guard !finished, !iterator.lease.revoked,
+                  ownerLease == nil || ownerLease === iterator.lease else { return .end }
             ownerLease = iterator.lease
             discardExpiredLocked(now: now())
             // A frame can arrive between the immediate check and installing the
@@ -262,20 +340,19 @@ final class VisualizerDataMailbox: @unchecked Sendable {
 
     fileprivate func cancel(lease: VisualizerIteratorLease) {
         let pending: CheckedContinuation<ReadResult, Never>? = lock.withLock {
+            lease.revoked = true
             guard ownerLease === lease else { return nil }
             let pending = waiter?.lease === lease ? waiter?.continuation : nil
             if waiter?.lease === lease {
                 waiter = nil
             }
-            // Do not requeue a value that raced with cancellation. The value
-            // was handed to this read and is intentionally dropped.
             ownerLease = nil
             return pending
         }
         pending?.resume(returning: .end)
     }
 
-    private func appendLocked(_ value: VisualizerData) {
+    private func appendLocked(_ value: VisualizerFrame) {
         let node = QueueNode(value)
         if let queueTail {
             queueTail.next = node
@@ -287,7 +364,7 @@ final class VisualizerDataMailbox: @unchecked Sendable {
     }
 
     @discardableResult
-    private func dequeueHeadLocked() -> VisualizerData? {
+    private func dequeueHeadLocked() -> VisualizerFrame? {
         guard let node = queueHead else { return nil }
         queueHead = node.next
         node.next = nil
@@ -304,16 +381,16 @@ final class VisualizerDataMailbox: @unchecked Sendable {
         queuedBytes = 0
     }
 
-    private func discardExpiredLocked(now: Int64) {
+    private func discardExpiredLocked(now: PresentationInstant) {
         // Server visualizer timestamps are non-decreasing, so expired frames form
         // a prefix. Each dequeued node releases its Data immediately.
-        while let value = queueHead?.value, value.localDisplayTime <= now {
+        while let value = queueHead?.value, !value.eligibilityForScheduling(at: now) {
             _ = dequeueHeadLocked()
         }
     }
 }
 
-extension VisualizerData {
+extension VisualizerFrame {
     /// The capacity accounting size required by the visualizer wire contract.
     var frameByteCount: Int {
         let (bytes, overflow) = BinaryMessage.headerSize.addingReportingOverflow(data.count)

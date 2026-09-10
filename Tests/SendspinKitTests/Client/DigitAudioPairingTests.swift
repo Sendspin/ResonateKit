@@ -91,15 +91,15 @@ private func assertSilentProtocolClose(_ session: DigitAudioSession) async throw
 
 private func nextCode(_ events: AsyncStream<ClientEvent>) async -> PairingCodeEmission? {
     await collectClientEvent(from: events, timeout: .seconds(3)) {
-        if case .pairingCodeChanged(.some) = $0 {
+        if case let .pairingCodeChanged(snapshot) = $0, snapshot.code != nil {
             return true
         }
         return false
     }.flatMap { event in
-        guard case let .pairingCodeChanged(emission?) = event else {
+        guard case let .pairingCodeChanged(snapshot) = event else {
             return nil
         }
-        return emission
+        return snapshot.code
     }
 }
 
@@ -135,7 +135,7 @@ struct DigitAudioPairingTests {
     func clipBeforePairInitCloses() async throws {
         let store = InMemoryPairingRecordStore()
         for _ in 0 ..< dynamicPairingRoundLimit {
-            _ = await store.incrementDynamicPairingRoundCount()
+            _ = try await store.reserveDynamicPairingRound(limit: dynamicPairingRoundLimit)
         }
         let session = try await makeDigitAudioSession(store: store)
         try await activateDigits(session.server)

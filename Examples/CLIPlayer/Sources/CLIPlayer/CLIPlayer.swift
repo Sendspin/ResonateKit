@@ -195,16 +195,12 @@ final class CLIPlayer {
                 artworkUrl: metadata.artworkURL
             )
 
-        // Ignored in TUI mode — these are either handled by log mode only, or
-        // have no corresponding on-screen element yet. Keep the list explicit
-        // so adding a new case is a compiler error, not a silent drop.
-        case .paired:
-            break
-
-        case .pairingCodeChanged, .pairingAttemptEnded:
-            break
-
-        case .audioOutputChanged,
+        // Explicit cases keep this example current as events evolve; apps may use `default: break` to ignore other events.
+        case .paired,
+             .pairingCodeChanged,
+             .pairingAttemptEnded,
+             .pairingWindowChanged,
+             .audioOutputChanged,
              .outputFormatStatusChanged,
              .streamingFailed,
              .groupUpdated,
@@ -229,18 +225,22 @@ final class CLIPlayer {
         case let .serverConnected(info):
             print("[EVENT] Server connected: \(info.name) (\(info.serverId)) trust=\(info.trustLevel)")
 
-        case let .paired(serverId):
-            print("[EVENT] Paired with server: \(serverId) trust=user")
+        case let .paired(snapshot):
+            print("[EVENT] Paired with server: \(snapshot.peer.id) trust=user")
 
-        case let .pairingCodeChanged(emission):
-            if let emission {
+        case let .pairingCodeChanged(snapshot):
+            if let emission = snapshot.code {
                 print("[PAIRING] Code \(emission.format.rawValue): \(emission.payload)")
             } else {
                 print("[PAIRING] Code cleared")
             }
 
-        case let .pairingAttemptEnded(reason):
-            print("[PAIRING] Attempt ended: \(reason.rawValue)")
+        case let .pairingAttemptEnded(snapshot):
+            print("[PAIRING] Attempt ended: \(snapshot.id.rawValue) \(snapshot.phase)")
+
+        case let .pairingWindowChanged(window):
+            let status = window == nil ? "closed" : "opened"
+            print("[PAIRING] Window \(status)")
 
         case let .audioOutputChanged(output):
             print("[AUDIO OUTPUT] \(output.diagnosticDescription ?? "unknown") rate=\(output.sampleRate.map(String.init) ?? "unknown")")

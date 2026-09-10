@@ -2,175 +2,442 @@ import Foundation
 @testable import SendspinKit
 import Testing
 
-struct VisualizerDataDeliveryTests {
-    @Test("cancellation before parking lets a new iterator reclaim ownership")
-    func cancellationBeforeParkDoesNotStealFrame() async {
-        let mailbox = VisualizerDataMailbox(capacityBytes: 64)
-        let cancelled = Task { () -> VisualizerData? in
-            await Task.yield()
-            var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-            return await iterator.next()
-        }
-        cancelled.cancel()
-        #expect(await cancelled.value == nil)
+struct VisualizerFrameDeliveryTests {
+    private let configuration = VisualizerStreamConfiguration(types: [.peak, .loudness, .beat, .spectrum], rateMax: 60)
 
-        let value = VisualizerData(type: .peak, data: Data([1]), localDisplayTime: .max)
-        mailbox.offer(value, now: 0)
-        var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-        #expect(await iterator.next() == value)
+    @Test("a canceled subscription releases mailbox ownership")
+    func cancellationReleasesOwnership() async throws {
+        let mailbox = VisualizerFrameMailbox(capacityBytes: 64)
+        let first = try VisualizerFrameSubscription(acquiring: mailbox)
+        first.cancel()
+        let second = try VisualizerFrameSubscription(acquiring: mailbox)
+        mailbox.offer(frame(type: .peak, byte: 1, at: .max), now: PresentationInstant(rawMicroseconds: 0))
+        var iterator = second.makeAsyncIterator()
+        #expect(await iterator.next()?.data == Data([1]))
         mailbox.finish()
     }
 
-    @Test("cancellation while parked lets a new iterator reclaim ownership")
-    func cancellationWhileParkedDoesNotStealFrame() async {
+    @Test("a pending read cancellation releases ownership")
+    func pendingCancellationReleasesOwnership() async throws {
         let clock = MailboxTestClock()
-        let mailbox = VisualizerDataMailbox(capacityBytes: 64, now: { clock.read() })
-        let waiting = Task { () -> VisualizerData? in
-            var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-            return await iterator.next()
+        let mailbox = VisualizerFrameMailbox(capacityBytes: 64, now: { clock.now })
+        let first = try VisualizerFrameSubscription(acquiring: mailbox)
+        let pending = Task { var iterator = first.makeAsyncIterator(); return await iterator.next() }
+        #expect(await clock.waitUntilReadCount(1))
+        pending.cancel()
+        let observation = await observeTask(
+            pending,
+            timeout: .seconds(1),
+            onTimeout: { mailbox.finish() }
+        )
+        guard case let .completed(value) = observation else {
+            Issue.record("cancelled mailbox read did not finish")
+            mailbox.finish()
+            return
         }
-        #expect(await clock.waitUntilReadCount(2))
-        waiting.cancel()
-        #expect(await waiting.value == nil)
-
-        let value = VisualizerData(type: .peak, data: Data([2]), localDisplayTime: .max)
-        mailbox.offer(value, now: 0)
-        var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-        #expect(await iterator.next() == value)
+        #expect(value == nil)
+        let second = try VisualizerFrameSubscription(acquiring: mailbox)
+        mailbox.offer(frame(type: .peak, byte: 2, at: .max), now: PresentationInstant(rawMicroseconds: 0))
+        var iterator = second.makeAsyncIterator()
+        #expect(await iterator.next()?.data == Data([2]))
         mailbox.finish()
     }
 
-    @Test("a second live iterator returns nil without replacing the owner")
-    func iteratorOwnershipIsStable() async {
-        let clock = MailboxTestClock()
-        let mailbox = VisualizerDataMailbox(capacityBytes: 64, now: { clock.read() })
-        let parked = Task { () -> VisualizerData? in
-            var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
+    @Test("an old iterator cannot consume a replacement after cancellation")
+    func oldIteratorAfterCancellationDoesNotConsumeReplacement() async throws {
+        let mailbox = VisualizerFrameMailbox(capacityBytes: 64)
+        let first = try VisualizerFrameSubscription(acquiring: mailbox)
+        var oldIterator = first.makeAsyncIterator()
+        first.cancel()
+
+        let replacement = try VisualizerFrameSubscription(acquiring: mailbox)
+        let replacementFrame = frame(type: .peak, byte: 19, at: .max)
+        mailbox.offer(replacementFrame, now: PresentationInstant(rawMicroseconds: 0))
+
+        #expect(await oldIterator.next() == nil)
+        var replacementIterator = replacement.makeAsyncIterator()
+        #expect(await replacementIterator.next() == replacementFrame)
+        mailbox.finish()
+    }
+
+    @Test("subscription deinit revokes an old iterator lease")
+    func subscriptionDeinitRevokesOldIteratorLease() async throws {
+        let mailbox = VisualizerFrameMailbox(capacityBytes: 64)
+        var oldIterator: VisualizerFrameSubscription.Iterator?
+        do {
+            let first = try VisualizerFrameSubscription(acquiring: mailbox)
+            oldIterator = first.makeAsyncIterator()
+        }
+
+        let replacement = try VisualizerFrameSubscription(acquiring: mailbox)
+        let replacementFrame = frame(type: .peak, byte: 24, at: .max)
+        mailbox.offer(replacementFrame, now: PresentationInstant(rawMicroseconds: 0))
+
+        var staleIterator = try #require(oldIterator)
+        #expect(await staleIterator.next() == nil)
+        var replacementIterator = replacement.makeAsyncIterator()
+        #expect(await replacementIterator.next() == replacementFrame)
+        mailbox.finish()
+    }
+
+    @Test("explicit cancellation between the immediate check and park is a barrier")
+    func explicitCancellationImmediateCheckToParkBarrier() async throws {
+        let reachedParkBarrier = DispatchSemaphore(value: 0)
+        let releaseParkBarrier = DispatchSemaphore(value: 0)
+        let mailbox = VisualizerFrameMailbox(
+            capacityBytes: 64,
+            beforePark: {
+                reachedParkBarrier.signal()
+                _ = releaseParkBarrier.wait(timeout: .now() + 1)
+            }
+        )
+        let first = try VisualizerFrameSubscription(acquiring: mailbox)
+        let pending = Task {
+            var iterator = first.makeAsyncIterator()
             return await iterator.next()
         }
-        #expect(await clock.waitUntilReadCount(2))
 
-        var second = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-        #expect(await second.next() == nil)
-        let value = VisualizerData(type: .peak, data: Data([3]), localDisplayTime: .max)
-        mailbox.offer(value, now: 0)
-        #expect(await parked.value == value)
+        defer {
+            first.cancel()
+            releaseParkBarrier.signal()
+            mailbox.finish()
+        }
+        try #require(await waitForSemaphore(reachedParkBarrier))
+        first.cancel()
+        releaseParkBarrier.signal()
+        let observation = await observeTask(
+            pending,
+            timeout: .seconds(1),
+            onTimeout: {
+                mailbox.finish()
+                releaseParkBarrier.signal()
+            }
+        )
+        guard case let .completed(value) = observation else {
+            Issue.record("cancelled parked read did not finish")
+            return
+        }
+        #expect(value == nil)
+
+        let replacement = try VisualizerFrameSubscription(acquiring: mailbox)
+        let replacementFrame = frame(type: .peak, byte: 20, at: .max)
+        mailbox.offer(replacementFrame, now: PresentationInstant(rawMicroseconds: 0))
+        var replacementIterator = replacement.makeAsyncIterator()
+        #expect(await replacementIterator.next() == replacementFrame)
+        mailbox.finish()
+    }
+
+    @Test("explicit cancellation after handoff drops the old frame")
+    func explicitCancellationAfterHandoff() async throws {
+        let reachedParkBarrier = DispatchSemaphore(value: 0)
+        let releaseParkBarrier = DispatchSemaphore(value: 0)
+        let reachedHandoffBarrier = DispatchSemaphore(value: 0)
+        let releaseHandoffBarrier = DispatchSemaphore(value: 0)
+        let mailbox = VisualizerFrameMailbox(
+            capacityBytes: 64,
+            beforePark: {
+                reachedParkBarrier.signal()
+                _ = releaseParkBarrier.wait(timeout: .now() + 1)
+            },
+            beforePostHandoffCheck: {
+                reachedHandoffBarrier.signal()
+                _ = releaseHandoffBarrier.wait(timeout: .now() + 1)
+            }
+        )
+        let first = try VisualizerFrameSubscription(acquiring: mailbox)
+        let pending = Task {
+            var iterator = first.makeAsyncIterator()
+            return await iterator.next()
+        }
+        defer {
+            first.cancel()
+            releaseParkBarrier.signal()
+            releaseHandoffBarrier.signal()
+            mailbox.finish()
+        }
+        try #require(await waitForSemaphore(reachedParkBarrier))
+        releaseParkBarrier.signal()
+        mailbox.offer(frame(type: .peak, byte: 21, at: .max), now: PresentationInstant(rawMicroseconds: 0))
+        try #require(await waitForSemaphore(reachedHandoffBarrier))
+        first.cancel()
+        releaseHandoffBarrier.signal()
+        let observation = await observeTask(
+            pending,
+            timeout: .seconds(1),
+            onTimeout: {
+                mailbox.finish()
+                releaseHandoffBarrier.signal()
+            }
+        )
+        guard case let .completed(value) = observation else {
+            Issue.record("cancelled handed-off read did not finish")
+            return
+        }
+        #expect(value == nil)
+        releaseHandoffBarrier.signal()
+        mailbox.finish()
+    }
+
+    @Test("task cancellation after handoff drops the old frame")
+    func taskCancellationAfterHandoff() async throws {
+        let reachedParkBarrier = DispatchSemaphore(value: 0)
+        let releaseParkBarrier = DispatchSemaphore(value: 0)
+        let reachedHandoffBarrier = DispatchSemaphore(value: 0)
+        let releaseHandoffBarrier = DispatchSemaphore(value: 0)
+        let mailbox = VisualizerFrameMailbox(
+            capacityBytes: 64,
+            beforePark: {
+                reachedParkBarrier.signal()
+                _ = releaseParkBarrier.wait(timeout: .now() + 1)
+            },
+            beforePostHandoffCheck: {
+                reachedHandoffBarrier.signal()
+                _ = releaseHandoffBarrier.wait(timeout: .now() + 1)
+            }
+        )
+        let subscription = try VisualizerFrameSubscription(acquiring: mailbox)
+        let pending = Task {
+            var iterator = subscription.makeAsyncIterator()
+            return await iterator.next()
+        }
+        defer {
+            pending.cancel()
+            releaseParkBarrier.signal()
+            releaseHandoffBarrier.signal()
+            mailbox.finish()
+        }
+        try #require(await waitForSemaphore(reachedParkBarrier))
+        releaseParkBarrier.signal()
+        mailbox.offer(frame(type: .peak, byte: 25, at: .max), now: PresentationInstant(rawMicroseconds: 0))
+
+        try #require(await waitForSemaphore(reachedHandoffBarrier))
+        pending.cancel()
+        releaseHandoffBarrier.signal()
+        let observation = await observeTask(
+            pending,
+            timeout: .seconds(1),
+            onTimeout: {
+                mailbox.finish()
+                releaseHandoffBarrier.signal()
+            }
+        )
+        guard case let .completed(value) = observation else {
+            Issue.record("task-cancelled handed-off read did not finish")
+            return
+        }
+        #expect(value == nil)
+        subscription.cancel()
+
+        releaseHandoffBarrier.signal()
+        mailbox.finish()
+    }
+
+    @Test("copied iterators share one parked read and preserve the original")
+    func copiedIteratorsShareOneInFlightRead() async throws {
+        let clock = MailboxTestClock()
+        let reachedPark = DispatchSemaphore(value: 0)
+        let releasePark = DispatchSemaphore(value: 0)
+        let mailbox = VisualizerFrameMailbox(
+            capacityBytes: 64,
+            now: { clock.now },
+            beforePark: {
+                reachedPark.signal()
+                _ = releasePark.wait(timeout: .now() + 1)
+            }
+        )
+        let subscription = try VisualizerFrameSubscription(acquiring: mailbox)
+        let first = subscription.makeAsyncIterator()
+        var copy = first
+        let pending = Task {
+            var iterator = first
+            return await iterator.next()
+        }
+
+        try #require(await waitForSemaphore(reachedPark))
+        defer {
+            pending.cancel()
+            releasePark.signal()
+            mailbox.finish()
+        }
+        let parkedReadCount = clock.readCountSnapshot
+        #expect(await copy.next() == nil)
+        #expect(clock.readCountSnapshot == parkedReadCount)
+        releasePark.signal()
+
+        let value = frame(type: .peak, byte: 23, at: .max)
+        mailbox.offer(value, now: PresentationInstant(rawMicroseconds: 0))
+        let observation = await observeTask(
+            pending,
+            timeout: .seconds(1),
+            onTimeout: {
+                mailbox.finish()
+                releasePark.signal()
+            }
+        )
+        guard case let .completed(result) = observation else {
+            Issue.record("copied iterator's parked read did not finish")
+            return
+        }
+        #expect(result == value)
+    }
+
+    @Test("a second active subscription throws without replacing the owner")
+    func secondSubscriptionIsRejected() throws {
+        let mailbox = VisualizerFrameMailbox(capacityBytes: 64)
+        let first = try VisualizerFrameSubscription(acquiring: mailbox)
+        #expect(throws: VisualizerFrameAcquisitionError.consumerAlreadyActive) {
+            _ = try VisualizerFrameSubscription(acquiring: mailbox)
+        }
+        first.cancel()
+        mailbox.finish()
+    }
+
+    @Test("a subscription ends duplicate iterators without entering mailbox reads")
+    func duplicateIteratorEndsImmediately() async throws {
+        let mailbox = VisualizerFrameMailbox(capacityBytes: 64)
+        let subscription = try VisualizerFrameSubscription(acquiring: mailbox)
+        var primary = subscription.makeAsyncIterator()
+        var duplicate = subscription.makeAsyncIterator()
+
+        #expect(await duplicate.next() == nil)
+
+        mailbox.offer(frame(type: .peak, byte: 10, at: .max), now: PresentationInstant(rawMicroseconds: 0))
+        #expect(await primary.next()?.data == Data([10]))
+        mailbox.finish()
+    }
+
+    @Test("scheduling eligibility is separate from validity at presentation")
+    func dueFrameCanRemainValid() {
+        let validity = VisualizerFrameValidity()
+        let frame = frame(type: .peak, byte: 3, at: 10, validity: validity)
+        #expect(frame.eligibilityForScheduling(at: PresentationInstant(rawMicroseconds: 9)))
+        #expect(frame.eligibilityForScheduling(at: PresentationInstant(rawMicroseconds: 10)) == false)
+        #expect(frame.isValid)
+        validity.invalidate()
+        #expect(frame.isValid == false)
+        #expect(frame.eligibilityForScheduling(at: PresentationInstant(rawMicroseconds: 9)) == false)
+    }
+
+    @Test("invalidated frames are not delivered after a waiter wakes")
+    func invalidationAfterWakeDropsFrame() async throws {
+        let validity = VisualizerFrameValidity()
+        let clock = MailboxTestClock()
+        let reachedParkBarrier = DispatchSemaphore(value: 0)
+        let releaseParkBarrier = DispatchSemaphore(value: 0)
+        let reachedHandoffBarrier = DispatchSemaphore(value: 0)
+        let releaseHandoffBarrier = DispatchSemaphore(value: 0)
+        let mailbox = VisualizerFrameMailbox(
+            capacityBytes: 64,
+            now: { clock.now },
+            beforePark: {
+                reachedParkBarrier.signal()
+                _ = releaseParkBarrier.wait(timeout: .now() + 1)
+            },
+            beforePostHandoffCheck: {
+                reachedHandoffBarrier.signal()
+                _ = releaseHandoffBarrier.wait(timeout: .now() + 1)
+            }
+        )
+        let subscription = try VisualizerFrameSubscription(acquiring: mailbox)
+        let pending = Task { var iterator = subscription.makeAsyncIterator(); return await iterator.next() }
+        defer {
+            releaseParkBarrier.signal()
+            releaseHandoffBarrier.signal()
+            mailbox.finish()
+        }
+        try #require(await waitForSemaphore(reachedParkBarrier))
+        releaseParkBarrier.signal()
+        mailbox.offer(frame(type: .beat, byte: 4, at: .max, validity: validity), now: PresentationInstant(rawMicroseconds: 0))
+        try #require(await waitForSemaphore(reachedHandoffBarrier))
+        validity.invalidate()
+        releaseHandoffBarrier.signal()
+        mailbox.finish()
+        let observation = await observeTask(
+            pending,
+            timeout: .seconds(1),
+            onTimeout: {
+                mailbox.finish()
+                releaseHandoffBarrier.signal()
+            }
+        )
+        guard case let .completed(value) = observation else {
+            Issue.record("invalidated handed-off read did not finish")
+            return
+        }
+        #expect(value == nil)
+    }
+
+    @Test("mailbox drops expired frames but keeps future frames FIFO")
+    func expirationAndFIFO() async throws {
+        let clock = MailboxTestClock(value: 0)
+        let mailbox = VisualizerFrameMailbox(capacityBytes: 64, now: { clock.now })
+        let subscription = try VisualizerFrameSubscription(acquiring: mailbox)
+        mailbox.offer(frame(type: .peak, byte: 5, at: 1), now: PresentationInstant(rawMicroseconds: 0))
+        mailbox.offer(frame(type: .peak, byte: 6, at: 20), now: PresentationInstant(rawMicroseconds: 0))
+        clock.setValue(10)
+        var iterator = subscription.makeAsyncIterator()
+        #expect(await iterator.next()?.data == Data([6]))
+        mailbox.finish()
+    }
+
+    @Test("mailbox enforces the exact wire byte budget")
+    func byteBudgetDropsOldestFrames() async throws {
+        let frameBytes = BinaryMessage.headerSize + Data([UInt8(7)]).count
+        let mailbox = VisualizerFrameMailbox(capacityBytes: frameBytes * 2)
+        let subscription = try VisualizerFrameSubscription(acquiring: mailbox)
+        mailbox.offer(frame(type: .peak, byte: 7, at: .max), now: PresentationInstant(rawMicroseconds: 0))
+        mailbox.offer(frame(type: .peak, byte: 8, at: .max), now: PresentationInstant(rawMicroseconds: 0))
+        mailbox.offer(frame(type: .peak, byte: 9, at: .max), now: PresentationInstant(rawMicroseconds: 0))
+        var iterator = subscription.makeAsyncIterator()
+        try #require(mailbox.retainedByteCount == frameBytes * 2)
+        #expect(await iterator.next()?.data == Data([8]))
+        #expect(await iterator.next()?.data == Data([9]))
         mailbox.finish()
     }
 
     @Test("mailbox admission remains safe at Int.max capacity")
-    func intMaxCapacityDoesNotOverflow() async {
-        let mailbox = VisualizerDataMailbox(capacityBytes: .max)
-        let value = VisualizerData(type: .loudness, data: Data([4, 5]), localDisplayTime: .max)
-        mailbox.offer(value, now: 0)
-        var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
+    func intMaxCapacityDoesNotOverflow() async throws {
+        let mailbox = VisualizerFrameMailbox(capacityBytes: .max)
+        let subscription = try VisualizerFrameSubscription(acquiring: mailbox)
+        let value = frame(type: .loudness, byte: 4, at: .max)
+        mailbox.offer(value, now: PresentationInstant(rawMicroseconds: 0))
+        var iterator = subscription.makeAsyncIterator()
         #expect(await iterator.next() == value)
         mailbox.finish()
     }
 
-    @Test("mailbox rechecks a frame deadline after a waiter resumes")
-    func resumedExpiredFrameIsDropped() async {
-        let clock = MailboxTestClock(value: 0)
-        let mailbox = VisualizerDataMailbox(capacityBytes: 64, now: { clock.read() })
-        let pending = Task { () -> VisualizerData? in
-            var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-            return await iterator.next()
-        }
-        #expect(await clock.waitUntilReadCount(2))
-        clock.setValue(10)
-        mailbox.offer(
-            VisualizerData(type: .beat, data: Data([6]), localDisplayTime: 5),
-            now: 0
+    @Test("an oversized visualizer frame never bypasses the byte cap")
+    func oversizedFrameIsDropped() throws {
+        let mailbox = VisualizerFrameMailbox(capacityBytes: BinaryMessage.headerSize + 1)
+        _ = try VisualizerFrameSubscription(acquiring: mailbox)
+        let oversized = VisualizerFrame(
+            type: .loudness,
+            data: Data([1, 2]),
+            presentationTime: PresentationInstant(rawMicroseconds: .max),
+            configuration: configuration
         )
-        mailbox.finish()
-        #expect(await pending.value == nil)
-    }
 
-    @Test("a canceled read that was woken does not transfer its frame to a newer waiter")
-    func cancellationAfterWakeDropsFrameWithoutStealing() async {
-        let clock = MailboxTestClock()
-        let mailbox = VisualizerDataMailbox(capacityBytes: 64, now: { clock.read() })
-        let oldRead = Task { () -> VisualizerData? in
-            var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-            return await iterator.next()
-        }
-        #expect(await clock.waitUntilReadCount(2))
+        mailbox.offer(oversized, now: PresentationInstant(rawMicroseconds: 0))
 
-        let first = VisualizerData(type: .peak, data: Data([7]), localDisplayTime: .max)
-        mailbox.offer(first, now: 0)
-        oldRead.cancel()
-
-        let newer = Task { () -> VisualizerData? in
-            var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-            return await iterator.next()
-        }
-        #expect(await clock.waitUntilReadCount(4))
-        #expect(await oldRead.value == nil)
-
-        let second = VisualizerData(type: .peak, data: Data([8]), localDisplayTime: .max)
-        mailbox.offer(second, now: 0)
-        #expect(await newer.value == second)
-        mailbox.finish()
-    }
-
-    @Test("invalidation after a wake never delivers an invalid frame")
-    func invalidationAfterWakeDropsFrame() async {
-        let validity = VisualizerFrameValidity()
-        let clock = MailboxTestClock(blockedRead: 3)
-        let mailbox = VisualizerDataMailbox(capacityBytes: 64, now: { clock.read() })
-        let pending = Task { () -> VisualizerData? in
-            var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-            return await iterator.next()
-        }
-        #expect(await clock.waitUntilReadCount(2))
-
-        let value = VisualizerData(
-            type: .beat,
-            data: Data([9]),
-            localDisplayTime: .max,
-            validity: validity
-        )
-        mailbox.offer(value, now: 0)
-        #expect(await clock.waitUntilReadCount(3))
-        validity.invalidate()
-        clock.releaseBlockedRead()
-        mailbox.finish()
-        #expect(await pending.value == nil)
-    }
-
-    @Test("an abandoned iterator token releases ownership")
-    func abandonedIteratorReclaimsOwnership() async {
-        let mailbox = VisualizerDataMailbox(capacityBytes: 64)
-        let first = VisualizerData(type: .peak, data: Data([10]), localDisplayTime: .max)
-        mailbox.offer(first, now: 0)
-
-        do {
-            var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-            #expect(await iterator.next() == first)
-        }
-        await Task.yield()
-
-        let second = VisualizerData(type: .peak, data: Data([11]), localDisplayTime: .max)
-        mailbox.offer(second, now: 0)
-        var replacement = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-        #expect(await replacement.next() == second)
+        #expect(mailbox.retainedByteCount == 0)
         mailbox.finish()
     }
 
     @Test("consuming a frame releases its byte storage and linked-queue budget")
-    func consumedFrameReleasesLinkedQueueBytes() async {
+    func consumedFrameReleasesLinkedQueueBytes() async throws {
         let frameBytes = BinaryMessage.headerSize + 1
-        let mailbox = VisualizerDataMailbox(capacityBytes: frameBytes * 2)
+        let mailbox = VisualizerFrameMailbox(capacityBytes: frameBytes * 2)
         let firstReleased = ByteReleaseProbe()
         offerTrackedFrame(firstReleased, to: mailbox, byte: 12)
-        let second = VisualizerData(type: .loudness, data: Data([13]), localDisplayTime: .max)
-        let third = VisualizerData(type: .loudness, data: Data([14]), localDisplayTime: .max)
+        let second = frame(type: .loudness, byte: 13, at: .max)
+        let third = frame(type: .loudness, byte: 14, at: .max)
 
         do {
-            var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-            #expect(await (iterator.next())?.data == Data([12]))
-            mailbox.offer(second, now: 0)
-            mailbox.offer(third, now: 0)
+            let subscription = try VisualizerFrameSubscription(acquiring: mailbox)
+            var iterator = subscription.makeAsyncIterator()
+            #expect(await iterator.next()?.data == Data([12]))
+            mailbox.offer(second, now: PresentationInstant(rawMicroseconds: 0))
+            mailbox.offer(third, now: PresentationInstant(rawMicroseconds: 0))
             #expect(await iterator.next() == second)
             #expect(await iterator.next() == third)
         }
@@ -178,136 +445,33 @@ struct VisualizerDataDeliveryTests {
         mailbox.finish()
     }
 
-    @Test("queued frames retain the configuration that validated them")
-    func configurationSnapshotSurvivesUpdate() async {
-        let old = VisualizerStreamConfiguration(
-            types: [.spectrum],
-            rateMax: 30,
-            spectrum: SpectrumConfiguration(nDispBins: 2, scale: .lin, fMin: 20, fMax: 20_000)
-        )
-        let updated = VisualizerStreamConfiguration(types: [.loudness], rateMax: 60)
-        let mailbox = VisualizerDataMailbox(capacityBytes: 128)
-        let oldFrame = VisualizerData(
-            type: .spectrum,
-            data: Data([0, 1, 0, 2]),
-            localDisplayTime: .max,
-            streamConfiguration: old
-        )
-        let newFrame = VisualizerData(
-            type: .loudness,
-            data: Data([0, 3]),
-            localDisplayTime: .max,
-            streamConfiguration: updated
-        )
-        mailbox.offer(oldFrame, now: 0)
-        mailbox.offer(newFrame, now: 0)
+    @Test("clear releases all retained visualizer frames immediately")
+    func clearDropsQueuedFrames() throws {
+        let mailbox = VisualizerFrameMailbox(capacityBytes: 64)
+        _ = try VisualizerFrameSubscription(acquiring: mailbox)
+        mailbox.offer(frame(type: .peak, byte: 15, at: .max), now: PresentationInstant(rawMicroseconds: 0))
+        mailbox.offer(frame(type: .loudness, byte: 16, at: .max), now: PresentationInstant(rawMicroseconds: 0))
+        #expect(mailbox.retainedByteCount > 0)
 
-        var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-        #expect(await iterator.next()?.streamConfiguration == old)
-        #expect(await iterator.next()?.streamConfiguration == updated)
-        mailbox.finish()
-    }
-
-    @Test("mailbox keeps retained visualizer bytes within the exact wire budget")
-    func byteBudgetDropsOldestFrames() async {
-        let mailbox = VisualizerDataMailbox(capacityBytes: 22)
-        let validity = VisualizerFrameValidity()
-        let first = VisualizerData(
-            type: .loudness,
-            data: Data([1, 2]),
-            localDisplayTime: .max,
-            validity: validity
-        )
-        let second = VisualizerData(
-            type: .loudness,
-            data: Data([3, 4]),
-            localDisplayTime: .max,
-            validity: validity
-        )
-        let third = VisualizerData(
-            type: .loudness,
-            data: Data([5, 6]),
-            localDisplayTime: .max,
-            validity: validity
-        )
-
-        mailbox.offer(first, now: 0)
-        mailbox.offer(second, now: 0)
-        mailbox.offer(third, now: 0)
-
-        var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-        #expect(await iterator.next() == second)
-        #expect(await iterator.next() == third)
-        mailbox.finish()
-        #expect(await iterator.next() == nil)
-    }
-
-    @Test("an oversized visualizer frame never bypasses the byte cap")
-    func oversizedFrameIsDropped() async {
-        let mailbox = VisualizerDataMailbox(capacityBytes: BinaryMessage.headerSize + 1)
-        let value = VisualizerData(
-            type: .spectrum,
-            data: Data(repeating: 0, count: 2),
-            localDisplayTime: .max
-        )
-        mailbox.offer(value, now: 0)
-
-        var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-        mailbox.finish()
-        #expect(await iterator.next() == nil)
-    }
-
-    @Test("mailbox drops expired frames when a slow consumer resumes")
-    func expiredFramesAreDroppedOnConsumption() async {
-        let mailbox = VisualizerDataMailbox(capacityBytes: 64)
-        let value = VisualizerData(type: .beat, data: Data([1]), localDisplayTime: 1)
-        mailbox.offer(value, now: 0)
-
-        let pending = Task { () -> VisualizerData? in
-            var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-            return await iterator.next()
-        }
-        let observation = await observeTask(
-            pending,
-            timeout: .milliseconds(50),
-            onTimeout: { mailbox.finish() }
-        )
-        switch observation {
-        case .timedOut:
-            break
-        case let .completed(value):
-            Issue.record("dropping an expired frame must keep a live mailbox open; got \(String(describing: value))")
-        }
-        mailbox.finish()
-    }
-
-    @Test("clear releases all retained visualizer frames")
-    func clearDropsQueuedFrames() async {
-        let mailbox = VisualizerDataMailbox(capacityBytes: 64)
-        mailbox.offer(
-            VisualizerData(type: .peak, data: Data([1]), localDisplayTime: .max),
-            now: 0
-        )
         mailbox.clear()
 
-        var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
+        #expect(mailbox.retainedByteCount == 0)
         mailbox.finish()
-        #expect(await iterator.next() == nil)
     }
 
-    @Test("parked clear, end, and teardown preserve the primary mailbox")
+    @Test("parked delivery cannot clear the primary mailbox")
     func parkedDeliveryDoesNotClearPrimaryMailbox() {
-        let mailbox = VisualizerDataMailbox(capacityBytes: 64)
+        let mailbox = VisualizerFrameMailbox(capacityBytes: 64)
         let primary = makeConnectionDataDelivery(mailbox: mailbox)
         let parked = makeConnectionDataDelivery(mailbox: mailbox)
         primary.promoteToPrimary()
-        let frame = VisualizerData(type: .peak, data: Data([15, 16]), localDisplayTime: .max)
-        primary.offerVisualizerIfValid(frame, validity: SessionValidityToken())
-        #expect(mailbox.retainedByteCount == frame.frameByteCount)
+        let value = frame(type: .peak, byte: 17, at: .max)
+        primary.offerVisualizerIfValid(value, validity: SessionValidityToken())
+        #expect(mailbox.retainedByteCount == value.frameByteCount)
 
         for _ in 0 ..< 3 {
             parked.clearVisualizer()
-            #expect(mailbox.retainedByteCount == frame.frameByteCount)
+            #expect(mailbox.retainedByteCount == value.frameByteCount)
         }
 
         primary.clearVisualizer()
@@ -317,12 +481,12 @@ struct VisualizerDataDeliveryTests {
 
     @Test("primary delivery clear releases retained bytes immediately")
     func primaryDeliveryClearsMailboxImmediately() {
-        let mailbox = VisualizerDataMailbox(capacityBytes: 64)
+        let mailbox = VisualizerFrameMailbox(capacityBytes: 64)
         let primary = makeConnectionDataDelivery(mailbox: mailbox)
         primary.promoteToPrimary()
-        let frame = VisualizerData(type: .peak, data: Data([17, 18]), localDisplayTime: .max)
-        primary.offerVisualizerIfValid(frame, validity: SessionValidityToken())
-        #expect(mailbox.retainedByteCount == frame.frameByteCount)
+        let value = frame(type: .peak, byte: 18, at: .max)
+        primary.offerVisualizerIfValid(value, validity: SessionValidityToken())
+        #expect(mailbox.retainedByteCount == value.frameByteCount)
 
         primary.clearVisualizer()
 
@@ -330,25 +494,23 @@ struct VisualizerDataDeliveryTests {
         mailbox.finish()
     }
 
-    @Test("mailbox preserves FIFO order among retained frames")
-    func retainedFramesRemainFifo() async {
-        let mailbox = VisualizerDataMailbox(capacityBytes: 64)
-        let values = (0 ..< 4).map { index in
-            VisualizerData(type: .loudness, data: Data([UInt8(index)]), localDisplayTime: .max)
-        }
-        for value in values {
-            mailbox.offer(value, now: 0)
-        }
-
-        var iterator = VisualizerDataStream(mailbox: mailbox).makeAsyncIterator()
-        for value in values {
-            #expect(await iterator.next() == value)
-        }
-        mailbox.finish()
+    private func frame(
+        type: VisualizerType,
+        byte: UInt8,
+        at microseconds: Int64,
+        validity: VisualizerFrameValidity = VisualizerFrameValidity()
+    ) -> VisualizerFrame {
+        VisualizerFrame(
+            type: type,
+            data: Data([byte]),
+            presentationTime: PresentationInstant(rawMicroseconds: microseconds),
+            configuration: configuration,
+            validity: validity
+        )
     }
 }
 
-private func makeConnectionDataDelivery(mailbox: VisualizerDataMailbox) -> ConnectionDataDelivery {
+private func makeConnectionDataDelivery(mailbox: VisualizerFrameMailbox) -> ConnectionDataDelivery {
     let (_, audio) = AsyncStream<AudioChunk>.makeStream()
     let (_, artwork) = AsyncStream<ArtworkData>.makeStream()
     return ConnectionDataDelivery(
@@ -357,6 +519,14 @@ private func makeConnectionDataDelivery(mailbox: VisualizerDataMailbox) -> Conne
         visualizer: mailbox,
         artworkObserver: nil
     )
+}
+
+private func waitForSemaphore(_ semaphore: DispatchSemaphore) async -> Bool {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(returning: semaphore.wait(timeout: .now() + 1) == .success)
+        }
+    }
 }
 
 private final class ByteReleaseProbe: @unchecked Sendable {
@@ -372,37 +542,40 @@ private final class ByteReleaseProbe: @unchecked Sendable {
     }
 }
 
-private func offerTrackedFrame(_ probe: ByteReleaseProbe, to mailbox: VisualizerDataMailbox, byte: UInt8) {
+private func offerTrackedFrame(_ probe: ByteReleaseProbe, to mailbox: VisualizerFrameMailbox, byte: UInt8) {
     let pointer = UnsafeMutableRawPointer.allocate(byteCount: 1, alignment: 1)
     pointer.initializeMemory(as: UInt8.self, repeating: byte, count: 1)
     let data = Data(bytesNoCopy: pointer, count: 1, deallocator: .custom { pointer, _ in
         pointer.deallocate()
         probe.markReleased()
     })
-    mailbox.offer(VisualizerData(type: .loudness, data: data, localDisplayTime: .max), now: 0)
+    let value = VisualizerFrame(
+        type: .loudness,
+        data: data,
+        presentationTime: PresentationInstant(rawMicroseconds: .max),
+        configuration: VisualizerStreamConfiguration(types: [.loudness], rateMax: 60)
+    )
+    mailbox.offer(value, now: PresentationInstant(rawMicroseconds: 0))
 }
 
 private final class MailboxTestClock: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Int64
     private var readCount = 0
-    private let blockedRead: Int?
-    private let release = DispatchSemaphore(value: 0)
 
-    init(value: Int64 = 0, blockedRead: Int? = nil) {
+    init(value: Int64 = 0) {
         self.value = value
-        self.blockedRead = blockedRead
     }
 
-    func read() -> Int64 {
-        let shouldBlock = lock.withLock {
+    var now: PresentationInstant {
+        lock.withLock {
             readCount += 1
-            return readCount == blockedRead
+            return PresentationInstant(rawMicroseconds: value)
         }
-        if shouldBlock {
-            release.wait()
-        }
-        return lock.withLock { value }
+    }
+
+    var readCountSnapshot: Int {
+        lock.withLock { readCount }
     }
 
     func setValue(_ value: Int64) {
@@ -417,9 +590,5 @@ private final class MailboxTestClock: @unchecked Sendable {
             await Task.yield()
         }
         return false
-    }
-
-    func releaseBlockedRead() {
-        release.signal()
     }
 }

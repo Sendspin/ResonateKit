@@ -187,15 +187,18 @@ extension SendspinConnection {
         } else {
             visualizerDelivery?.clear()
         }
+        if pairingAttemptID != nil {
+            enqueuePairingCode(nil)
+        }
+        pairingAttemptTask?.cancel()
+        closePairingWindow()
         pairingAttemptActive = false
         pendingPairingPsk = nil
-        if dynamicPairingAttempt != nil {
-            controlSink.enqueue(.pairingCodeChanged(nil))
-            dynamicPairingAttempt = nil
-        }
+        dynamicPairingAttempt = nil
         staticPairingAttempt = nil
+        pairingAttemptID = nil
+        pairingAttemptPeer = nil
         pairingAttemptTask?.cancel()
-        pairingWindowTask?.cancel()
 
         // Stop the engine (async cleanup: close output, finish channels)
         await audioEngine.shutdown()

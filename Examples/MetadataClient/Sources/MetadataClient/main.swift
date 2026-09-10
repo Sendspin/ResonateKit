@@ -38,6 +38,15 @@ struct MetadataClient: AsyncParsableCommand {
     var timeout: Double = 5.0
 
     @MainActor
+    private func makeClient() throws -> SendspinClient {
+        try SendspinClient(
+            identity: .generate(),
+            name: "Metadata Client",
+            roles: [.metadataV1]
+        )
+    }
+
+    @MainActor
     func run() async throws {
         let url = try await resolveServerURL(
             server: server,
@@ -48,11 +57,7 @@ struct MetadataClient: AsyncParsableCommand {
         // Build the client. We only request the metadata role — no playerConfig
         // needed because we are not playing audio. The server will send us
         // track metadata, group updates, and stream lifecycle events.
-        let client = try SendspinClient(
-            identity: .generate(),
-            name: "Metadata Client",
-            roles: [.metadataV1]
-        )
+        let client = try makeClient()
 
         // MARK: SIGINT handling
         // Ignore the default handler so Ctrl-C doesn't kill us mid-async-loop.
@@ -169,10 +174,24 @@ struct MetadataClient: AsyncParsableCommand {
                 }
                 return
 
-            case .paired, .pairingCodeChanged, .pairingAttemptEnded, .audioOutputChanged, .outputFormatStatusChanged, .streamingFailed,
-                 .streamFormatChanged, .streamCleared, .controllerStateUpdated, .controllerStateCleared,
-                 .colorStateUpdated, .colorStateCleared, .artworkStreamStarted, .visualizerStreamStarted,
-                 .outputDelayChanged, .lastPlayedServerChanged:
+            // Explicit cases keep this example current as events evolve; apps may use `default: break` to ignore other events.
+            case .paired,
+                 .pairingCodeChanged,
+                 .pairingAttemptEnded,
+                 .pairingWindowChanged,
+                 .audioOutputChanged,
+                 .outputFormatStatusChanged,
+                 .streamingFailed,
+                 .streamFormatChanged,
+                 .streamCleared,
+                 .controllerStateUpdated,
+                 .controllerStateCleared,
+                 .colorStateUpdated,
+                 .colorStateCleared,
+                 .artworkStreamStarted,
+                 .visualizerStreamStarted,
+                 .outputDelayChanged,
+                 .lastPlayedServerChanged:
                 break
             }
         }

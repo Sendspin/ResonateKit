@@ -17,7 +17,7 @@ struct ConcurrentPairingTests {
 
         let codeTask = Task {
             await collectClientEvent(from: session.events) {
-                if case .pairingCodeChanged(.some) = $0 {
+                if case let .pairingCodeChanged(snapshot) = $0, snapshot.code != nil {
                     return true
                 }
                 return false
@@ -161,18 +161,18 @@ struct ConcurrentPairingTests {
         await session.client.disconnect()
     }
 
-    @Test("cancelPairingAttempt targets the parked side and leaves playback connected")
+    @Test("cancelPairing targets the parked side and leaves playback connected")
     func cancelTargetsPairingSide() async throws {
         let session = try await makeSession()
         let side = try await admitPairingSide(to: session.client)
         _ = await collectClientEvent(from: session.events) {
-            if case .pairingCodeChanged(.some) = $0 {
+            if case let .pairingCodeChanged(snapshot) = $0, snapshot.code != nil {
                 return true
             }
             return false
         }
 
-        try await session.client.cancelPairingAttempt()
+        try await session.client.cancelPairing(attemptID: #require(await MainActor.run { session.client.currentPairing?.id }))
 
         let abort = try await waitForClientJSON(side, type: PairAbortMessage.typeString)
         let decoded = try JSONDecoder().decode(PairAbortMessage.self, from: abort)

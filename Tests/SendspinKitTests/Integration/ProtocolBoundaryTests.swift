@@ -131,8 +131,10 @@ struct ProtocolBoundaryTests {
         )
         let server = fixture.server
         let connection = fixture.connection
+        #expect(await waitUntil { await connection.clockSyncTask != nil }, "clock-sync task handle must appear before cancel")
         await connection.clockSyncTask?.cancel()
         await connection.clockSyncTask?.value
+        #expect(await waitUntil { await !connection.outboundInFlight }, "initial clock samples must drain")
 
         try await server.sendActivation(
             activities: [.playback],

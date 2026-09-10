@@ -39,4 +39,4 @@ The sync offset is used by the scheduler to convert server-domain timestamps to 
 
 ## Custom audio processing
 
-To access raw audio data for visualization or effects, enable ``PlayerConfiguration/emitRawAudioEvents`` and consume ``SendspinClient/audioChunks``. You can also provide a process callback via ``PlayerConfiguration/processCallback`` that runs inline in the audio pipeline before scheduling. Visualizer-role payloads are delivered separately through ``SendspinClient/visualizerData``.
+To access raw audio data for visualization or effects, enable ``PlayerConfiguration/emitRawAudioEvents`` and consume ``SendspinClient/audioChunks``. You can also provide a process callback via ``PlayerConfiguration/processCallback`` that runs inline in the audio pipeline before scheduling. Visualizer-role payloads are delivered separately through ``SendspinClient/acquireVisualizerFrames()`` as bounded ``VisualizerFrame`` values with typed presentation deadlines.

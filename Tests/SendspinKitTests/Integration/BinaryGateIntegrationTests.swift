@@ -53,7 +53,7 @@ struct BinaryGateIntegrationTests {
     @Test("invalid visualizer configuration does not reject a valid player stream")
     func invalidVisualizerConfigurationContinuesPlayerHandling() async throws {
         let audio = AsyncStream<AudioChunk>.makeStream()
-        let visualizer = AsyncStream<VisualizerData>.makeStream()
+        let visualizer = AsyncStream<VisualizerFrame>.makeStream()
         let visualizerState = try VisualizerStateObject(types: [.loudness], rateMax: 30)
         let fixture = try await makeEstablishedConnection(
             activeRoles: [.playerV1, .visualizerV1],
@@ -64,7 +64,7 @@ struct BinaryGateIntegrationTests {
         )
         let audioEngine = fixture.connection.audioEngineForTesting
         let audioValues = BinaryGateValues<AudioChunk>()
-        let visualizerValues = BinaryGateValues<VisualizerData>()
+        let visualizerValues = BinaryGateValues<VisualizerFrame>()
         let audioConsumer = Task {
             for await value in audio.0 {
                 await audioValues.append(value)
@@ -111,14 +111,14 @@ struct BinaryGateIntegrationTests {
 
     @Test("visualizer binary requires the visualizer state send")
     func visualizerBinaryIsDroppedBeforeStateAndDeliveredAfter() async throws {
-        let visualizer = AsyncStream<VisualizerData>.makeStream()
+        let visualizer = AsyncStream<VisualizerFrame>.makeStream()
         let clock = StubClock()
         let visualizerState = try VisualizerStateObject(types: [.loudness], rateMax: 30)
         let fixture = try await makeEstablishedConnection(
             clock: clock, activeRoles: [.visualizerV1], visualizerSink: visualizer.1, roles: [.visualizerV1],
             initialVisualizerState: visualizerState
         )
-        let values = BinaryGateValues<VisualizerData>()
+        let values = BinaryGateValues<VisualizerFrame>()
         let consumer = Task {
             for await value in visualizer.0 {
                 await values.append(value)
@@ -149,7 +149,7 @@ struct BinaryGateIntegrationTests {
 
     @Test("valid visualizer binary shapes reach the visualizer stream")
     func validVisualizerTypesDeliverTheirDocumentedPayloadShapes() async throws {
-        let visualizer = AsyncStream<VisualizerData>.makeStream()
+        let visualizer = AsyncStream<VisualizerFrame>.makeStream()
         let spectrum = SpectrumConfiguration(nDispBins: 2, scale: .lin, fMin: 20, fMax: 20_000)
         let visualizerState = try VisualizerStateObject(
             types: [.loudness, .beat, .fPeak, .spectrum, .peak],
@@ -163,7 +163,7 @@ struct BinaryGateIntegrationTests {
             roles: [.visualizerV1],
             initialVisualizerState: visualizerState
         )
-        let values = BinaryGateValues<VisualizerData>()
+        let values = BinaryGateValues<VisualizerFrame>()
         let consumer = Task {
             for await value in visualizer.0 {
                 await values.append(value)
@@ -208,7 +208,7 @@ struct BinaryGateIntegrationTests {
 
     @Test("malformed visualizer payloads are dropped before the public stream")
     func malformedVisualizerPayloadDoesNotCrossTheEmissionBarrier() async throws {
-        let visualizer = AsyncStream<VisualizerData>.makeStream()
+        let visualizer = AsyncStream<VisualizerFrame>.makeStream()
         let state = try VisualizerStateObject(types: [.loudness], rateMax: 30)
         let fixture = try await makeEstablishedConnection(
             clock: StubClock(),
@@ -245,14 +245,14 @@ struct BinaryGateIntegrationTests {
 
     @Test("stale visualizer frames are dropped using their arrival instant")
     func staleVisualizerFrameIsDroppedAtArrival() async throws {
-        let visualizer = AsyncStream<VisualizerData>.makeStream()
+        let visualizer = AsyncStream<VisualizerFrame>.makeStream()
         let clock = StubClock()
         let visualizerState = try VisualizerStateObject(types: [.loudness], rateMax: 30)
         let fixture = try await makeEstablishedConnection(
             clock: clock, activeRoles: [.visualizerV1], visualizerSink: visualizer.1, roles: [.visualizerV1],
             initialVisualizerState: visualizerState
         )
-        let values = BinaryGateValues<VisualizerData>()
+        let values = BinaryGateValues<VisualizerFrame>()
         let consumer = Task {
             for await value in visualizer.0 {
                 await values.append(value)
@@ -283,7 +283,7 @@ struct BinaryGateIntegrationTests {
 
     @Test("visualizer frame validity changes at clear and end boundaries")
     func visualizerFramesAreInvalidatedByClearAndEnd() async throws {
-        let visualizer = AsyncStream<VisualizerData>.makeStream()
+        let visualizer = AsyncStream<VisualizerFrame>.makeStream()
         let clock = StubClock()
         let state = try VisualizerStateObject(types: [.loudness], rateMax: 30)
         let fixture = try await makeEstablishedConnection(
@@ -304,18 +304,19 @@ struct BinaryGateIntegrationTests {
         await fixture.connection.handleVisualizerBinary(frame, arrival: 1_000_000)
         let consumer = Task { await visualizer.0.first(where: { _ in true }) }
         let beforeClear = try #require(await consumer.value)
-        #expect(beforeClear.validity.isValid)
-        #expect(beforeClear.isRenderable(at: 1_000_000))
-        #expect(beforeClear.isRenderable(at: 2_000_000) == false)
+        #expect(beforeClear.isValid)
+        #expect(beforeClear.isValid)
+        #expect(beforeClear.eligibilityForScheduling(at: PresentationInstant(rawMicroseconds: 1_000_000)))
+        #expect(beforeClear.eligibilityForScheduling(at: PresentationInstant(rawMicroseconds: 2_000_000)) == false)
 
         await fixture.connection.handleStreamClear(StreamClearMessage(payload: StreamClearPayload(roles: ["visualizer"])))
-        #expect(beforeClear.validity.isValid == false)
+        #expect(beforeClear.isValid == false)
         await fixture.connection.handleVisualizerBinary(frame, arrival: 1_000_000)
         let afterClear = try #require(await visualizer.0.first(where: { _ in true }))
-        #expect(afterClear.validity.isValid)
+        #expect(afterClear.isValid)
 
         await fixture.connection.handleStreamEnd(StreamEndMessage(payload: StreamEndPayload(roles: ["visualizer"])))
-        #expect(afterClear.validity.isValid == false)
+        #expect(afterClear.isValid == false)
 
         await fixture.connection.handleStreamStart(StreamStartMessage(payload: StreamStartPayload(
             player: nil, artwork: nil, visualizer: StreamStartVisualizer()
@@ -324,7 +325,7 @@ struct BinaryGateIntegrationTests {
         await fixture.connection.handleVisualizerBinary(frame, arrival: 1_000_000)
         let afterEnd = try #require(await visualizer.0.first(where: { _ in true }))
         await fixture.connection.shutdown()
-        #expect(afterEnd.validity.isValid == false)
+        #expect(afterEnd.isValid == false)
     }
 
     @Test("role-changing activation resets the player binary gate")

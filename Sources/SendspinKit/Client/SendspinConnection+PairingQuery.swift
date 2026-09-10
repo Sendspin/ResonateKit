@@ -55,6 +55,18 @@ extension SendspinConnection {
         )
     }
 
+    func pairingAttemptSnapshot() -> PairingAttemptSnapshot? {
+        guard let id = pairingAttemptID, let peer = pairingAttemptPeer else { return nil }
+        let phase: PairingAttemptPhase = if dynamicPairingAttempt?.emission != nil || staticPairingAttempt != nil {
+            .codeReady
+        } else if pendingPairingPsk != nil {
+            .authenticating
+        } else {
+            .pending
+        }
+        return PairingAttemptSnapshot(id: id, peer: peer, phase: phase, code: dynamicPairingAttempt?.emission)
+    }
+
     func projectionSnapshot() -> ProjectionSnapshot {
         ProjectionSnapshot(
             serverId: currentServerId ?? "",

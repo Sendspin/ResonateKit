@@ -54,3 +54,21 @@ These properties update on the main actor and trigger SwiftUI view updates autom
 ``ColorState`` includes both its raw server timestamp and a local absolute display time when clock
 sync is ready. Most UI consumers can apply colors immediately; synchronized consumers can schedule
 the update using ``ColorState/localDisplayTime``.
+
+## Completion and physical timing
+
+A command method returning successfully means that SendspinKit accepted and sent the encrypted
+command. It does not mean that the server acknowledged the command, that application audio has
+started or ended, or that a sample is audible. Use the resulting control events and output telemetry
+when the UI needs an observed state transition.
+
+``SendspinClient/outputDelayMs`` describes physical downstream delay after submission to the output
+path. Changing it retimes pending audio; samples already submitted cannot be rewritten. Consequently
+an output-delay change is not instantaneous acoustic convergence. The adjusted timing becomes
+observable as the retimed pipeline reaches the downstream device.
+
+For visualizers, ``PresentationClock`` and ``PresentationInstant`` are a monotonic scheduling domain,
+not a display-photon clock. ``PresentationClock/sleep(until:)`` prevents early submission and
+``VisualizerFrame/isValid`` checks stream generation at the due instant, but a CoreVideo display-link
+submission does not guarantee the next screen refresh or exact photon timing. Consumers must not
+claim refresh synchronization without an independently measured clock mapping.

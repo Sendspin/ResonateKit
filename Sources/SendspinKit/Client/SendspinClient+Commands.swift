@@ -169,20 +169,36 @@ extension SendspinClient {
 }
 
 public extension SendspinClient {
-    /// Open the connection-owned pairing window for one code-based attempt.
+    /// Open the attempt-scoped pairing window for `attemptID`.
+    /// Dynamic pairing resets the global budget and performs a fallible round reservation;
+    /// static pairing does neither. The window controls eligibility, not peer trust.
     @MainActor
-    func openPairingWindow() async throws {
+    func openPairingWindow(for attemptID: PairingAttemptID) async throws {
         try requireOpen()
-        guard let connection = pairingTargetConnection() else { throw SendspinClientError.notConnected }
-        await connection.openPairingWindow()
+        let candidates = [connection, pairingConnection].compactMap(\.self)
+        guard !candidates.isEmpty else { throw SendspinClientError.notConnected }
+        for candidate in candidates {
+            guard let snapshot = await candidate.pairingAttemptSnapshot(), snapshot.id == attemptID else { continue }
+            try await candidate.openPairingWindow(attemptID: attemptID)
+            return
+        }
+        throw SendspinClientError.stalePairingAttempt(attemptID)
     }
 
-    /// Cancel the current code-based pairing attempt, if any.
+    /// Cancel exactly the attempt represented by `attemptID`. The ID is matched
+    /// against both the primary and parked pairing connection; it never retargets
+    /// another connection after the original attempt ends.
     @MainActor
-    func cancelPairingAttempt() async throws {
+    func cancelPairing(attemptID: PairingAttemptID) async throws {
         try requireOpen()
-        guard let connection = pairingTargetConnection() else { throw SendspinClientError.notConnected }
-        await connection.cancelPairingAttempt()
+        let candidates = [connection, pairingConnection].compactMap(\.self)
+        guard !candidates.isEmpty else { throw SendspinClientError.notConnected }
+        for candidate in candidates {
+            guard let snapshot = await candidate.pairingAttemptSnapshot(), snapshot.id == attemptID else { continue }
+            try await candidate.cancelPairing(attemptID: attemptID)
+            return
+        }
+        throw SendspinClientError.stalePairingAttempt(attemptID)
     }
 
     /// Start playback.

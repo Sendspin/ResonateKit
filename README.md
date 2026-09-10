@@ -125,21 +125,40 @@ makes the client available again but does not automatically rejoin its previous 
 ## Pairing codes
 
 Pairing-code flows are app-facing setup hooks. Enable a method in `PairingConfiguration`, then
-listen to the existing `SendspinClient.events()` stream for
-`ClientEvent.pairingCodeChanged(_:)`:
+listen to `SendspinClient.events()` for `ClientEvent.pairingCodeChanged(_:)`,
+`ClientEvent.pairingAttemptEnded(_:)`, and `ClientEvent.paired(_:)`. Each event carries a
+`PairingAttemptSnapshot`; keep its `id` with the UI state that displayed its code.
 
 - Dynamic pairing emits a `PairingCodeEmission` with `format == .digits` and a contiguous six-digit
   `payload`, or with `format == .qrCode` and a complete version-one `SP:1` `payload`. Display or
   speak the value from the app; presentation grouping and QR image generation remain app
-  responsibilities. When the server advertises the optional speaker capability, a digits emission
-  also carries a validated `digitAudioPack`; the host app is responsible for decoding and playing
-  those ten clips. A `nil` emission clears any displayed code.
-- Call `try await client.openPairingWindow()` from the app's physical-gesture or equivalent
-  operator-confirmation hook. The call records or consumes the connection-owned window intent and
-  returns without waiting for pairing to finish. Call `try await client.cancelPairingAttempt()` to
-  cancel an in-progress attempt or close the local window.
-- Listen for `ClientEvent.pairingAttemptEnded(_:)` to distinguish reasons such as
-  `.pairingCodeMismatch`, `.userCancelled`, `.attemptTimeout`, and `.methodNotSupported`.
+  responsibilities. A `nil` `code` clears any displayed code.
+- Call `try await client.openPairingWindow(for: snapshot.id)` from the app's physical-gesture or
+  equivalent operator-confirmation hook. It records or consumes the connection-owned window and
+  returns without waiting for pairing to finish.
+- Cancel only the attempt represented by the ID captured with the rendered snapshot:
+
+  ```swift
+  // `renderedPairing` is the immutable snapshot captured by the UI row/button.
+  let displayedAttemptID = renderedPairing?.id
+  if let displayedAttemptID {
+      do {
+          try await client.cancelPairing(attemptID: displayedAttemptID)
+      } catch SendspinClientError.stalePairingAttempt {
+          // The displayed attempt ended; do not retarget a newer attempt.
+      }
+  }
+  ```
+
+  `PairingAttemptID` is opaque. A retry retains its ID; a later activation receives a new one.
+  `client.currentPairing` retains the latest terminal snapshot until another attempt starts.
+  `client.pairingWindow` is the observable authorization window for that attempt and becomes `nil`
+  when it expires or closes; its `expiresAt` is UI state, not a trust assertion.
+  `snapshot.peer.id` is unverified while `snapshot.peer.trustLevel == .none`; only successful
+  pairing establishes `.user` trust. The authorization window is operator consent, not server trust.
+  Handle terminal `snapshot.phase` values such as
+  `.ended(.pairingCodeMismatch)`, `.ended(.userCancelled)`, `.ended(.attemptTimeout)`, and
+  `.ended(.methodNotSupported)` as outcomes rather than assuming cancellation succeeded.
 
 Static pairing uses `PairingConfiguration(staticPairingCode:staticPairingCodeEnabled:)`. The host
 must provision and persist a device-unique eight-digit ASCII decimal code; never ship a fixed
@@ -213,14 +232,19 @@ schedule color changes alongside audio, artwork, or visualizer updates.
 Configure the visualizer role when creating the client. The requested types, maximum update rate,
 and optional spectrum parameters are published in `client/state`; the server's negotiated types,
 rate, conditional `tracks_downbeats`, and spectrum parameters are exposed by the
-`.visualizerStreamStarted` event and `currentVisualizerStreamConfiguration`. Visualizer frames are
-delivered through `client.visualizerData`; each `VisualizerData` includes its `type`, raw payload,
-local display deadline, and a stream-generation validity token. Consumers must check
-`frame.isRenderable` immediately before drawing: this rejects frames invalidated by
-`stream/clear`, `stream/end`, or session replacement, and also rejects frames whose display
-deadline has become stale while queued. Each frame retains the negotiated configuration that
-validated it, including across an in-place configuration update. Frames whose translated
-deadline has already passed at arrival are discarded.
+`.visualizerStreamStarted` event and `currentVisualizerStreamConfiguration`. Acquire the single
+bounded data-plane consumer with `try client.acquireVisualizerFrames()`. Each `VisualizerFrame`
+contains its type, raw payload, typed `presentationTime`, and the negotiated configuration that
+validated it. The subscription drops stale frames and invalidates queued frames when a stream or
+session ends; it never creates an unbounded producer queue.
+
+Use `PresentationClock` and `PresentationInstant` for scheduling. A frame is eligible only while
+`frame.eligibilityForScheduling(at: clock.now)` is true; after sleeping until its presentation
+instant, capture a fresh instant and call `frame.isValid` immediately before submitting it to the
+view model or display tick. `isValid` checks stream generation only, so a due frame can remain valid;
+its deadline is a scheduling decision, not a lifetime check. Do not convert presentation instants
+through wall clock time or draw a frame early. See `Examples/VisualizerClient` for a bounded SwiftUI
+consumer; a display-link submission is not a guarantee about screen-photon timing.
 
 ```swift
 let visualizer = try SendspinClient(
@@ -263,6 +287,17 @@ SendspinKit uses a Kalman filter for clock synchronization and timestamp-based a
 - **AudioScheduler** — Priority queue of audio chunks sorted by playback time
 - **Playback Window** — Configurable tolerance for network jitter (default +/-50ms)
 - **Sync Correction** — Frame-level drop/insert to maintain alignment without audible glitches
+
+A successful command API call means that SendspinKit accepted and sent the encrypted command. It is
+not a server acknowledgement and is not evidence that application audio has started, completed, or
+become audible. Treat the subsequent state/event stream and audio output telemetry as separate
+signals.
+
+`outputDelayMs` models physical downstream delay after the client submits audio to its output path.
+When the value changes, pending audio is retimed for the new delay and already submitted audio cannot
+be rewritten. The command/event transition therefore does not create instantaneous acoustic
+convergence: the new timing takes effect as the retimed pipeline reaches the downstream device.
+Keep this distinction when measuring synchronization or presenting completion UI.
 
 ## Documentation
 

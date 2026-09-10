@@ -23,8 +23,8 @@ actor SendspinConnection {
     let audioEngine: AudioEngine
     let audioSink: AsyncStream<AudioChunk>.Continuation
     let artworkSink: AsyncStream<ArtworkData>.Continuation
-    let visualizerSink: AsyncStream<VisualizerData>.Continuation
-    let visualizerDelivery: VisualizerDataMailbox?
+    let visualizerSink: AsyncStream<VisualizerFrame>.Continuation
+    let visualizerDelivery: VisualizerFrameMailbox?
     let dataDelivery: ConnectionDataDelivery?
     let activationGate: ConnectionActivationGate?
     let emitRawAudio: Bool
@@ -122,6 +122,8 @@ actor SendspinConnection {
     /// Set when an outbound send fails: a burned nonce makes the channel
     /// crypto-dead, so queued and later senders must fail without encrypting.
     var outboundFailed = false
+    /// Authorization retained only for the terminal abort of the attempt that was just cleared.
+    var pairingAbortAuthorization: PairingAttemptID?
 
     /// Server info
     var currentServerId: String?
@@ -153,6 +155,9 @@ actor SendspinConnection {
     /// Set synchronously when an admitted pairing activation starts setup. It
     /// covers the suspension before a concrete PSK/code attempt is installed.
     var pairingAttemptActive = false
+    /// Identity is created at pairing admission, before any awaited setup work.
+    var pairingAttemptID: PairingAttemptID?
+    var pairingAttemptPeer: PairingPeer?
     var initialPairingActivation: PairingDirective?
     var pendingPairingPsk: Psk?
     var pairingAttemptTask: Task<Void, Never>?
@@ -167,6 +172,8 @@ actor SendspinConnection {
         var nonceA: Data?
         var prs: Data?
         var emission: PairingCodeEmission?
+        /// The atomically reserved global round. Zero means the attempt is held pending
+        /// until an explicit dynamic-budget reset action makes a reservation possible.
         var round: UInt32
         var sid: Data?
         var pairInitSent: Bool
@@ -190,6 +197,8 @@ actor SendspinConnection {
     var staticPairingAttempt: StaticPairingAttempt?
     var pairingActivateCounter: UInt32 = 0
     var pairingWindowOpen = false
+    var pairingWindowAttemptID: PairingAttemptID?
+    var pairingWindowExpiresAt: PresentationInstant?
     var pairingWindowTask: Task<Void, Never>?
     let pairingWindowLifetime: Duration
 
@@ -282,8 +291,8 @@ actor SendspinConnection {
         },
         audioSink: AsyncStream<AudioChunk>.Continuation = AsyncStream<AudioChunk>.makeStream().1,
         artworkSink: AsyncStream<ArtworkData>.Continuation = AsyncStream<ArtworkData>.makeStream().1,
-        visualizerSink: AsyncStream<VisualizerData>.Continuation = AsyncStream<VisualizerData>.makeStream().1,
-        visualizerDelivery: VisualizerDataMailbox? = nil,
+        visualizerSink: AsyncStream<VisualizerFrame>.Continuation = AsyncStream<VisualizerFrame>.makeStream().1,
+        visualizerDelivery: VisualizerFrameMailbox? = nil,
         dataDelivery: ConnectionDataDelivery? = nil,
         activationGate: ConnectionActivationGate? = nil,
         emitRawAudio: Bool = true,
@@ -308,7 +317,13 @@ actor SendspinConnection {
         self.serverName = serverName
         self.activities = activities
         self.activeRoles = activeRoles
-        pairingAttemptActive = false
+        let preallocatedPairing = pairingConfigurationRuntime != nil
+            && (activities.isEmpty || activities == [.pairing])
+        pairingAttemptActive = activities == [.pairing]
+        pairingAttemptID = preallocatedPairing ? PairingAttemptID() : nil
+        pairingAttemptPeer = preallocatedPairing
+            ? PairingPeer(id: serverId, name: serverName)
+            : nil
         initialPairingActivation = nil
         pendingPairingPsk = nil
         pairingAttemptTask = nil
@@ -326,6 +341,8 @@ actor SendspinConnection {
         dynamicPairingAttempt = nil
         staticPairingAttempt = nil
         pairingWindowOpen = false
+        pairingWindowAttemptID = nil
+        pairingWindowExpiresAt = nil
         pairingWindowTask = nil
         self.identityPrivateKey = identityPrivateKey
         self.serverStaticPublicKey = serverStaticPublicKey

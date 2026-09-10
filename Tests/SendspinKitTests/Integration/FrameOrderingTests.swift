@@ -413,10 +413,11 @@ struct FrameOrderingTests {
         let client = try makePlayerClient(roles: [.playerV1, .visualizerV1], visualizerConfig: visualizerConfig)
         let mock = try await connectClient(client, activeRoles: [.playerV1, .visualizerV1])
 
-        let visualizerData = CollectedValues<VisualizerData>()
+        let visualizerData = CollectedValues<VisualizerFrame>()
+        let visualizerSubscription = try client.acquireVisualizerFrames()
 
         let collectTask = Task {
-            for await payload in client.visualizerData {
+            for await payload in visualizerSubscription {
                 await visualizerData.append(payload)
             }
         }
@@ -445,7 +446,7 @@ struct FrameOrderingTests {
         collectTask.cancel()
 
         let payload = try #require(await visualizerData.all.first)
-        #expect(payload.localDisplayTime > 0, "Synced visualizer payload should carry a local display deadline")
+        #expect(payload.presentationTime.rawMicroseconds > 0, "Synced visualizer payload should carry a local display deadline")
 
         await client.disconnect()
     }

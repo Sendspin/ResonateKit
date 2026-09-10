@@ -157,6 +157,45 @@ struct PskCandidateTests {
         }
     }
 
+    @Test("Dynamic pairing reservations are atomic under concurrency and bounded")
+    func dynamicPairingReservationsAreAtomic() async throws {
+        let store = InMemoryPairingRecordStore()
+        let limit: UInt32 = 20
+        let reservations = await withTaskGroup(of: DynamicPairingRoundReservation.self, returning: [DynamicPairingRoundReservation].self) { group in
+            for _ in 0 ..< 100 {
+                group.addTask {
+                    await reserveRound(store, limit: limit)
+                }
+            }
+            var results: [DynamicPairingRoundReservation] = []
+            for await result in group {
+                results.append(result)
+            }
+            return results
+        }
+        let rounds = reservations.compactMap { reservation -> UInt32? in
+            guard case let .reserved(round, _) = reservation else { return nil }
+            return round
+        }
+        #expect(rounds.count == Int(limit))
+        #expect(Set(rounds).count == Int(limit))
+        #expect(try await store.dynamicPairingRoundCount() == limit)
+        #expect(try await store.reserveDynamicPairingRound(limit: limit) == .exhausted)
+        try await store.resetDynamicPairingBudget()
+        #expect(try await store.reserveDynamicPairingRound(limit: limit) == .reserved(round: 1, remaining: limit - 1))
+    }
+
+    @Test("Dynamic pairing budget storage failures are thrown")
+    func dynamicPairingBudgetFailureIsNotSilenced() async throws {
+        let store = FailingDynamicBudgetStore()
+        await #expect(throws: PairingRecordStoreError.storageExhausted) {
+            try await store.reserveDynamicPairingRound(limit: dynamicPairingRoundLimit)
+        }
+        await #expect(throws: PairingRecordStoreError.storageExhausted) {
+            try await store.resetDynamicPairingBudget()
+        }
+    }
+
     @Test("A matching PSK in the wrong declared category is a lookup miss")
     func wrongCategoryIsLookupMiss() {
         let record = Psk.generate()
@@ -185,6 +224,41 @@ struct PskCandidateTests {
         let record = Psk.generate()
         let candidates = [PskCandidate(psk: record, category: .longTerm)]
         #expect(PskCandidate.select(from: candidates, pskId: record.pskId, pskCategory: .longTerm, serverId: "anything") != nil)
+    }
+}
+
+private func reserveRound(
+    _ store: InMemoryPairingRecordStore,
+    limit: UInt32
+) async -> DynamicPairingRoundReservation {
+    do {
+        return try await store.reserveDynamicPairingRound(limit: limit)
+    } catch {
+        return .exhausted
+    }
+}
+
+private actor FailingDynamicBudgetStore: PairingRecordStore {
+    func listRecords() async -> [PairingRecord] {
+        []
+    }
+
+    func insert(_: PairingRecord) async throws {}
+
+    func remove(pskId _: String) async {}
+
+    func markUsed(pskId _: String) async {}
+
+    func dynamicPairingRoundCount() async throws -> UInt32 {
+        throw PairingRecordStoreError.storageExhausted
+    }
+
+    func reserveDynamicPairingRound(limit _: UInt32) async throws -> DynamicPairingRoundReservation {
+        throw PairingRecordStoreError.storageExhausted
+    }
+
+    func resetDynamicPairingBudget() async throws {
+        throw PairingRecordStoreError.storageExhausted
     }
 }
 

@@ -38,13 +38,25 @@ extension SendspinConnection {
     func sendWrapped(
         _ message: some Codable & Sendable,
         bypassRehandshakeGate: Bool = false,
-        requireRunningLifecycle: Bool = false
+        requireRunningLifecycle: Bool = false,
+        expectedPairingAttemptID: PairingAttemptID? = nil,
+        allowClearedPairingAbort: Bool = false
     ) async throws {
         await acquireOutboundSlot()
         defer { releaseOutboundSlot() }
 
         guard !outboundFailed else {
             throw SendspinClientError.sendFailed("outbound channel is dead")
+        }
+        if let expectedPairingAttemptID {
+            let currentAuthorized = pairingAttemptID == expectedPairingAttemptID
+            let abortAuthorized = allowClearedPairingAbort && pairingAbortAuthorization == expectedPairingAttemptID
+            guard currentAuthorized || abortAuthorized else {
+                throw SendspinClientError.stalePairingAttempt(expectedPairingAttemptID)
+            }
+            if abortAuthorized, !currentAuthorized {
+                pairingAbortAuthorization = nil
+            }
         }
         // Gate checks come after acquisition: a sender parked during an exchange
         // or shutdown must not proceed under stale keys or a closing session.
@@ -77,6 +89,18 @@ extension SendspinConnection {
             await failOutbound()
             throw error
         }
+    }
+
+    func sendPairingWrapped(
+        _ message: some Codable & Sendable,
+        attemptID: PairingAttemptID,
+        allowClearedAbort: Bool = false
+    ) async throws {
+        try await sendWrapped(
+            message,
+            expectedPairingAttemptID: attemptID,
+            allowClearedPairingAbort: allowClearedAbort
+        )
     }
 
     // MARK: - Facade-initiated sends

@@ -1,4 +1,4 @@
-import SendspinKit
+@testable import SendspinKit
 import Testing
 
 @Suite("Public pairing surface")
@@ -24,7 +24,7 @@ struct PublicSurfaceTests {
             pairing: PairingConfiguration(pairingPsk: pairingPsk)
         )
         do {
-            try await client.openPairingWindow()
+            try await client.openPairingWindow(for: PairingAttemptID())
         } catch SendspinClientError.notConnected {
             // The API remains callable before a transport is connected.
         }

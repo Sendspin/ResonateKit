@@ -317,7 +317,7 @@ struct SendspinClientTests {
         let events = client.events()
         let audio = client.audioChunks
         let artwork = client.artwork
-        let visualizer = client.visualizerData
+        let visualizer = try client.acquireVisualizerFrames()
 
         async let firstClose: Void = client.close()
         async let secondClose: Void = client.close()
@@ -351,7 +351,7 @@ struct SendspinClientTests {
         let events = client.events()
         let audio = client.audioChunks
         let artwork = client.artwork
-        let visualizer = client.visualizerData
+        let visualizer = try client.acquireVisualizerFrames()
         let collectedEvents = Task { @MainActor in
             var values: [ClientEvent] = []
             for await event in events {

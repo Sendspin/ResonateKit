@@ -201,10 +201,27 @@ struct ClockSyncDiagnostics: AsyncParsableCommand {
                     }
                     state.shouldQuit = true
                     break eventLoop
-                case .paired, .pairingCodeChanged, .pairingAttemptEnded, .audioOutputChanged, .outputFormatStatusChanged, .streamingFailed,
-                     .streamStarted, .streamFormatChanged, .streamEnded, .streamCleared,
-                     .groupUpdated, .metadataReceived, .controllerStateUpdated, .controllerStateCleared, .colorStateUpdated,
-                     .colorStateCleared, .artworkStreamStarted, .visualizerStreamStarted, .outputDelayChanged,
+                // Explicit cases keep this example current as events evolve; apps may use `default: break` to ignore other events.
+                case .paired,
+                     .pairingCodeChanged,
+                     .pairingAttemptEnded,
+                     .pairingWindowChanged,
+                     .audioOutputChanged,
+                     .outputFormatStatusChanged,
+                     .streamingFailed,
+                     .streamStarted,
+                     .streamFormatChanged,
+                     .streamEnded,
+                     .streamCleared,
+                     .groupUpdated,
+                     .metadataReceived,
+                     .controllerStateUpdated,
+                     .controllerStateCleared,
+                     .colorStateUpdated,
+                     .colorStateCleared,
+                     .artworkStreamStarted,
+                     .visualizerStreamStarted,
+                     .outputDelayChanged,
                      .lastPlayedServerChanged:
                     break
                 }

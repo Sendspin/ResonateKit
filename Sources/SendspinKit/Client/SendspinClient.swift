@@ -40,6 +40,11 @@ public final class SendspinClient {
     public private(set) var connectionState: ConnectionState = .disconnected
     /// Trust level established by the currently admitted Noise PSK.
     public private(set) var trustLevel: TrustLevel = .none
+    /// Latest immutable pairing projection, including the terminal snapshot until a new attempt starts.
+    public private(set) var currentPairing: PairingAttemptSnapshot?
+    /// Operator authorization for one pairing attempt, or nil when no window is open.
+    /// A window does not change the peer's ``TrustLevel``; that is established only after pairing.
+    public private(set) var pairingWindow: PairingWindowSnapshot?
     /// The audio format currently being streamed by the server, or nil if no stream is active.
     public private(set) var currentStreamFormat: AudioFormatSpec?
     /// Written both here and by the control drain's `.operationalState` case, so
@@ -198,14 +203,15 @@ public final class SendspinClient {
     /// Most recent artwork payload received from the artwork data stream.
     public private(set) var currentArtwork: ArtworkData?
 
-    let visualizerDataMailbox: VisualizerDataMailbox
-    /// Visualizer bytes from the visualizer data stream.
+    let visualizerFrameMailbox: VisualizerFrameMailbox
+    /// Acquire the single app-facing visualizer frame subscription.
     ///
-    /// Delivery is FIFO among retained frames and bounded by the configured
-    /// visualizer `bufferCapacity` using the wire frame size (9 + payload bytes).
-    /// Periodic types are requested with the shared `rateMax` scalar; beat and
-    /// peak remain event-driven as defined by the visualizer role.
-    public let visualizerData: VisualizerDataStream
+    /// A subscription owns the bounded mailbox consumer until it is cancelled,
+    /// its pending read is cancelled, or it is deallocated. A second live
+    /// subscription fails instead of silently returning an empty iterator.
+    public func acquireVisualizerFrames() throws(VisualizerFrameAcquisitionError) -> VisualizerFrameSubscription {
+        try VisualizerFrameSubscription(acquiring: visualizerFrameMailbox)
+    }
 
     public convenience init(
         identity: SendspinIdentity,
@@ -307,8 +313,7 @@ public final class SendspinClient {
 
         (audioChunks, audioChunksContinuation) = AsyncStream.makeStream()
         (artwork, artworkContinuation) = AsyncStream.makeStream()
-        visualizerDataMailbox = VisualizerDataMailbox(capacityBytes: visualizerConfig?.bufferCapacity ?? 1)
-        visualizerData = VisualizerDataStream(mailbox: visualizerDataMailbox)
+        visualizerFrameMailbox = VisualizerFrameMailbox(capacityBytes: visualizerConfig?.bufferCapacity ?? 1)
 
         if roleSet.contains(.playerV1) {
             startAudioOutputCapabilityMonitoring()
@@ -335,7 +340,7 @@ public final class SendspinClient {
         eventSubscribers.removeAll()
         audioChunksContinuation.finish()
         artworkContinuation.finish()
-        visualizerDataMailbox.finish()
+        visualizerFrameMailbox.finish()
         // Safety net: dropping a connected client must not leak a live, playing
         // connection graph. Capture the connection into a local — do NOT capture
         // self. (`isolated deinit` runs on the MainActor, so reading the isolated
@@ -354,7 +359,7 @@ public final class SendspinClient {
     ///
     /// Each call returns an independent stream that receives future control events.
     /// Binary role payloads are not emitted here; use ``audioChunks``, ``artwork``,
-    /// and ``visualizerData`` for data-plane bytes.
+    /// and ``acquireVisualizerFrames()`` for data-plane bytes.
     public func events() -> AsyncStream<ClientEvent> {
         let id = UUID()
         let (stream, continuation) = AsyncStream<ClientEvent>.makeStream()
@@ -430,6 +435,18 @@ public final class SendspinClient {
 
     func updateControllerState(_ state: ControllerState?) {
         currentControllerState = state
+    }
+
+    func updateCurrentPairing(_ snapshot: PairingAttemptSnapshot?) {
+        currentPairing = snapshot
+    }
+
+    func updatePairingWindow(_ window: PairingWindowSnapshot?) {
+        pairingWindow = window
+    }
+
+    func clearPairingWindow() {
+        pairingWindow = nil
     }
 
     private func updateCodecHeader(_ header: Data?) {
@@ -631,7 +648,7 @@ public final class SendspinClient {
         drainConnectionEventsTask?.cancel()
         drainConnectionEventsTask = nil
         sessionValidity?.invalidate()
-        visualizerDataMailbox.clear()
+        visualizerFrameMailbox.clear()
         let retired = connection
         connection = nil
         return retired
@@ -700,7 +717,7 @@ public final class SendspinClient {
         let dataDelivery = ConnectionDataDelivery(
             audio: audioChunksContinuation,
             artwork: artworkContinuation,
-            visualizer: visualizerDataMailbox,
+            visualizer: visualizerFrameMailbox,
             artworkObserver: deliveryArtworkObserver
         )
         if !installAsPairingSide {
@@ -846,6 +863,9 @@ public final class SendspinClient {
             await newConnection.prepareInitialPairingActivation(outcomePairing)
         }
         await newConnection.start()
+        if !installAsPairingSide, let snapshot = await newConnection.pairingAttemptSnapshot() {
+            updateCurrentPairing(snapshot)
+        }
 
         // Drain control events without retaining the client: upgrade weak `self` per event.
         // Otherwise a parked task prevents deinit and its cleanup safety net.
@@ -1005,7 +1025,7 @@ public final class SendspinClient {
         eventSubscribers.removeAll()
         audioChunksContinuation.finish()
         artworkContinuation.finish()
-        visualizerDataMailbox.finish()
+        visualizerFrameMailbox.finish()
     }
 
     /// Record the host application's audio-session activation state.
@@ -1085,14 +1105,33 @@ public final class SendspinClient {
     func applyConnectionEvent(_ event: ConnectionEvent) { // swiftlint:disable:this function_body_length
         guard !isTerminated else { return }
         switch event {
-        case let .paired(serverId):
-            emitEvent(.paired(serverId: serverId))
+        case let .paired(snapshot):
+            currentPairing = snapshot
+            // A late success from an older attempt must not close a newer window.
+            if pairingWindow?.attemptID == snapshot.id {
+                pairingWindow = nil
+            }
+            emitEvent(.paired(snapshot))
 
-        case let .pairingCodeChanged(emission):
-            emitEvent(.pairingCodeChanged(emission))
+        case let .pairingCodeChanged(snapshot):
+            // A terminal nil-code projection follows the ended event so a
+            // consumer can observe both lifecycle and code removal in order.
+            if case .ended = currentPairing?.phase, snapshot.code == nil,
+               snapshot.id == currentPairing?.id {
+                emitEvent(.pairingCodeChanged(snapshot))
+            } else {
+                currentPairing = snapshot
+                emitEvent(.pairingCodeChanged(snapshot))
+            }
 
-        case let .pairingAttemptEnded(reason):
-            emitEvent(.pairingAttemptEnded(reason))
+        case let .pairingAttemptEnded(snapshot):
+            currentPairing = snapshot
+            pairingWindow = nil
+            emitEvent(.pairingAttemptEnded(snapshot))
+
+        case let .pairingWindowChanged(window):
+            pairingWindow = window
+            emitEvent(.pairingWindowChanged(window))
 
         case let .serverConnected(info):
             currentServerId = info.serverId
@@ -1296,7 +1335,7 @@ public final class SendspinClient {
         playerStreamActive = false
         artworkStreamActive = false
         currentVisualizerStreamConfiguration = nil
-        visualizerDataMailbox.clear()
+        visualizerFrameMailbox.clear()
     }
 
     /// Clear server-reported state that is scoped to a single connection. A

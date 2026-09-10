@@ -144,17 +144,74 @@ public struct VisualizerStreamConfiguration: Sendable, Equatable {
     }
 }
 
+/// Monotonic presentation-time instant used by SendspinKit.
+/// `rawMicroseconds` shares the synchronized server-timestamp domain after conversion;
+/// compare only with another ``PresentationInstant`` (it is not wall-clock time).
+public struct PresentationInstant: Sendable, Hashable, Comparable {
+    public let rawMicroseconds: Int64
+
+    public init(rawMicroseconds: Int64) {
+        self.rawMicroseconds = rawMicroseconds
+    }
+
+    /// The current instant in the presentation clock's monotonic domain.
+    public static var now: Self {
+        Self(rawMicroseconds: MonotonicClock.absoluteMicroseconds())
+    }
+
+    public static func < (lhs: Self, rhs: Self) -> Bool {
+        lhs.rawMicroseconds < rhs.rawMicroseconds
+    }
+
+    /// Adds a duration, saturating if the resulting microsecond value overflows.
+    public func adding(_ duration: Duration) -> Self {
+        let components = duration.components
+        let seconds = components.seconds.multipliedReportingOverflow(by: 1_000_000)
+        let micros = components.attoseconds / 1_000_000_000_000
+        let (whole, overflow) = seconds.partialValue.addingReportingOverflow(micros)
+        let delta: Int64 = if seconds.overflow || overflow {
+            components.seconds >= 0 ? .max : .min
+        } else {
+            whole
+        }
+        let (result, resultOverflow) = rawMicroseconds.addingReportingOverflow(delta)
+        return Self(rawMicroseconds: resultOverflow ? (delta >= 0 ? .max : .min) : result)
+    }
+
+    public func duration(to other: Self) -> Duration {
+        let (delta, overflow) = other.rawMicroseconds.subtractingReportingOverflow(rawMicroseconds)
+        return .microseconds(overflow ? (other > self ? .max : .min) : delta)
+    }
+}
+
+/// Access to the same monotonic time domain used for visualizer deadlines.
+public struct PresentationClock: Sendable {
+    public init() {}
+
+    public var now: PresentationInstant {
+        .now
+    }
+
+    public func duration(from start: PresentationInstant, to end: PresentationInstant) -> Duration {
+        start.duration(to: end)
+    }
+
+    /// Sleeps until an instant in the presentation domain without converting through wall time.
+    public func sleep(until instant: PresentationInstant) async throws {
+        let remaining = now.duration(to: instant)
+        guard remaining > .zero else { return }
+        try await Task.sleep(for: remaining)
+    }
+}
+
 /// Validity shared by frames in one visualizer stream generation.
-/// Queued frames can outlive stream boundaries or session replacement; check
-/// ``VisualizerData/isRenderable`` before drawing.
-public final class VisualizerFrameValidity: @unchecked Sendable {
+/// The token is intentionally private to the library; stream boundaries invalidate
+/// queued frames without exposing mutable lifetime state to app code.
+final class VisualizerFrameValidity: @unchecked Sendable {
     private let lock = NSLock()
     private var valid = true
 
-    public init() {}
-
-    /// Whether this frame still belongs to the active visualizer stream.
-    public var isValid: Bool {
+    var isValid: Bool {
         lock.withLock { valid }
     }
 
@@ -164,47 +221,70 @@ public final class VisualizerFrameValidity: @unchecked Sendable {
 }
 
 /// Visualizer bytes received from the visualizer stream.
-public struct VisualizerData: Sendable, Equatable {
+///
+/// Stream validity can change independently of a frame's bytes.
+/// Use ``matchesPayload(_:)`` for explicit payload equality rather than comparing
+/// stream-lifetime state.
+public struct VisualizerFrame: Sendable, Equatable {
     /// The visualization type encoded by the binary message type byte.
     public let type: VisualizerType
     /// Raw visualizer payload bytes after the Sendspin binary header.
     public let data: Data
-    /// Local absolute display time in microseconds.
-    public let localDisplayTime: Int64
-    /// The negotiated configuration used to validate this frame. Consumers should
-    /// use this snapshot when rendering queued frames after a configuration update.
-    public let streamConfiguration: VisualizerStreamConfiguration?
-    /// Stream-generation validity. Check this immediately before rendering.
-    public let validity: VisualizerFrameValidity
+    /// The local monotonic instant at which this frame should be presented.
+    public let presentationTime: PresentationInstant
+    /// The negotiated configuration used to validate this frame.
+    public let configuration: VisualizerStreamConfiguration
 
-    /// True only while this frame belongs to the active stream and its display deadline is fresh.
-    public var isRenderable: Bool {
-        isRenderable(at: MonotonicClock.absoluteMicroseconds())
+    private let validity: VisualizerFrameValidity
+
+    /// Whether this frame belongs to the active visualizer stream.
+    /// Check immediately before presenting; a late frame can remain `isValid`.
+    /// Lateness is scheduling eligibility, not stream lifetime.
+    public var isValid: Bool {
+        validity.isValid
     }
 
-    /// True only while valid and not already late at the supplied local instant.
-    public func isRenderable(at localNow: Int64) -> Bool {
-        validity.isValid && localDisplayTime > localNow
+    /// Whether this frame may be submitted to a future display schedule at `instant`.
+    /// The deadline check is intentionally separate from ``isValid`` at presentation.
+    public func eligibilityForScheduling(at instant: PresentationInstant) -> Bool {
+        validity.isValid && presentationTime > instant
+    }
+
+    /// Explicit payload comparison that excludes stream-generation lifetime.
+    public func matchesPayload(_ other: VisualizerFrame) -> Bool {
+        type == other.type && data == other.data && presentationTime == other.presentationTime
+            && configuration == other.configuration
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.matchesPayload(rhs)
     }
 
     public init(
         type: VisualizerType,
         data: Data,
-        localDisplayTime: Int64,
-        streamConfiguration: VisualizerStreamConfiguration? = nil,
-        validity: VisualizerFrameValidity = VisualizerFrameValidity()
+        presentationTime: PresentationInstant,
+        configuration: VisualizerStreamConfiguration
     ) {
         self.type = type
         self.data = data
-        self.localDisplayTime = localDisplayTime
-        self.streamConfiguration = streamConfiguration
-        self.validity = validity
+        self.presentationTime = presentationTime
+        self.configuration = configuration
+        validity = VisualizerFrameValidity()
     }
 
-    public static func == (lhs: VisualizerData, rhs: VisualizerData) -> Bool {
-        lhs.type == rhs.type && lhs.data == rhs.data && lhs.localDisplayTime == rhs.localDisplayTime
-            && lhs.streamConfiguration == rhs.streamConfiguration
-            && lhs.validity === rhs.validity
+    init(
+        type: VisualizerType,
+        data: Data,
+        presentationTime: PresentationInstant,
+        configuration: VisualizerStreamConfiguration,
+        validity: VisualizerFrameValidity
+    ) {
+        self.type = type
+        self.data = data
+        self.presentationTime = presentationTime
+        self.configuration = configuration
+        self.validity = validity
     }
 }
 
@@ -225,11 +305,72 @@ public struct PairingCodeEmission: Sendable, Equatable {
     }
 }
 
+/// Opaque identity for one admitted pairing attempt. A retry keeps this identity;
+/// a later activation receives a new identity.
+public struct PairingAttemptID: Hashable, Sendable {
+    public let rawValue: UUID
+
+    init() {
+        rawValue = UUID()
+    }
+}
+
+/// The server descriptor is available before authentication and therefore reports
+/// ``TrustLevel/none`` until the pairing succeeds.
+public struct PairingPeer: Sendable, Equatable {
+    public let id: String
+    public let name: String
+    public let trustLevel: TrustLevel
+
+    public init(id: String, name: String, trustLevel: TrustLevel = .none) {
+        self.id = id
+        self.name = name
+        self.trustLevel = trustLevel
+    }
+}
+
+public enum PairingAttemptPhase: Sendable, Equatable {
+    /// The server has admitted pairing but setup is waiting for authorization.
+    case pending
+    case codeReady
+    case authenticating
+    case succeeded
+    case ended(PairAbortReason)
+}
+
+/// Immutable UI projection of a connection-owned pairing attempt.
+public struct PairingAttemptSnapshot: Sendable, Equatable {
+    public let id: PairingAttemptID
+    public let peer: PairingPeer
+    public let phase: PairingAttemptPhase
+    public let code: PairingCodeEmission?
+
+    public init(id: PairingAttemptID, peer: PairingPeer, phase: PairingAttemptPhase, code: PairingCodeEmission? = nil) {
+        self.id = id
+        self.peer = peer
+        self.phase = phase
+        self.code = code
+    }
+}
+
+/// The operator-authorized window for one pairing attempt. The owning attempt
+/// identity is explicit because pairing peers are untrusted until pairing succeeds.
+public struct PairingWindowSnapshot: Sendable, Equatable {
+    public let attemptID: PairingAttemptID
+    public let expiresAt: PresentationInstant
+
+    public init(attemptID: PairingAttemptID, expiresAt: PresentationInstant) {
+        self.attemptID = attemptID
+        self.expiresAt = expiresAt
+    }
+}
+
 public enum ClientEvent: Sendable, Equatable {
     case serverConnected(ServerInfo)
-    case pairingCodeChanged(PairingCodeEmission?)
-    case pairingAttemptEnded(PairAbortReason)
-    case paired(serverId: String)
+    case pairingCodeChanged(PairingAttemptSnapshot)
+    case pairingAttemptEnded(PairingAttemptSnapshot)
+    case pairingWindowChanged(PairingWindowSnapshot?)
+    case paired(PairingAttemptSnapshot)
     /// The client observed a new advisory audio-output capability snapshot.
     case audioOutputChanged(AudioOutputSnapshot)
     /// The current session's output-format negotiation status changed.
@@ -502,6 +643,8 @@ public enum StreamRole: String, Sendable, Hashable {
 public enum SendspinClientError: SendspinError, Equatable, LocalizedError {
     /// A method that requires an active connection was called while disconnected.
     case notConnected
+    /// A pairing command referred to an attempt that is no longer active.
+    case stalePairingAttempt(PairingAttemptID)
     /// ``SendspinClient/connect(to:)`` or ``SendspinClient/acceptConnection(_:)``
     /// was called while a connection is already in progress or established.
     case alreadyConnected
@@ -526,6 +669,8 @@ public enum SendspinClientError: SendspinError, Equatable, LocalizedError {
         switch self {
         case .notConnected:
             "Not connected to a Sendspin server"
+        case let .stalePairingAttempt(id):
+            "Pairing attempt \(id.rawValue) is no longer active"
         case .alreadyConnected:
             "Already connected or connecting to a Sendspin server"
         case let .sendFailed(reason):
