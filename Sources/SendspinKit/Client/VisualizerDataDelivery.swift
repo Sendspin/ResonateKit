@@ -137,8 +137,8 @@ final class VisualizerFrameMailbox: @unchecked Sendable {
     private let lock = NSLock()
     private let capacityBytes: Int
     private let now: @Sendable () -> PresentationInstant
-    private let beforePark: (@Sendable () -> Void)?
-    private let beforePostHandoffCheck: (@Sendable () -> Void)?
+    private let beforePark: (@Sendable () async -> Void)?
+    private let beforePostHandoffCheck: (@Sendable () async -> Void)?
     private var queueHead: QueueNode?
     private var queueTail: QueueNode?
     private var queuedBytes = 0
@@ -171,8 +171,8 @@ final class VisualizerFrameMailbox: @unchecked Sendable {
     init(
         capacityBytes: Int,
         now: @escaping @Sendable () -> PresentationInstant = { .now },
-        beforePark: (@Sendable () -> Void)? = nil,
-        beforePostHandoffCheck: (@Sendable () -> Void)? = nil
+        beforePark: (@Sendable () async -> Void)? = nil,
+        beforePostHandoffCheck: (@Sendable () async -> Void)? = nil
     ) {
         precondition(capacityBytes > 0)
         self.capacityBytes = capacityBytes
@@ -261,7 +261,7 @@ final class VisualizerFrameMailbox: @unchecked Sendable {
                 break
             }
 
-            beforePark?()
+            await beforePark?()
             let result = await withTaskCancellationHandler {
                 await withCheckedContinuation { (continuation: CheckedContinuation<ReadResult, Never>) in
                     park(owner: iterator, continuation: continuation)
@@ -269,7 +269,7 @@ final class VisualizerFrameMailbox: @unchecked Sendable {
             } onCancel: {
                 cancel(lease: iterator.lease)
             }
-            beforePostHandoffCheck?()
+            await beforePostHandoffCheck?()
             switch result {
             case let .value(value):
                 // An explicitly canceled lease drops a frame already handed to its continuation.

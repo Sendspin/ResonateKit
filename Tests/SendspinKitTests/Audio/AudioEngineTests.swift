@@ -9,15 +9,20 @@ actor StubClock: ClockSyncProtocol {
     private var synchronized = true
     private let offset: Int64 // offset = server - client
     private let anchorToNow: Bool
+    private let absoluteAnchorMicroseconds: Int64?
 
     /// - Parameter anchorToNow: when true, `serverTimeToLocal` maps a (small) server
-    ///   timestamp to `MonotonicClock.absoluteMicroseconds() + serverTime`, so a chunk
-    ///   scheduled with a near-zero/near-future `ts` lands inside the scheduler's
-    ///   playback window and is actually emitted to `scheduledChunks` (rather than
-    ///   dropped-late). Required to drive `runSchedulerOutput`'s rebuild path.
-    init(offsetMicroseconds: Int64 = 0, anchorToNow: Bool = false) {
+    ///   timestamp to the current monotonic instant plus `serverTime`.
+    /// - Parameter absoluteAnchorMicroseconds: optional fixed absolute instant for tests that
+    ///   need server-to-local conversion without elapsed wall-clock time.
+    init(
+        offsetMicroseconds: Int64 = 0,
+        anchorToNow: Bool = false,
+        absoluteAnchorMicroseconds: Int64? = nil
+    ) {
         offset = offsetMicroseconds
         self.anchorToNow = anchorToNow
+        self.absoluteAnchorMicroseconds = absoluteAnchorMicroseconds
     }
 
     var hasSynced: Bool {
@@ -33,7 +38,7 @@ actor StubClock: ClockSyncProtocol {
 
     func serverTimeToLocal(_ serverTime: Int64) -> Int64 {
         if anchorToNow {
-            return MonotonicClock.absoluteMicroseconds() + serverTime
+            return (absoluteAnchorMicroseconds ?? MonotonicClock.absoluteMicroseconds()) + serverTime
         }
         // Stub: local = server - offset
         return serverTime - offset
@@ -41,7 +46,7 @@ actor StubClock: ClockSyncProtocol {
 
     func localTimeToServer(_ localTime: Int64) -> Int64 {
         if anchorToNow {
-            return localTime - MonotonicClock.absoluteMicroseconds()
+            return localTime - (absoluteAnchorMicroseconds ?? MonotonicClock.absoluteMicroseconds())
         }
         // Stub: server = local + offset (inverse of serverTimeToLocal)
         return localTime + offset

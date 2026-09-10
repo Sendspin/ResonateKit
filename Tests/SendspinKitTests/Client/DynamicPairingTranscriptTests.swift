@@ -374,7 +374,7 @@ struct DynamicPairingTranscriptTests {
         )
         let windowEventsTask = Task { () -> [ClientEvent] in
             var events = [ClientEvent]()
-            for await event in session.events {
+            for await event in session.client.events() {
                 if case .pairingWindowChanged = event {
                     events.append(event)
                     if events.count == 2 {

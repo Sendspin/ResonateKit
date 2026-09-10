@@ -199,6 +199,8 @@ actor AudioEngine {
     private var startupReleaseInvocation: UInt64 = 0
     private var startupReleaseInProgress = false
     private var outputHasStarted = false
+    /// Absolute time source for startup selection; injectable only through the internal test init.
+    private let startupNow: @Sendable () -> Int64
     private let engineID = UUID().uuidString
 
     private struct StartupBuffer {
@@ -355,11 +357,13 @@ actor AudioEngine {
         scheduler: AudioScheduler,
         clock: any ClockSyncProtocol,
         enableStartupBuffering: Bool = false,
-        startupMinBufferMs: Int = 0
+        startupMinBufferMs: Int = 0,
+        startupNow: @escaping @Sendable () -> Int64 = { MonotonicClock.absoluteMicroseconds() }
     ) {
         self.output = output
         audioScheduler = scheduler
         self.clock = clock
+        self.startupNow = startupNow
         let sink = DataPlaneSink()
         _commandsSink = sink
         _commandStream = sink.commands
@@ -394,6 +398,7 @@ actor AudioEngine {
         output = audioPlayer
         self.audioScheduler = audioScheduler
         self.clock = clock
+        startupNow = { MonotonicClock.absoluteMicroseconds() }
         let sink = DataPlaneSink()
         _commandsSink = sink
         _commandStream = sink.commands
@@ -970,7 +975,7 @@ actor AudioEngine {
             return
         }
 
-        let nowUs = MonotonicClock.absoluteMicroseconds()
+        let nowUs = startupNow()
         let playTimes = buffer.chunks.map(\.playTimeMicroseconds)
         let candidate = Self.releaseSelection(
             playTimes: playTimes,

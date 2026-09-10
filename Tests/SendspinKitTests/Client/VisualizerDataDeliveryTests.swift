@@ -82,13 +82,13 @@ struct VisualizerFrameDeliveryTests {
 
     @Test("explicit cancellation between the immediate check and park is a barrier")
     func explicitCancellationImmediateCheckToParkBarrier() async throws {
-        let reachedParkBarrier = DispatchSemaphore(value: 0)
-        let releaseParkBarrier = DispatchSemaphore(value: 0)
+        let reachedParkBarrier = AsyncTestBarrier()
+        let releaseParkBarrier = AsyncTestBarrier()
         let mailbox = VisualizerFrameMailbox(
             capacityBytes: 64,
             beforePark: {
-                reachedParkBarrier.signal()
-                _ = releaseParkBarrier.wait(timeout: .now() + 1)
+                await reachedParkBarrier.signalReached()
+                await releaseParkBarrier.waitUntilReleased()
             }
         )
         let first = try VisualizerFrameSubscription(acquiring: mailbox)
@@ -99,18 +99,18 @@ struct VisualizerFrameDeliveryTests {
 
         defer {
             first.cancel()
-            releaseParkBarrier.signal()
+            Task { await releaseParkBarrier.release() }
             mailbox.finish()
         }
-        try #require(await waitForSemaphore(reachedParkBarrier))
+        try #require(await reachedParkBarrier.waitUntilReached())
         first.cancel()
-        releaseParkBarrier.signal()
+        await releaseParkBarrier.release()
         let observation = await observeTask(
             pending,
             timeout: .seconds(1),
             onTimeout: {
                 mailbox.finish()
-                releaseParkBarrier.signal()
+                await releaseParkBarrier.release()
             }
         )
         guard case let .completed(value) = observation else {
@@ -129,19 +129,19 @@ struct VisualizerFrameDeliveryTests {
 
     @Test("explicit cancellation after handoff drops the old frame")
     func explicitCancellationAfterHandoff() async throws {
-        let reachedParkBarrier = DispatchSemaphore(value: 0)
-        let releaseParkBarrier = DispatchSemaphore(value: 0)
-        let reachedHandoffBarrier = DispatchSemaphore(value: 0)
-        let releaseHandoffBarrier = DispatchSemaphore(value: 0)
+        let reachedParkBarrier = AsyncTestBarrier()
+        let releaseParkBarrier = AsyncTestBarrier()
+        let reachedHandoffBarrier = AsyncTestBarrier()
+        let releaseHandoffBarrier = AsyncTestBarrier()
         let mailbox = VisualizerFrameMailbox(
             capacityBytes: 64,
             beforePark: {
-                reachedParkBarrier.signal()
-                _ = releaseParkBarrier.wait(timeout: .now() + 1)
+                await reachedParkBarrier.signalReached()
+                await releaseParkBarrier.waitUntilReleased()
             },
             beforePostHandoffCheck: {
-                reachedHandoffBarrier.signal()
-                _ = releaseHandoffBarrier.wait(timeout: .now() + 1)
+                await reachedHandoffBarrier.signalReached()
+                await releaseHandoffBarrier.waitUntilReleased()
             }
         )
         let first = try VisualizerFrameSubscription(acquiring: mailbox)
@@ -151,22 +151,24 @@ struct VisualizerFrameDeliveryTests {
         }
         defer {
             first.cancel()
-            releaseParkBarrier.signal()
-            releaseHandoffBarrier.signal()
+            Task {
+                await releaseParkBarrier.release()
+                await releaseHandoffBarrier.release()
+            }
             mailbox.finish()
         }
-        try #require(await waitForSemaphore(reachedParkBarrier))
-        releaseParkBarrier.signal()
+        try #require(await reachedParkBarrier.waitUntilReached())
+        await releaseParkBarrier.release()
         mailbox.offer(frame(type: .peak, byte: 21, at: .max), now: PresentationInstant(rawMicroseconds: 0))
-        try #require(await waitForSemaphore(reachedHandoffBarrier))
+        try #require(await reachedHandoffBarrier.waitUntilReached())
         first.cancel()
-        releaseHandoffBarrier.signal()
+        await releaseHandoffBarrier.release()
         let observation = await observeTask(
             pending,
             timeout: .seconds(1),
             onTimeout: {
                 mailbox.finish()
-                releaseHandoffBarrier.signal()
+                await releaseHandoffBarrier.release()
             }
         )
         guard case let .completed(value) = observation else {
@@ -174,25 +176,25 @@ struct VisualizerFrameDeliveryTests {
             return
         }
         #expect(value == nil)
-        releaseHandoffBarrier.signal()
+        await releaseHandoffBarrier.release()
         mailbox.finish()
     }
 
     @Test("task cancellation after handoff drops the old frame")
     func taskCancellationAfterHandoff() async throws {
-        let reachedParkBarrier = DispatchSemaphore(value: 0)
-        let releaseParkBarrier = DispatchSemaphore(value: 0)
-        let reachedHandoffBarrier = DispatchSemaphore(value: 0)
-        let releaseHandoffBarrier = DispatchSemaphore(value: 0)
+        let reachedParkBarrier = AsyncTestBarrier()
+        let releaseParkBarrier = AsyncTestBarrier()
+        let reachedHandoffBarrier = AsyncTestBarrier()
+        let releaseHandoffBarrier = AsyncTestBarrier()
         let mailbox = VisualizerFrameMailbox(
             capacityBytes: 64,
             beforePark: {
-                reachedParkBarrier.signal()
-                _ = releaseParkBarrier.wait(timeout: .now() + 1)
+                await reachedParkBarrier.signalReached()
+                await releaseParkBarrier.waitUntilReleased()
             },
             beforePostHandoffCheck: {
-                reachedHandoffBarrier.signal()
-                _ = releaseHandoffBarrier.wait(timeout: .now() + 1)
+                await reachedHandoffBarrier.signalReached()
+                await releaseHandoffBarrier.waitUntilReleased()
             }
         )
         let subscription = try VisualizerFrameSubscription(acquiring: mailbox)
@@ -202,23 +204,25 @@ struct VisualizerFrameDeliveryTests {
         }
         defer {
             pending.cancel()
-            releaseParkBarrier.signal()
-            releaseHandoffBarrier.signal()
+            Task {
+                await releaseParkBarrier.release()
+                await releaseHandoffBarrier.release()
+            }
             mailbox.finish()
         }
-        try #require(await waitForSemaphore(reachedParkBarrier))
-        releaseParkBarrier.signal()
+        try #require(await reachedParkBarrier.waitUntilReached())
+        await releaseParkBarrier.release()
         mailbox.offer(frame(type: .peak, byte: 25, at: .max), now: PresentationInstant(rawMicroseconds: 0))
 
-        try #require(await waitForSemaphore(reachedHandoffBarrier))
+        try #require(await reachedHandoffBarrier.waitUntilReached())
         pending.cancel()
-        releaseHandoffBarrier.signal()
+        await releaseHandoffBarrier.release()
         let observation = await observeTask(
             pending,
             timeout: .seconds(1),
             onTimeout: {
                 mailbox.finish()
-                releaseHandoffBarrier.signal()
+                await releaseHandoffBarrier.release()
             }
         )
         guard case let .completed(value) = observation else {
@@ -228,21 +232,21 @@ struct VisualizerFrameDeliveryTests {
         #expect(value == nil)
         subscription.cancel()
 
-        releaseHandoffBarrier.signal()
+        await releaseHandoffBarrier.release()
         mailbox.finish()
     }
 
     @Test("copied iterators share one parked read and preserve the original")
     func copiedIteratorsShareOneInFlightRead() async throws {
         let clock = MailboxTestClock()
-        let reachedPark = DispatchSemaphore(value: 0)
-        let releasePark = DispatchSemaphore(value: 0)
+        let reachedPark = AsyncTestBarrier()
+        let releasePark = AsyncTestBarrier()
         let mailbox = VisualizerFrameMailbox(
             capacityBytes: 64,
             now: { clock.now },
             beforePark: {
-                reachedPark.signal()
-                _ = releasePark.wait(timeout: .now() + 1)
+                await reachedPark.signalReached()
+                await releasePark.waitUntilReleased()
             }
         )
         let subscription = try VisualizerFrameSubscription(acquiring: mailbox)
@@ -253,16 +257,16 @@ struct VisualizerFrameDeliveryTests {
             return await iterator.next()
         }
 
-        try #require(await waitForSemaphore(reachedPark))
+        try #require(await reachedPark.waitUntilReached())
         defer {
             pending.cancel()
-            releasePark.signal()
+            Task { await releasePark.release() }
             mailbox.finish()
         }
         let parkedReadCount = clock.readCountSnapshot
         #expect(await copy.next() == nil)
         #expect(clock.readCountSnapshot == parkedReadCount)
-        releasePark.signal()
+        await releasePark.release()
 
         let value = frame(type: .peak, byte: 23, at: .max)
         mailbox.offer(value, now: PresentationInstant(rawMicroseconds: 0))
@@ -271,7 +275,7 @@ struct VisualizerFrameDeliveryTests {
             timeout: .seconds(1),
             onTimeout: {
                 mailbox.finish()
-                releasePark.signal()
+                await releasePark.release()
             }
         )
         guard case let .completed(result) = observation else {
@@ -322,42 +326,44 @@ struct VisualizerFrameDeliveryTests {
     func invalidationAfterWakeDropsFrame() async throws {
         let validity = VisualizerFrameValidity()
         let clock = MailboxTestClock()
-        let reachedParkBarrier = DispatchSemaphore(value: 0)
-        let releaseParkBarrier = DispatchSemaphore(value: 0)
-        let reachedHandoffBarrier = DispatchSemaphore(value: 0)
-        let releaseHandoffBarrier = DispatchSemaphore(value: 0)
+        let reachedParkBarrier = AsyncTestBarrier()
+        let releaseParkBarrier = AsyncTestBarrier()
+        let reachedHandoffBarrier = AsyncTestBarrier()
+        let releaseHandoffBarrier = AsyncTestBarrier()
         let mailbox = VisualizerFrameMailbox(
             capacityBytes: 64,
             now: { clock.now },
             beforePark: {
-                reachedParkBarrier.signal()
-                _ = releaseParkBarrier.wait(timeout: .now() + 1)
+                await reachedParkBarrier.signalReached()
+                await releaseParkBarrier.waitUntilReleased()
             },
             beforePostHandoffCheck: {
-                reachedHandoffBarrier.signal()
-                _ = releaseHandoffBarrier.wait(timeout: .now() + 1)
+                await reachedHandoffBarrier.signalReached()
+                await releaseHandoffBarrier.waitUntilReleased()
             }
         )
         let subscription = try VisualizerFrameSubscription(acquiring: mailbox)
         let pending = Task { var iterator = subscription.makeAsyncIterator(); return await iterator.next() }
         defer {
-            releaseParkBarrier.signal()
-            releaseHandoffBarrier.signal()
+            Task {
+                await releaseParkBarrier.release()
+                await releaseHandoffBarrier.release()
+            }
             mailbox.finish()
         }
-        try #require(await waitForSemaphore(reachedParkBarrier))
-        releaseParkBarrier.signal()
+        try #require(await reachedParkBarrier.waitUntilReached())
+        await releaseParkBarrier.release()
         mailbox.offer(frame(type: .beat, byte: 4, at: .max, validity: validity), now: PresentationInstant(rawMicroseconds: 0))
-        try #require(await waitForSemaphore(reachedHandoffBarrier))
+        try #require(await reachedHandoffBarrier.waitUntilReached())
         validity.invalidate()
-        releaseHandoffBarrier.signal()
+        await releaseHandoffBarrier.release()
         mailbox.finish()
         let observation = await observeTask(
             pending,
             timeout: .seconds(1),
             onTimeout: {
                 mailbox.finish()
-                releaseHandoffBarrier.signal()
+                await releaseHandoffBarrier.release()
             }
         )
         guard case let .completed(value) = observation else {
@@ -521,10 +527,37 @@ private func makeConnectionDataDelivery(mailbox: VisualizerFrameMailbox) -> Conn
     )
 }
 
-private func waitForSemaphore(_ semaphore: DispatchSemaphore) async -> Bool {
-    await withCheckedContinuation { continuation in
-        DispatchQueue.global().async {
-            continuation.resume(returning: semaphore.wait(timeout: .now() + 1) == .success)
+private actor AsyncTestBarrier {
+    private var reached = false
+    private var released = false
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func signalReached() {
+        reached = true
+    }
+
+    func waitUntilReached(timeout: Duration = .seconds(2)) async -> Bool {
+        await waitUntil(timeout: timeout) { await self.isReached }
+    }
+
+    private var isReached: Bool {
+        reached
+    }
+
+    func release() {
+        guard !released else { return }
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    func waitUntilReleased() async {
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
         }
     }
 }
