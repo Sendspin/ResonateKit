@@ -51,7 +51,7 @@ extension SendspinConnection {
                 let abort = try JSONDecoder().decode(PairAbortMessage.self, from: data)
                 clearPairingAttempt(reason: abort.payload.reason)
 
-            case "client/pair-pending", "client/pair-init", "client/pair-auth", "client/pair-confirm":
+            case "client/pair-pending", "client/pair-init", "client/pair-auth", "client/pair-retry", "client/pair-confirm":
                 throw PairingProtocolError.invalidSequence
 
             case "server/time":
@@ -92,6 +92,7 @@ extension SendspinConnection {
                 || msgType == "client/pair-pending"
                 || msgType == "client/pair-init"
                 || msgType == "client/pair-auth"
+                || msgType == "client/pair-retry"
                 || msgType == "client/pair-confirm"
                 || msgType == "pair/abort"
                 || (msgType == ServerHelloMessage.typeString && awaitingRehandshakeActivation) {
@@ -259,7 +260,12 @@ extension SendspinConnection {
     /// The live message loop starts after setup, so pairing must be initialized here
     /// rather than waiting for another server/activate frame.
     func applyInitialPairingActivation(_ pairing: PairingDirective) async {
-        guard activities == [.pairing], pairingAttemptActive == false else { return }
+        guard activities == [.pairing] else { return }
+        if pairingAttemptID == nil {
+            admitPairingAttempt()
+        } else {
+            enqueuePairingSnapshot(phase: .pending)
+        }
         pairingAttemptActive = true
         pairingActivateCounter = pairingActivateCounter == .max ? 0 : pairingActivateCounter + 1
         switch pairing.method {
@@ -275,6 +281,9 @@ extension SendspinConnection {
     }
 
     func handleServerActivate(_ message: ServerActivateMessage) async {
+        if Set(message.payload.activities) == [.pairing], pairingAttemptID == nil {
+            admitPairingAttempt()
+        }
         let advertisement = await livePairingAdvertisement()
         sessionContext = ActivationAdmissibility.SessionContext(
             category: sessionContext.category,
@@ -304,6 +313,20 @@ extension SendspinConnection {
             session: sessionContext
         ) {
         case .admit:
+            if activities == [.pairing], nextActivities != [.pairing], let activationGate {
+                let verdict = await activationGate.request(
+                    activities: nextActivities,
+                    activeRoles: nextRoles
+                )
+                guard case .admit = verdict else {
+                    if case let .reject(reason) = verdict {
+                        try? await sendWrapped(ClientGoodbyeMessage(payload: GoodbyePayload(reason: reason)))
+                    }
+                    disconnectReason = .explicit(.concurrentAttempt)
+                    await transport.disconnect()
+                    return
+                }
+            }
             activities = nextActivities
             pairingAttemptActive = nextActivities == [.pairing]
             let completedRehandshake = awaitingRehandshakeActivation
@@ -322,8 +345,7 @@ extension SendspinConnection {
                 if !activeRoles.contains(.visualizerV1) {
                     visualizerStreamActive = false
                     visualizerStreamConfiguration = nil
-                    visualizerFrameValidity.invalidate()
-                    visualizerFrameValidity = VisualizerFrameValidity()
+                    resetVisualizerDelivery(resetTimestampFloor: true)
                 }
             }
             try? await publishClientState(bypassRehandshakeGate: completedRehandshake)
@@ -339,7 +361,7 @@ extension SendspinConnection {
                 await beginStaticPairingAttempt(format: message.payload.pairing?.format)
             } else if pairingAttemptActive || pendingPairingPsk != nil || dynamicPairingAttempt != nil || staticPairingAttempt != nil {
                 if dynamicPairingAttempt != nil {
-                    controlSink.enqueue(.pairingCodeChanged(nil))
+                    enqueuePairingCode(nil)
                 }
                 clearPairingAttempt()
             }
@@ -362,29 +384,61 @@ extension SendspinConnection {
         }
     }
 
+    func admitPairingAttempt() {
+        guard pairingAttemptID == nil else { return }
+        pairingAbortAuthorization = nil
+        pairingAttemptID = PairingAttemptID()
+        pairingAttemptPeer = PairingPeer(id: currentServerId ?? "", name: serverName)
+        enqueuePairingSnapshot(phase: .pending)
+    }
+
+    func enqueuePairingSnapshot(phase: PairingAttemptPhase, code: PairingCodeEmission? = nil) {
+        guard let id = pairingAttemptID, let peer = pairingAttemptPeer else { return }
+        let snapshot = PairingAttemptSnapshot(id: id, peer: peer, phase: phase, code: code)
+        switch phase {
+        case .ended:
+            controlSink.enqueue(.pairingAttemptEnded(snapshot))
+        case .succeeded:
+            controlSink.enqueue(.paired(snapshot))
+        default:
+            controlSink.enqueue(.pairingCodeChanged(snapshot))
+        }
+    }
+
+    func enqueuePairingCode(_ emission: PairingCodeEmission?) {
+        enqueuePairingSnapshot(phase: emission == nil ? .authenticating : .codeReady, code: emission)
+    }
+
     func beginPairingAttempt() async {
+        guard pairingAttemptID != nil else { return }
         guard pskCategory == .pairing,
               pendingPairingPsk == nil,
               dynamicPairingAttempt == nil,
               staticPairingAttempt == nil
         else {
-            if pskCategory != .pairing {
-                try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .methodNotSupported)))
+            if pskCategory != .pairing, let attemptID = pairingAttemptID {
+                try? await sendPairingWrapped(
+                    PairAbortMessage(payload: PairAbortPayload(reason: .methodNotSupported)),
+                    attemptID: attemptID
+                )
             }
             return
         }
+        guard let authorizedAttemptID = pairingAttemptID else { return }
         let generated = await selectPairingLongTermPsk()
-        guard pairingAttemptActive else { return }
+        guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
         pendingPairingPsk = generated
         pairingAttemptTask?.cancel()
+        let attemptID = pairingAttemptID
         pairingAttemptTask = Task { [weak self] in
             try? await Task.sleep(for: self?.pairingAttemptTimeout ?? .seconds(120))
             guard !Task.isCancelled else { return }
-            await self?.pairingAttemptTimedOut()
+            await self?.pairingAttemptTimedOut(attemptID: attemptID)
         }
-        try? await sendWrapped(ClientPairFinalizeMessage(
-            payload: ClientPairFinalizePayload(longTermPsk: generated.base64URL)
-        ))
+        try? await sendPairingWrapped(
+            ClientPairFinalizeMessage(payload: ClientPairFinalizePayload(longTermPsk: generated.base64URL)),
+            attemptID: authorizedAttemptID
+        )
     }
 
     /// The long-term PSK offered in `client/pair-finalize`. Normally freshly
@@ -413,17 +467,22 @@ extension SendspinConnection {
     }
 
     func beginDynamicPairingAttempt(format: String?) async {
+        guard pairingAttemptID != nil else { return }
         guard pskCategory == .sentinel,
               let rawFormat = format,
-              let selectedFormat = PairingCodeFormat(rawValue: rawFormat),
-              await dynamicPairingCodeIsOffered(format: selectedFormat)
+              let selectedFormat = PairingCodeFormat(rawValue: rawFormat)
         else {
-            clearPairingAttempt(reason: .methodNotSupported)
-            try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .methodNotSupported)))
+            guard let attemptID = pairingAttemptID else { return }
+            await abortPairingAttempt(reason: .methodNotSupported, attemptID: attemptID)
             return
         }
+        guard let authorizedAttemptID = pairingAttemptID else { return }
+        guard await dynamicPairingCodeIsOffered(format: selectedFormat), pairingAttemptID == authorizedAttemptID else { return }
         guard dynamicPairingAttempt == nil, staticPairingAttempt == nil, pendingPairingPsk == nil else {
-            try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .concurrentAttempt)))
+            try? await sendPairingWrapped(
+                PairAbortMessage(payload: PairAbortPayload(reason: .concurrentAttempt)),
+                attemptID: authorizedAttemptID
+            )
             await transport.disconnect()
             return
         }
@@ -440,8 +499,8 @@ extension SendspinConnection {
         #else
             let pairingHandshakeHash = channel.handshakeHash
         #endif
-        let sid = CPaceSessionIdentifier.make(handshakeHash: pairingHandshakeHash, counter: pairingActivateCounter)
         let advertisement = await livePairingAdvertisement()
+        guard pairingAttemptID == authorizedAttemptID else { return }
         let dynamicDescriptor = advertisement.supportedPairMethods[PairMethod.dynamicPairingCode]
         let digitAudioDescriptor = selectedFormat == .digits && dynamicDescriptor?.outChannels?.contains("speaker") == true
             ? dynamicDescriptor?.digitAudio
@@ -449,26 +508,49 @@ extension SendspinConnection {
         dynamicPairingAttempt = DynamicPairingAttempt(
             format: selectedFormat,
             pairingIndex: pairingActivateCounter,
-            sid: sid,
             nonceB: nonceB,
             commitB: commitB,
             digitAudioDescriptor: digitAudioDescriptor,
             digitAudioValidator: digitAudioDescriptor.map { DigitAudioPackValidator(descriptor: $0) },
             nonceA: nil,
+            prs: nil,
+            round: 0,
+            sid: nil,
             pairInitSent: false,
             serverShare: nil,
             cpace: nil,
             secrets: nil,
             clientConfirmationSent: false
         )
-        let count = await pairingStore?.dynamicPairingFailureCount() ?? 0
-        let escalated = count >= dynamicPairingFailureEscalationThreshold
-        if escalated, !pairingWindowOpen {
-            try? await sendWrapped(ClientPairPendingMessage(
-                payload: ClientPairPendingPayload(pairingIndex: pairingActivateCounter)
-            ))
-        } else {
-            await sendDynamicPairInit()
+        guard let pairingStore else {
+            Log.client.error("Dynamic pairing requires a durable pairing store")
+            clearPairingAttempt()
+            disconnectReason = .connectionLost(nil)
+            await transport.disconnect()
+            return
+        }
+        do {
+            let reservation = try await pairingStore.reserveDynamicPairingRound(limit: dynamicPairingRoundLimit)
+            guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
+            guard var reservedAttempt = dynamicPairingAttempt else { return }
+            switch reservation {
+            case let .reserved(round, _):
+                reservedAttempt.round = round
+                dynamicPairingAttempt = reservedAttempt
+                await sendDynamicPairInit(attemptID: authorizedAttemptID)
+            case .exhausted:
+                // Before the first pair-init, budget exhaustion keeps the attempt pending.
+                try? await sendPairingWrapped(
+                    ClientPairPendingMessage(payload: ClientPairPendingPayload(pairingIndex: pairingActivateCounter)),
+                    attemptID: authorizedAttemptID
+                )
+            }
+        } catch {
+            Log.client.error("Dynamic pairing budget reservation failed: \(error.localizedDescription)")
+            guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
+            clearPairingAttempt()
+            disconnectReason = .connectionLost(nil)
+            await transport.disconnect()
         }
     }
 
@@ -478,24 +560,30 @@ extension SendspinConnection {
     }
 
     func beginStaticPairingAttempt(format: String?) async {
+        guard pairingAttemptID != nil else { return }
         guard pskCategory == .sentinel, format == nil,
               let runtime = pairingConfigurationRuntime
         else {
-            clearPairingAttempt(reason: .methodNotSupported)
-            try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .methodNotSupported)))
+            guard let attemptID = pairingAttemptID else { return }
+            await abortPairingAttempt(reason: .methodNotSupported, attemptID: attemptID)
             return
         }
+        guard let authorizedAttemptID = pairingAttemptID else { return }
         let configuration = await runtime.snapshot()
+        guard pairingAttemptID == authorizedAttemptID else { return }
         guard configuration.staticPairingCodeIsAdvertised,
               let code = configuration.staticPairingCode,
               PairingManagementConfiguration.isValidStaticPairingCode(code)
         else {
-            clearPairingAttempt(reason: .methodNotSupported)
-            try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .methodNotSupported)))
+            guard let attemptID = pairingAttemptID else { return }
+            await abortPairingAttempt(reason: .methodNotSupported, attemptID: attemptID)
             return
         }
         guard dynamicPairingAttempt == nil, staticPairingAttempt == nil, pendingPairingPsk == nil else {
-            try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .concurrentAttempt)))
+            try? await sendPairingWrapped(
+                PairAbortMessage(payload: PairAbortPayload(reason: .concurrentAttempt)),
+                attemptID: authorizedAttemptID
+            )
             await transport.disconnect()
             return
         }
@@ -504,7 +592,7 @@ extension SendspinConnection {
         #else
             let pairingHandshakeHash = channel.handshakeHash
         #endif
-        let sid = CPaceSessionIdentifier.make(handshakeHash: pairingHandshakeHash, counter: pairingActivateCounter)
+        let sid = CPaceSessionIdentifier.make(handshakeHash: pairingHandshakeHash, counter: pairingActivateCounter, round: 1)
         staticPairingAttempt = StaticPairingAttempt(
             pairingIndex: pairingActivateCounter,
             sid: sid,
@@ -517,63 +605,127 @@ extension SendspinConnection {
         if pairingWindowOpen {
             await sendStaticPairInit()
         } else {
-            try? await sendWrapped(ClientPairPendingMessage(
-                payload: ClientPairPendingPayload(pairingIndex: pairingActivateCounter)
-            ))
+            guard let attemptID = pairingAttemptID else { return }
+            try? await sendPairingWrapped(
+                ClientPairPendingMessage(payload: ClientPairPendingPayload(pairingIndex: pairingActivateCounter)),
+                attemptID: attemptID
+            )
         }
     }
 
-    func sendDynamicPairInit() async {
-        guard var attempt = dynamicPairingAttempt else { return }
-        pairingWindowOpen = false
-        pairingWindowTask?.cancel()
-        pairingWindowTask = nil
-        pairingAttemptTask?.cancel()
-        pairingAttemptTask = Task { [weak self] in
-            try? await Task.sleep(for: self?.pairingAttemptTimeout ?? .seconds(120))
-            guard !Task.isCancelled else { return }
-            await self?.pairingAttemptTimedOut()
+    func sendDynamicPairInit(attemptID: PairingAttemptID? = nil) async {
+        guard let authorizedAttemptID = attemptID ?? pairingAttemptID,
+              pairingAttemptID == authorizedAttemptID,
+              var attempt = dynamicPairingAttempt,
+              attempt.round > 0
+        else { return }
+        closePairingWindow(for: authorizedAttemptID)
+        if pairingAttemptTask == nil {
+            pairingAttemptTask = Task { [weak self] in
+                try? await Task.sleep(for: self?.pairingAttemptTimeout ?? .seconds(120))
+                guard !Task.isCancelled else { return }
+                await self?.pairingAttemptTimedOut(attemptID: authorizedAttemptID)
+            }
         }
-        attempt.nonceA = nil
+        attempt.pairInitSent = false
+        attempt.serverShare = nil
+        attempt.cpace = nil
+        attempt.secrets = nil
+        attempt.clientConfirmationSent = false
         dynamicPairingAttempt = attempt
         do {
-            try await sendWrapped(ClientPairInitMessage(payload: ClientPairInitPayload(
+            try await sendPairingWrapped(ClientPairInitMessage(payload: ClientPairInitPayload(
                 pairingIndex: attempt.pairingIndex,
                 commitB: Base64URL.encode(attempt.commitB)
-            )))
+            )), attemptID: authorizedAttemptID)
+            guard pairingAttemptID == authorizedAttemptID else { return }
             attempt.pairInitSent = true
             dynamicPairingAttempt = attempt
         } catch {
+            guard pairingAttemptID == authorizedAttemptID else { return }
             clearPairingAttempt()
         }
     }
 
-    func openPairingWindow() async {
-        guard !pairingWindowOpen else { return }
+    func openPairingWindow(attemptID: PairingAttemptID) async throws {
+        // The identity is reserved at admission, before the server chooses a
+        // pairing method. Allow the operator to authorize that reserved attempt
+        // before the activation arrives; method setup consumes the window later.
+        guard pairingAttemptID == attemptID else {
+            throw SendspinClientError.stalePairingAttempt(attemptID)
+        }
+        pairingAttemptActive = true
+        let authorizedAttemptID = attemptID
+        // Only dynamic pairing consumes the shared round budget. Static-code
+        // approval is scoped to this attempt and does not reset that budget.
+        if var dynamicAttempt = dynamicPairingAttempt, dynamicAttempt.round == 0 {
+            guard let pairingStore else {
+                await failPairingStorage(for: authorizedAttemptID)
+                throw PairingRecordStoreError.storageExhausted
+            }
+            do {
+                try await pairingStore.resetDynamicPairingBudget()
+                guard pairingAttemptID == authorizedAttemptID else {
+                    throw SendspinClientError.stalePairingAttempt(authorizedAttemptID)
+                }
+                let reservation = try await pairingStore.reserveDynamicPairingRound(limit: dynamicPairingRoundLimit)
+                guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else {
+                    throw SendspinClientError.stalePairingAttempt(authorizedAttemptID)
+                }
+                guard case let .reserved(round, _) = reservation else {
+                    clearPairingAttempt(reason: .pairingCodeMismatch)
+                    pairingAbortAuthorization = authorizedAttemptID
+                    try? await sendPairingWrapped(
+                        PairAbortMessage(payload: PairAbortPayload(reason: .pairingCodeMismatch)),
+                        attemptID: authorizedAttemptID,
+                        allowClearedAbort: true
+                    )
+                    throw PairingRecordStoreError.storageExhausted
+                }
+                dynamicAttempt.round = round
+                dynamicPairingAttempt = dynamicAttempt
+            } catch let error as SendspinClientError {
+                throw error
+            } catch {
+                Log.client.error("Dynamic pairing budget reservation failed: \(error.localizedDescription)")
+                await failPairingStorage(for: authorizedAttemptID)
+                throw error
+            }
+        }
+        guard !pairingWindowOpen, pairingAttemptID == authorizedAttemptID, pairingAttemptActive else {
+            throw SendspinClientError.stalePairingAttempt(authorizedAttemptID)
+        }
         pairingWindowOpen = true
+        pairingWindowAttemptID = authorizedAttemptID
+        let expiresAt = PresentationInstant.now.adding(pairingWindowLifetime)
+        pairingWindowExpiresAt = expiresAt
+        controlSink.enqueue(.pairingWindowChanged(PairingWindowSnapshot(
+            attemptID: authorizedAttemptID,
+            expiresAt: expiresAt
+        )))
         pairingWindowTask?.cancel()
         pairingWindowTask = Task { [weak self] in
             try? await Task.sleep(for: self?.pairingWindowLifetime ?? .seconds(300))
             guard !Task.isCancelled else { return }
-            await self?.closePairingWindow()
+            await self?.expirePairingWindow(for: authorizedAttemptID)
         }
         if dynamicPairingAttempt != nil {
-            await sendDynamicPairInit()
+            await sendDynamicPairInit(attemptID: authorizedAttemptID)
         } else if staticPairingAttempt != nil {
-            await sendStaticPairInit()
+            await sendStaticPairInit(attemptID: authorizedAttemptID)
         }
     }
 
-    func sendStaticPairInit() async {
-        guard var attempt = staticPairingAttempt, attempt.cpace == nil else { return }
-        pairingWindowOpen = false
-        pairingWindowTask?.cancel()
-        pairingWindowTask = nil
+    func sendStaticPairInit(attemptID: PairingAttemptID? = nil) async {
+        guard attemptID == nil || pairingAttemptID == attemptID,
+              var attempt = staticPairingAttempt, attempt.cpace == nil else { return }
+        closePairingWindow(for: attemptID)
         pairingAttemptTask?.cancel()
+        let attemptID = pairingAttemptID
         pairingAttemptTask = Task { [weak self] in
             try? await Task.sleep(for: self?.pairingAttemptTimeout ?? .seconds(120))
             guard !Task.isCancelled else { return }
-            await self?.pairingAttemptTimedOut()
+            await self?.pairingAttemptTimedOut(attemptID: attemptID)
         }
         attempt.cpace = try? CPace(
             role: .responder,
@@ -586,24 +738,52 @@ extension SendspinConnection {
             return
         }
         staticPairingAttempt = attempt
-        try? await sendWrapped(ClientPairInitMessage(
-            payload: ClientPairInitPayload(pairingIndex: attempt.pairingIndex, commitB: nil)
-        ))
+        guard let attemptID = pairingAttemptID else { return }
+        try? await sendPairingWrapped(
+            ClientPairInitMessage(payload: ClientPairInitPayload(pairingIndex: attempt.pairingIndex, commitB: nil)),
+            attemptID: attemptID
+        )
     }
 
-    func closePairingWindow() {
+    /// Close or consume the one-attempt authorization window. The snapshot's
+    /// lifetime is the public authorization state, so clearing it emits exactly
+    /// one nil event even if a close races expiry or finalization.
+    func closePairingWindow(for attemptID: PairingAttemptID? = nil, cancelTask: Bool = true) {
+        guard attemptID == nil || pairingWindowAttemptID == attemptID else { return }
+        let hadPublicWindow = pairingWindowExpiresAt != nil
         pairingWindowOpen = false
-        pairingWindowTask?.cancel()
+        pairingWindowAttemptID = nil
+        pairingWindowExpiresAt = nil
+        if cancelTask {
+            pairingWindowTask?.cancel()
+        }
         pairingWindowTask = nil
+        if hadPublicWindow {
+            controlSink.enqueue(.pairingWindowChanged(nil))
+        }
     }
 
-    func cancelPairingAttempt() async {
-        guard dynamicPairingAttempt != nil || staticPairingAttempt != nil || pendingPairingPsk != nil else {
+    /// Expiry runs in the window task itself, so it must clear the state without
+    /// cancelling that currently executing task.
+    func expirePairingWindow(for attemptID: PairingAttemptID) {
+        guard pairingWindowAttemptID == attemptID, pairingWindowExpiresAt != nil else { return }
+        closePairingWindow(for: attemptID, cancelTask: false)
+    }
+
+    func cancelPairing(attemptID: PairingAttemptID) async throws {
+        guard pairingAttemptID == attemptID else { throw SendspinClientError.stalePairingAttempt(attemptID) }
+        guard dynamicPairingAttempt != nil || staticPairingAttempt != nil || pendingPairingPsk != nil || pairingAttemptActive else {
             closePairingWindow()
-            return
+            throw SendspinClientError.stalePairingAttempt(attemptID)
         }
         clearPairingAttempt(reason: .userCancelled)
-        try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .userCancelled)))
+        guard pairingAttemptID == nil else { return }
+        pairingAbortAuthorization = attemptID
+        try? await sendPairingWrapped(
+            PairAbortMessage(payload: PairAbortPayload(reason: .userCancelled)),
+            attemptID: attemptID,
+            allowClearedAbort: true
+        )
     }
 
     func handleDigitAudioClip(_ message: BinaryMessage) throws {
@@ -621,51 +801,87 @@ extension SendspinConnection {
     }
 
     func handleServerPairInit(_ message: ServerPairInitMessage) async throws {
-        // A server message left over after an ended attempt is discarded silently.
         guard dynamicPairingAttempt != nil || staticPairingAttempt != nil else { return }
-        guard var attempt = dynamicPairingAttempt, attempt.pairInitSent, attempt.nonceA == nil,
-              let nonceA = Base64URL.decode(message.payload.nonceA, count: 32)
+        guard var attempt = dynamicPairingAttempt, attempt.pairInitSent,
+              attempt.cpace == nil, attempt.serverShare == nil
         else { throw PairingProtocolError.invalidSequence }
-        let digitAudioPack: DigitAudioPack? = if let validator = attempt.digitAudioValidator {
-            try validator.finish()
-        } else {
-            nil
+        guard attempt.round > 0 else {
+            // The first round is reserved when the attempt is authorized. A pending
+            // attempt cannot receive server/pair-init until a reset authorizes it.
+            return
         }
-        attempt.nonceA = nonceA
-        var input = Data("sendspin-pairing-code-derive-v1".utf8)
-        #if DEBUG
-            input.append(pairingHandshakeHashOverride ?? channel.handshakeHash)
-        #else
-            input.append(channel.handshakeHash)
-        #endif
-        input.append(nonceA); input.append(attempt.nonceB)
-        let digest = Data(SHA256.hash(data: input))
-        let prs: Data
-        let emission: PairingCodeEmission
-        switch attempt.format {
-        case .digits:
-            var value: UInt64 = 0
-            for byte in digest {
-                value = (value * 256 + UInt64(byte)) % 1_000_000
+        if attempt.prs == nil {
+            guard let encodedNonceA = message.payload.nonceA,
+                  let nonceA = Base64URL.decode(encodedNonceA, count: 32)
+            else { throw PairingProtocolError.invalidSequence }
+            let digitAudioPack: DigitAudioPack? = if let validator = attempt.digitAudioValidator {
+                try validator.finish()
+            } else {
+                nil
             }
-            prs = Data(String(format: "%06llu", value).utf8)
-            emission = PairingCodeEmission(
-                format: .digits,
-                payload: String(data: prs, encoding: .utf8)!,
-                digitAudioPack: digitAudioPack
-            )
-        case .qrCode:
-            prs = digest.prefix(24)
-            emission = PairingCodeEmission(format: .qrCode, payload: PairingToken.dynamicCodeToken(Data(prs)))
+            attempt.nonceA = nonceA
+            var input = Data("sendspin-pairing-code-derive-v1".utf8)
+            #if DEBUG
+                input.append(pairingHandshakeHashOverride ?? channel.handshakeHash)
+            #else
+                input.append(channel.handshakeHash)
+            #endif
+            input.append(nonceA); input.append(attempt.nonceB)
+            let digest = Data(SHA256.hash(data: input))
+            let prs: Data
+            let emission: PairingCodeEmission
+            switch attempt.format {
+            case .digits:
+                var value: UInt64 = 0
+                for byte in digest {
+                    value = (value * 256 + UInt64(byte)) % 1_000_000
+                }
+                prs = Data(String(format: "%06llu", value).utf8)
+                emission = PairingCodeEmission(
+                    format: .digits,
+                    payload: String(data: prs, encoding: .utf8)!,
+                    digitAudioPack: digitAudioPack
+                )
+            case .qrCode:
+                prs = digest.prefix(24)
+                emission = PairingCodeEmission(format: .qrCode, payload: PairingToken.dynamicCodeToken(Data(prs)))
+            }
+            attempt.prs = prs
+            attempt.emission = emission
+            enqueuePairingCode(emission)
+        } else {
+            guard message.payload.nonceA == nil, let prs = attempt.prs else {
+                throw PairingProtocolError.invalidSequence
+            }
+            if let emission = attempt.emission {
+                enqueuePairingCode(emission)
+            }
+            attempt.clientConfirmationSent = false
+            attempt.serverShare = nil
+            attempt.secrets = nil
+            attempt.sid = nil
+            attempt.cpace = nil
+            _ = prs
         }
+        guard let prs = attempt.prs else { throw PairingProtocolError.invalidSequence }
+        #if DEBUG
+            let pairingHandshakeHash = pairingHandshakeHashOverride ?? channel.handshakeHash
+        #else
+            let pairingHandshakeHash = channel.handshakeHash
+        #endif
+        let sid = CPaceSessionIdentifier.make(
+            handshakeHash: pairingHandshakeHash,
+            counter: attempt.pairingIndex,
+            round: attempt.round
+        )
+        attempt.sid = sid
         attempt.cpace = try CPace(
             role: .responder,
             prs: prs,
-            sid: attempt.sid,
+            sid: sid,
             scalarOverride: pairingScalarBOverride
         )
         dynamicPairingAttempt = attempt
-        controlSink.enqueue(.pairingCodeChanged(emission))
     }
 
     func handleServerPairAuth(_ message: ServerPairAuthMessage) async throws {
@@ -676,7 +892,11 @@ extension SendspinConnection {
             attempt.serverShare = share
             attempt.secrets = try cpace.derive(remoteShare: share)
             dynamicPairingAttempt = attempt
-            try await sendWrapped(ClientPairAuthMessage(payload: ClientPairAuthPayload(pakeMsg2: Base64URL.encode(cpace.publicShare))))
+            guard let attemptID = pairingAttemptID else { return }
+            try await sendPairingWrapped(
+                ClientPairAuthMessage(payload: ClientPairAuthPayload(pakeMsg2: Base64URL.encode(cpace.publicShare))),
+                attemptID: attemptID
+            )
             return
         }
         guard var attempt = staticPairingAttempt, attempt.serverShare == nil,
@@ -686,7 +906,11 @@ extension SendspinConnection {
         attempt.serverShare = share
         attempt.secrets = try cpace.derive(remoteShare: share)
         staticPairingAttempt = attempt
-        try await sendWrapped(ClientPairAuthMessage(payload: ClientPairAuthPayload(pakeMsg2: Base64URL.encode(cpace.publicShare))))
+        guard let attemptID = pairingAttemptID else { return }
+        try await sendPairingWrapped(
+            ClientPairAuthMessage(payload: ClientPairAuthPayload(pakeMsg2: Base64URL.encode(cpace.publicShare))),
+            attemptID: attemptID
+        )
     }
 
     func handleServerPairConfirm(_ message: ServerPairConfirmMessage) async throws {
@@ -710,11 +934,13 @@ extension SendspinConnection {
             tag,
             CPaceX25519.mcfTag(isk: secrets.isk, sid: attempt.sid, share: serverShare, associatedData: CPaceX25519.defaultInitiatorAD)
         ) else {
-            clearPairingAttempt(reason: .pairingCodeMismatch)
-            try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .pairingCodeMismatch)))
+            guard let attemptID = pairingAttemptID else { return }
+            await abortPairingAttempt(reason: .pairingCodeMismatch, attemptID: attemptID)
             return
         }
+        guard let authorizedAttemptID = pairingAttemptID else { return }
         let generated = await selectPairingLongTermPsk()
+        guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
         pendingPairingPsk = generated
         attempt.clientConfirmationSent = true
         staticPairingAttempt = attempt
@@ -724,12 +950,12 @@ extension SendspinConnection {
             share: cpace.publicShare,
             associatedData: CPaceX25519.defaultResponderAD
         )
-        try await sendWrapped(ClientPairConfirmMessage(
+        try await sendPairingWrapped(ClientPairConfirmMessage(
             payload: ClientPairConfirmPayload(
                 clientKc: Base64URL.encode(clientTag),
                 wrappedNonceB: nil
             )
-        ))
+        ), attemptID: authorizedAttemptID)
         let wrappedPsk = try PairingWrap.wrap(
             plaintext: generated.bytes,
             label: Data("sendspin-pair-psk-wrap-v1".utf8),
@@ -737,63 +963,111 @@ extension SendspinConnection {
             isk: secrets.isk,
             suite: suite
         )
-        try await sendWrapped(ClientPairFinalizeMessage(
+        try await sendPairingWrapped(ClientPairFinalizeMessage(
             payload: ClientPairFinalizePayload(wrappedPsk: Base64URL.encode(wrappedPsk))
-        ))
+        ), attemptID: authorizedAttemptID)
     }
 
     private func handleDynamicServerPairConfirm(_ message: ServerPairConfirmMessage) async throws {
+        guard let authorizedAttemptID = pairingAttemptID else { return }
         guard var attempt = dynamicPairingAttempt,
               !attempt.clientConfirmationSent,
+              let sid = attempt.sid,
               let cpace = attempt.cpace,
               let secrets = attempt.secrets,
               let serverShare = attempt.serverShare,
               let tag = Base64URL.decode(message.payload.serverKc, count: 64)
         else { throw PairingProtocolError.invalidSequence }
-        let expected = CPaceX25519.mcfTag(isk: secrets.isk, sid: attempt.sid, share: serverShare, associatedData: CPaceX25519.defaultInitiatorAD)
+        let expected = CPaceX25519.mcfTag(isk: secrets.isk, sid: sid, share: serverShare, associatedData: CPaceX25519.defaultInitiatorAD)
         guard CPaceX25519.constantTimeEqual(tag, expected) else {
-            _ = await pairingStore?.incrementDynamicPairingFailureCount()
-            clearPairingAttempt(reason: .pairingCodeMismatch)
-            try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .pairingCodeMismatch)))
+            if attempt.round < dynamicPairingRoundLimit {
+                attempt.serverShare = nil
+                attempt.cpace = nil
+                attempt.secrets = nil
+                attempt.sid = nil
+                dynamicPairingAttempt = attempt
+                guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
+                guard let pairingStore else {
+                    await failPairingStorage(for: authorizedAttemptID)
+                    return
+                }
+                let reservation: DynamicPairingRoundReservation
+                do {
+                    reservation = try await pairingStore.reserveDynamicPairingRound(limit: dynamicPairingRoundLimit)
+                } catch {
+                    Log.client.error("Dynamic pairing budget reservation failed: \(error.localizedDescription)")
+                    await failPairingStorage(for: authorizedAttemptID)
+                    return
+                }
+                guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
+                guard case let .reserved(round, _) = reservation else {
+                    await abortPairingAttempt(reason: .pairingCodeMismatch, attemptID: authorizedAttemptID)
+                    return
+                }
+                attempt.round = round
+                dynamicPairingAttempt = attempt
+                guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
+                try? await sendPairingWrapped(
+                    ClientPairRetryMessage(payload: ClientPairRetryPayload()),
+                    attemptID: authorizedAttemptID
+                )
+                guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
+                await sendDynamicPairInit(attemptID: authorizedAttemptID)
+            } else {
+                guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
+                await abortPairingAttempt(reason: .pairingCodeMismatch, attemptID: authorizedAttemptID)
+            }
             return
         }
-        await pairingStore?.resetDynamicPairingFailureCount()
+        do {
+            try await pairingStore?.resetDynamicPairingBudget()
+        } catch {
+            Log.client.error("Dynamic pairing budget reset failed: \(error.localizedDescription)")
+            guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
+            clearPairingAttempt()
+            disconnectReason = .connectionLost(nil)
+            await transport.disconnect()
+            return
+        }
+        guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
         let clientTag = CPaceX25519.mcfTag(
             isk: secrets.isk,
-            sid: attempt.sid,
+            sid: sid,
             share: cpace.publicShare,
             associatedData: CPaceX25519.defaultResponderAD
         )
         let wrappedNonce = try PairingWrap.wrap(
             plaintext: attempt.nonceB,
             label: Data("sendspin-pair-nonce-wrap-v1".utf8),
-            sid: attempt.sid,
+            sid: sid,
             isk: secrets.isk,
             suite: suite
         )
         let generated = await selectPairingLongTermPsk()
+        guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
         pendingPairingPsk = generated
         attempt.clientConfirmationSent = true
         dynamicPairingAttempt = attempt
-        try await sendWrapped(ClientPairConfirmMessage(
+        try await sendPairingWrapped(ClientPairConfirmMessage(
             payload: ClientPairConfirmPayload(
                 clientKc: Base64URL.encode(clientTag),
                 wrappedNonceB: Base64URL.encode(wrappedNonce)
             )
-        ))
+        ), attemptID: authorizedAttemptID)
         let wrappedPsk = try PairingWrap.wrap(
             plaintext: generated.bytes,
             label: Data("sendspin-pair-psk-wrap-v1".utf8),
-            sid: attempt.sid,
+            sid: sid,
             isk: secrets.isk,
             suite: suite
         )
-        try await sendWrapped(ClientPairFinalizeMessage(
+        try await sendPairingWrapped(ClientPairFinalizeMessage(
             payload: ClientPairFinalizePayload(wrappedPsk: Base64URL.encode(wrappedPsk))
-        ))
+        ), attemptID: authorizedAttemptID)
     }
 
-    func pairingAttemptTimedOut() async {
+    func pairingAttemptTimedOut(attemptID: PairingAttemptID?) async {
+        guard let attemptID, pairingAttemptID == attemptID else { return }
         // A stale wake (its handle was cancelled and replaced by a newer attempt
         // or teardown) must not detach the newer handle or abort the fresh attempt.
         guard !Task.isCancelled else { return }
@@ -801,11 +1075,36 @@ extension SendspinConnection {
         // Detach this task's handle before clear: clearPairingAttempt cancels the
         // owned task, which would self-cancel the abort send below.
         pairingAttemptTask = nil
-        clearPairingAttempt(reason: .attemptTimeout)
-        try? await sendWrapped(PairAbortMessage(payload: PairAbortPayload(reason: .attemptTimeout)))
+        await abortPairingAttempt(reason: .attemptTimeout, attemptID: attemptID)
+    }
+
+    private func failPairingStorage(for attemptID: PairingAttemptID) async {
+        guard pairingAttemptID == attemptID else { return }
+        clearPairingAttempt()
+        disconnectReason = .connectionLost(nil)
+        await transport.disconnect()
+    }
+
+    private func abortPairingAttempt(reason: PairAbortReason, attemptID: PairingAttemptID) async {
+        guard pairingAttemptID == attemptID else { return }
+        pairingAbortAuthorization = attemptID
+        clearPairingAttempt(reason: reason)
+        try? await sendPairingWrapped(
+            PairAbortMessage(payload: PairAbortPayload(reason: reason)),
+            attemptID: attemptID,
+            allowClearedAbort: true
+        )
     }
 
     func clearPairingAttempt(reason: PairAbortReason? = nil) {
+        if let reason, let id = pairingAttemptID, let peer = pairingAttemptPeer {
+            controlSink.enqueue(.pairingAttemptEnded(PairingAttemptSnapshot(
+                id: id, peer: peer, phase: .ended(reason), code: nil
+            )))
+        }
+        if pairingAttemptID != nil {
+            enqueuePairingCode(nil)
+        }
         pairingAttemptActive = false
         pendingPairingPsk = nil
         dynamicPairingAttempt = nil
@@ -813,30 +1112,40 @@ extension SendspinConnection {
         pairingAttemptTask?.cancel()
         pairingAttemptTask = nil
         closePairingWindow()
-        if let reason {
-            controlSink.enqueue(.pairingAttemptEnded(reason))
-            controlSink.enqueue(.pairingCodeChanged(nil))
-        }
+        pairingAttemptID = nil
+        pairingAttemptPeer = nil
     }
 
     func handleServerPairFinalize(_: ServerPairFinalizeMessage) async {
         guard let generated = pendingPairingPsk, let pairingStore else { return }
-        let hadCodeAttempt = dynamicPairingAttempt != nil || staticPairingAttempt != nil
-        if hadCodeAttempt {
-            controlSink.enqueue(.pairingCodeChanged(nil))
+        let authorizedAttemptID = pairingAttemptID
+        let successSnapshot: PairingAttemptSnapshot? = if let id = pairingAttemptID, let peer = pairingAttemptPeer {
+            PairingAttemptSnapshot(id: id, peer: peer, phase: .succeeded, code: nil)
+        } else {
+            nil
         }
-        clearPairingAttempt()
         let records = await pairingStore.listRecords()
+        guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
         if records.contains(where: { $0.pskId == generated.pskId }) {
             await pairingStore.markUsed(pskId: generated.pskId)
-            controlSink.enqueue(.paired(serverId: currentServerId ?? ""))
+            guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
+            clearPairingAttempt()
+            if let successSnapshot {
+                controlSink.enqueue(.paired(successSnapshot))
+            }
             return
         }
         do {
             try await pairingStore.insert(PairingRecord(psk: generated, serverId: currentServerId))
-            controlSink.enqueue(.paired(serverId: currentServerId ?? ""))
+            guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
+            clearPairingAttempt()
+            if let successSnapshot {
+                controlSink.enqueue(.paired(successSnapshot))
+            }
         } catch {
+            guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
             Log.client.error("Pairing record persistence failed: \(error.localizedDescription)")
+            clearPairingAttempt()
             disconnectReason = .connectionLost(nil)
             await transport.disconnect()
         }
@@ -1045,11 +1354,12 @@ extension SendspinConnection {
                 Log.client.warning("Discarding invalid visualizer stream configuration")
                 visualizerStreamActive = false
                 visualizerStreamConfiguration = nil
-                visualizerFrameValidity.invalidate()
-                visualizerFrameValidity = VisualizerFrameValidity()
+                resetVisualizerDelivery(resetTimestampFloor: true)
             } else {
-                visualizerFrameValidity.invalidate()
-                visualizerFrameValidity = VisualizerFrameValidity()
+                let startsNewStream = !visualizerStreamActive
+                if startsNewStream {
+                    resetVisualizerDelivery(resetTimestampFloor: true)
+                }
                 visualizerStreamConfiguration = VisualizerStreamConfiguration(
                     types: visualizerInfo.types,
                     rateMax: visualizerInfo.rateMax,
@@ -1164,8 +1474,7 @@ extension SendspinConnection {
             audioEngine.commands.enqueue(.streamClear(roles: roles))
         }
         if roles == nil || roles?.contains("visualizer") == true {
-            visualizerFrameValidity.invalidate()
-            visualizerFrameValidity = VisualizerFrameValidity()
+            resetVisualizerDelivery(resetTimestampFloor: true)
         }
         // stream/clear invalidates queued visualizer frames without ending the negotiated stream.
 
@@ -1191,8 +1500,7 @@ extension SendspinConnection {
         if endedRoles == nil || endedRoles?.contains("visualizer") == true {
             visualizerStreamActive = false
             visualizerStreamConfiguration = nil
-            visualizerFrameValidity.invalidate()
-            visualizerFrameValidity = VisualizerFrameValidity()
+            resetVisualizerDelivery(resetTimestampFloor: true)
         }
 
         // Per spec, entering external_source causes the server to end active streams.
@@ -1282,7 +1590,11 @@ extension SendspinConnection {
                 serverTimestamp: message.timestamp,
                 sendAhead: message.sendAhead
             )
-            validity.yieldIfValid(chunk, to: audioSink)
+            if let dataDelivery {
+                dataDelivery.yieldAudioIfValid(chunk, validity: validity)
+            } else {
+                validity.yieldIfValid(chunk, to: audioSink)
+            }
         }
 
         // Only enqueue to engine if clock is synced. Tag the frame at ingress so a format
@@ -1354,8 +1666,12 @@ extension SendspinConnection {
             artworkPending[result.channel] = nil
             artworkScheduleTasks[result.channel]?.cancel()
             artworkScheduleTasks[result.channel] = nil
-            artworkObserver?(artwork)
-            validity.yieldIfValid(artwork, to: artworkSink)
+            if let dataDelivery {
+                dataDelivery.yieldArtworkIfValid(artwork, validity: validity)
+            } else {
+                artworkObserver?(artwork)
+                validity.yieldIfValid(artwork, to: artworkSink)
+            }
         } else {
             artworkPending[result.channel] = ScheduledArtwork(artwork: artwork, localDisplayTime: localTime)
             artworkScheduleTasks[result.channel]?.cancel()
@@ -1373,8 +1689,12 @@ extension SendspinConnection {
         guard let pending = artworkPending[channel], pending.localDisplayTime <= scheduleNow() else { return }
         artworkPending[channel] = nil
         artworkScheduleTasks[channel] = nil
-        artworkObserver?(pending.artwork)
-        validity.yieldIfValid(pending.artwork, to: artworkSink)
+        if let dataDelivery {
+            dataDelivery.yieldArtworkIfValid(pending.artwork, validity: validity)
+        } else {
+            artworkObserver?(pending.artwork)
+            validity.yieldIfValid(pending.artwork, to: artworkSink)
+        }
     }
 
     private func recordArrivalDelay(message: BinaryMessage, arrival: Int64) async {
@@ -1461,12 +1781,37 @@ extension SendspinConnection {
             Log.client.warning("Discarding stale visualizer binary")
             return
         }
-        let visualizerData = VisualizerData(
+        if let floor = visualizerTimestampFloor, localDisplayTime < floor {
+            Log.client.warning("Discarding out-of-order visualizer binary")
+            return
+        }
+        visualizerTimestampFloor = localDisplayTime
+        let visualizerData = VisualizerFrame(
             type: type,
             data: message.data,
-            localDisplayTime: localDisplayTime,
+            presentationTime: PresentationInstant(rawMicroseconds: localDisplayTime),
+            configuration: configuration,
             validity: visualizerFrameValidity
         )
-        validity.yieldIfValid(visualizerData, to: visualizerSink)
+        if let dataDelivery {
+            dataDelivery.offerVisualizerIfValid(visualizerData, validity: validity)
+        } else if let visualizerDelivery {
+            validity.offerIfValid(visualizerData, to: visualizerDelivery)
+        } else {
+            validity.yieldIfValid(visualizerData, to: visualizerSink)
+        }
+    }
+
+    private func resetVisualizerDelivery(resetTimestampFloor: Bool) {
+        visualizerFrameValidity.invalidate()
+        visualizerFrameValidity = VisualizerFrameValidity()
+        if let dataDelivery {
+            dataDelivery.clearVisualizer()
+        } else {
+            visualizerDelivery?.clear()
+        }
+        if resetTimestampFloor {
+            visualizerTimestampFloor = nil
+        }
     }
 }

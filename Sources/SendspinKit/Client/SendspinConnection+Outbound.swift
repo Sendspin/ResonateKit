@@ -35,21 +35,40 @@ extension SendspinConnection {
         await transport.disconnect()
     }
 
-    func sendWrapped(_ message: some Codable & Sendable, bypassRehandshakeGate: Bool = false) async throws {
+    func sendWrapped(
+        _ message: some Codable & Sendable,
+        bypassRehandshakeGate: Bool = false,
+        requireRunningLifecycle: Bool = false,
+        expectedPairingAttemptID: PairingAttemptID? = nil,
+        allowClearedPairingAbort: Bool = false
+    ) async throws {
         await acquireOutboundSlot()
         defer { releaseOutboundSlot() }
 
         guard !outboundFailed else {
             throw SendspinClientError.sendFailed("outbound channel is dead")
         }
-        // Gate check comes after acquisition: a sender that parked during the
-        // exchange must not encrypt under pre-swap keys.
+        if let expectedPairingAttemptID {
+            let currentAuthorized = pairingAttemptID == expectedPairingAttemptID
+            let abortAuthorized = allowClearedPairingAbort && pairingAbortAuthorization == expectedPairingAttemptID
+            guard currentAuthorized || abortAuthorized else {
+                throw SendspinClientError.stalePairingAttempt(expectedPairingAttemptID)
+            }
+            if abortAuthorized, !currentAuthorized {
+                pairingAbortAuthorization = nil
+            }
+        }
+        // Gate checks come after acquisition: a sender parked during an exchange
+        // or shutdown must not proceed under stale keys or a closing session.
         guard bypassRehandshakeGate || !rehandshakeInProgress else {
             throw SendspinClientError.handshakeIncomplete
         }
-        guard lifecycle == .running || lifecycle == .shuttingDown else {
-            // `.shuttingDown` permits the intentional goodbye; everything else
-            // on a stopped connection is rejected.
+        let lifecycleAllowsSend = requireRunningLifecycle
+            ? lifecycle == .running
+            : lifecycle == .running || lifecycle == .shuttingDown
+        guard lifecycleAllowsSend else {
+            // `.shuttingDown` permits the intentional goodbye; leave opts out so
+            // a queued leave cannot follow that goodbye onto a closing transport.
             throw SendspinClientError.notConnected
         }
         if Task.isCancelled {
@@ -70,6 +89,18 @@ extension SendspinConnection {
             await failOutbound()
             throw error
         }
+    }
+
+    func sendPairingWrapped(
+        _ message: some Codable & Sendable,
+        attemptID: PairingAttemptID,
+        allowClearedAbort: Bool = false
+    ) async throws {
+        try await sendWrapped(
+            message,
+            expectedPairingAttemptID: attemptID,
+            allowClearedPairingAbort: allowClearedAbort
+        )
     }
 
     // MARK: - Facade-initiated sends

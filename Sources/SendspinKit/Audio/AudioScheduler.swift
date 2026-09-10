@@ -16,8 +16,9 @@ struct SchedulerStats: Equatable {
 /// via `generation` for seamless format transitions.
 struct ScheduledChunk {
     let pcmData: Data
-    /// Local absolute time in microseconds (from MonotonicClock) when this chunk should play
-    let playTimeMicroseconds: Int64
+    /// Local absolute time in microseconds (from MonotonicClock) when this chunk should play.
+    /// Output delay is already included; `originalTimestamp` remains in server time.
+    var playTimeMicroseconds: Int64
     let originalTimestamp: Int64
     /// Stream generation — incremented on format changes so the output loop
     /// can distinguish old-format from new-format chunks.
@@ -182,6 +183,18 @@ actor AudioScheduler {
     func finish() {
         stop()
         chunkContinuation.finish()
+    }
+
+    /// Shift all queued local play times when the local output delay changes.
+    /// Wire timestamps stay unchanged; a uniform shift preserves queue order. Chunks already
+    /// yielded through `scheduledChunks` are immutable and are corrected by the render path.
+    func rebaseOutputDelay(from oldDelayUs: Int64, to newDelayUs: Int64) {
+        let shift = oldDelayUs.subtractingReportingOverflow(newDelayUs)
+        let delta = shift.overflow ? (oldDelayUs >= newDelayUs ? Int64.max : Int64.min) : shift.partialValue
+        guard delta != 0 else { return }
+        for index in readIndex ..< queue.count {
+            queue[index].playTimeMicroseconds = queue[index].playTimeMicroseconds.saturatingAdding(delta)
+        }
     }
 
     /// Clear all queued chunks. Values already yielded by AsyncStream are rejected by the

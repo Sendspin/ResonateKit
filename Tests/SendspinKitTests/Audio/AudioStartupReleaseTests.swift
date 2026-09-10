@@ -443,7 +443,8 @@ struct AudioStartupReleaseTests {
 
     @Test("chunks arriving during PCM priming are scheduled after the startup commit")
     func chunksDuringPCMPrimingAreDeferredUntilAfterCommit() async throws {
-        let clock = StubClock(anchorToNow: true)
+        let startupNow = MonotonicClock.absoluteMicroseconds()
+        let clock = StubClock(anchorToNow: true, absoluteAnchorMicroseconds: startupNow)
         let output = SpyAudioOutput()
         let scheduler = AudioScheduler(clockSync: clock)
         let engine = AudioEngine(
@@ -451,20 +452,33 @@ struct AudioStartupReleaseTests {
             scheduler: scheduler,
             clock: clock,
             enableStartupBuffering: true,
-            startupMinBufferMs: 200
+            startupMinBufferMs: 200,
+            startupNow: { startupNow }
         )
         let format = try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 48_000, bitDepth: 16)
-        let firstTimestamp: Int64 = 1_000_000
-        let deferredTimestamp: Int64 = 1_100_000
+        let firstTimestamp: Int64 = 0
+        let deferredTimestamp: Int64 = 300_000
         await engine.start()
         await engine.commands.enqueue(.streamStart(format, codecHeader: nil))
         await output.blockNextPCM()
+        defer {
+            // Release the non-cancellable spy continuation before fallback shutdown, even when
+            // an expectation fails while the startup coordinator is parked in PCM priming.
+            Task {
+                await output.releaseBlockedPCM()
+                await engine.shutdown()
+            }
+        }
         await engine.commands.enqueue(.chunk(Data(repeating: 0x01, count: 100), ts: firstTimestamp))
         #expect(await waitUntil { await output.playedPCMTimestamps.contains(firstTimestamp) })
 
         await engine.commands.enqueue(.chunk(Data(repeating: 0x02, count: 100), ts: deferredTimestamp))
         #expect(await waitUntil { await engine.appliedCommandKinds().count(where: { $0 == .chunk }) == 2 })
         #expect(await !output.recordedCalls.contains("startPrepared()"))
+        #expect(
+            await scheduler.stats.received == 0,
+            "the deferred chunk must not reach the scheduler before startup commit"
+        )
         await output.releaseBlockedPCM()
 
         #expect(await waitUntil(timeout: .seconds(3)) { await output.recordedCalls.contains("startPrepared()") })

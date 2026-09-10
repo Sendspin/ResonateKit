@@ -61,11 +61,13 @@ private struct DynamicTestSession {
     let events: AsyncStream<ClientEvent>
     let pairingHandshakeHashOverride: Data?
     let deterministic: Bool
+    let hasPrimary: Bool
 }
 
 @MainActor
 private func makeDynamicTestSession(
     store: (any PairingRecordStore)? = nil,
+    primary: Bool = false,
     attemptTimeout: Duration = .seconds(120),
     windowLifetime: Duration = .seconds(300),
     nonceBOverride: Data? = nil,
@@ -77,7 +79,13 @@ private func makeDynamicTestSession(
     let client = try SendspinClient(
         identity: .generate(),
         name: "Dynamic Pairing Test Client",
-        roles: [],
+        roles: primary ? [.playerV1, .controllerV1] : [],
+        playerConfig: primary ? PlayerConfiguration(
+            bufferCapacity: 65_536,
+            supportedFormats: [AudioFormatSpec(codec: .pcm, channels: 1, sampleRate: 8_000, bitDepth: 16)],
+            volumeMode: .none,
+            emitRawAudioEvents: true
+        ) : nil,
         pairing: PairingConfiguration(
             pairingPsk: pairingPsk,
             store: resolvedStore,
@@ -95,16 +103,41 @@ private func makeDynamicTestSession(
     let server = MockNoiseServer(transport: transport, psk: .sentinel)
     let events = client.events()
     async let accepted: Void = client.acceptConnection(transport)
-    try await server.establishSession(activities: [], activeRoles: [])
+    try await server.establishSession(
+        activities: primary ? [.playback] : [],
+        activeRoles: primary ? [.playerV1, .controllerV1] : []
+    )
     try await accepted
     #expect(await waitUntil { await MainActor.run { client.connectionState == .connected } })
+    if primary {
+        let sideTransport = MockTransport()
+        let side = MockNoiseServer(transport: sideTransport, psk: .sentinel)
+        async let sideAccepted: Void = client.acceptConnection(sideTransport)
+        try await side.beginAdmission(name: "Dynamic Pairing Side")
+        for _ in 0 ..< dynamicPairingRoundLimit {
+            _ = try await resolvedStore.reserveDynamicPairingRound(limit: dynamicPairingRoundLimit)
+        }
+        try await activateDynamic(side)
+        try await sideAccepted
+        #expect(await waitUntil { await MainActor.run { client.pairingConnection != nil } })
+        return DynamicTestSession(
+            client: client,
+            server: side,
+            store: resolvedStore,
+            events: events,
+            pairingHandshakeHashOverride: pairingHandshakeHashOverride,
+            deterministic: nonceBOverride != nil && pairingHandshakeHashOverride != nil && pairingScalarBOverride != nil,
+            hasPrimary: true
+        )
+    }
     return DynamicTestSession(
         client: client,
         server: server,
         store: resolvedStore,
         events: events,
         pairingHandshakeHashOverride: pairingHandshakeHashOverride,
-        deterministic: nonceBOverride != nil && pairingHandshakeHashOverride != nil && pairingScalarBOverride != nil
+        deterministic: nonceBOverride != nil && pairingHandshakeHashOverride != nil && pairingScalarBOverride != nil,
+        hasPrimary: false
     )
 }
 
@@ -132,7 +165,7 @@ private func waitForClientMessage(
 
 private func endedEvent(_ stream: AsyncStream<ClientEvent>, reason: PairAbortReason) async -> ClientEvent? {
     await collectClientEvent(from: stream, timeout: .seconds(3)) {
-        if case .pairingAttemptEnded(reason) = $0 {
+        if case let .pairingAttemptEnded(snapshot) = $0, snapshot.phase == .ended(reason) {
             return true
         }
         return false
@@ -141,14 +174,14 @@ private func endedEvent(_ stream: AsyncStream<ClientEvent>, reason: PairAbortRea
 
 private extension ClientEvent {
     func unwrapEmission() throws -> PairingCodeEmission {
-        guard case let .pairingCodeChanged(value?) = self else { throw DynamicTestError.missingEvent }
+        guard case let .pairingCodeChanged(snapshot) = self, let value = snapshot.code else { throw DynamicTestError.missingEvent }
         return value
     }
 }
 
 private func codeEvent(_ stream: AsyncStream<ClientEvent>) async -> ClientEvent? {
     await collectClientEvent(from: stream, timeout: .seconds(3)) {
-        if case .pairingCodeChanged(.some) = $0 {
+        if case let .pairingCodeChanged(snapshot) = $0, snapshot.code != nil {
             return true
         }
         return false
@@ -167,11 +200,27 @@ private func pairingMessageTypes(_ server: MockNoiseServer) async -> [String] {
 private func dynamicServerTranscript(
     _ session: DynamicTestSession,
     format: PairingCodeFormat = .digits,
-    badServerConfirmation: Bool = false
+    badServerConfirmation: Bool = false,
+    operatorOpen: Bool = false
 ) async throws -> (PairingCodeEmission, [String]) {
     let fixture = try dynamicFixture()
-    try await activateDynamic(session.server, format: format)
-    let initData = try await waitForClientMessage(session.server, type: ClientPairInitMessage.typeString)
+    if operatorOpen, !session.hasPrimary {
+        for _ in 0 ..< dynamicPairingRoundLimit {
+            _ = try await session.store.reserveDynamicPairingRound(limit: dynamicPairingRoundLimit)
+        }
+    }
+    if !session.hasPrimary {
+        try await activateDynamic(session.server, format: format)
+    }
+    let initData: Data
+    if operatorOpen {
+        _ = try await waitForClientMessage(session.server, type: ClientPairPendingMessage.typeString)
+        let attemptID = try #require(await MainActor.run { session.client.currentPairing?.id })
+        try await session.client.openPairingWindow(for: attemptID)
+        initData = try await waitForClientMessage(session.server, type: ClientPairInitMessage.typeString)
+    } else {
+        initData = try await waitForClientMessage(session.server, type: ClientPairInitMessage.typeString)
+    }
     let initMessage = try JSONDecoder().decode(ClientPairInitMessage.self, from: initData)
     #expect(initMessage.payload.pairingIndex == fixture.counter)
     if session.pairingHandshakeHashOverride != nil {
@@ -188,11 +237,7 @@ private func dynamicServerTranscript(
         )), encoding: .utf8)!
     )
     let event = try #require(await eventTask.value)
-    let emission: PairingCodeEmission = if case let .pairingCodeChanged(value?) = event {
-        value
-    } else {
-        throw DynamicTestError.missingEvent
-    }
+    let emission = try event.unwrapEmission()
     let handshakeHash: Data = if let override = session.pairingHandshakeHashOverride {
         override
     } else {
@@ -200,7 +245,8 @@ private func dynamicServerTranscript(
     }
     let sid = CPaceSessionIdentifier.make(
         handshakeHash: handshakeHash,
-        counter: fixture.counter
+        counter: initMessage.payload.pairingIndex,
+        round: 1
     )
     let prs = emission.format == .digits ? Data(emission.payload.utf8) : try qrPayload(emission.payload)
     let cpace = try CPace(
@@ -257,6 +303,7 @@ private func qrPayload(_ token: String) throws -> Data {
     return Data(bytes.prefix(24))
 }
 
+@MainActor
 @Suite("Dynamic pairing transcripts", .timeLimit(.minutes(1)))
 struct DynamicPairingTranscriptTests {
     @Test("happy path uses fixture-exact code and persists only after acknowledgement")
@@ -267,8 +314,9 @@ struct DynamicPairingTranscriptTests {
             pairingHandshakeHashOverride: dataFromHex(fixture.handshakeHash),
             pairingScalarBOverride: dataFromHex(fixture.scalarB)
         )
-        let (emission, _) = try await dynamicServerTranscript(session)
+        let (emission, _) = try await dynamicServerTranscript(session, operatorOpen: true)
         #expect(emission.format == .digits)
+        #expect(session.client.pairingWindow == nil)
         #expect(emission.payload == fixture.digitsCode)
         #expect(emission.payload == "268386")
         let confirms = try await waitForClientMessage(session.server, type: ClientPairConfirmMessage.typeString)
@@ -306,7 +354,57 @@ struct DynamicPairingTranscriptTests {
         try await session.server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
         #expect(await waitUntil { await session.store.listRecords().filter { $0.serverId != nil }.count == 1 })
         #expect(await session.store.listRecords().filter { $0.serverId != nil }.count == 1)
-        #expect(await collectClientEvent(from: session.events) { $0 == .pairingCodeChanged(nil) } != nil)
+        #expect(await collectClientEvent(from: session.events) {
+            if case let .pairingCodeChanged(snapshot) = $0 {
+                return snapshot.code == nil
+            }
+            return false
+        } != nil)
+        await session.client.disconnect()
+    }
+
+    @Test("parked dynamic pairing succeeds after operator authorization")
+    func parkedSideHappyPath() async throws {
+        let fixture = try dynamicFixture()
+        let session = try await makeDynamicTestSession(
+            primary: true,
+            nonceBOverride: dataFromHex(fixture.nonceB),
+            pairingHandshakeHashOverride: dataFromHex(fixture.handshakeHash),
+            pairingScalarBOverride: dataFromHex(fixture.scalarB)
+        )
+        let windowEventsTask = Task { () -> [ClientEvent] in
+            var events = [ClientEvent]()
+            for await event in session.client.events() {
+                if case .pairingWindowChanged = event {
+                    events.append(event)
+                    if events.count == 2 {
+                        return events
+                    }
+                }
+            }
+            return events
+        }
+        let (emission, _) = try await dynamicServerTranscript(session, operatorOpen: true)
+        #expect(emission.payload == fixture.digitsCode)
+        let finalize = try await waitForClientMessage(session.server, type: ClientPairFinalizeMessage.typeString)
+        #expect(finalize.isEmpty == false)
+        try await session.server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
+        let serverID = await session.server.serverId
+        #expect(await waitUntil { await session.store.listRecords().contains { $0.serverId == serverID } })
+        let windowEvents = await observeTask(windowEventsTask, timeout: .seconds(2))
+        guard case let .completed(events) = windowEvents else {
+            Issue.record("parked dynamic pairing window did not emit open then nil")
+            await session.client.disconnect()
+            return
+        }
+        #expect(events.count == 2)
+        guard case .pairingWindowChanged(.some) = events[0],
+              case .pairingWindowChanged(nil) = events[1] else {
+            Issue.record("parked dynamic pairing window did not emit open then nil")
+            await session.client.disconnect()
+            return
+        }
+        #expect(session.client.pairingWindow == nil)
         await session.client.disconnect()
     }
 
@@ -325,31 +423,81 @@ struct DynamicPairingTranscriptTests {
         await session.client.disconnect()
     }
 
-    @Test("binding mismatch aborts with pairing_code_mismatch and keeps the socket open")
+    @Test("binding mismatch retries with pairing_code_mismatch still available to a later round")
     func bindingMismatch() async throws {
         let session = try await makeDynamicTestSession()
         _ = try await dynamicServerTranscript(session, badServerConfirmation: true)
-        let abortData = try await waitForClientMessage(session.server, type: PairAbortMessage.typeString)
-        let abort = try JSONDecoder().decode(PairAbortMessage.self, from: abortData)
-        #expect(abort.payload.reason.rawValue == "pairing_code_mismatch")
+        _ = try await waitForClientMessage(session.server, type: ClientPairRetryMessage.typeString)
         #expect(await session.store.listRecords().allSatisfy { $0.serverId == nil })
-        #expect(await endedEvent(session.events, reason: .pairingCodeMismatch) != nil)
-        #expect(await collectClientEvent(from: session.events) { $0 == .pairingCodeChanged(nil) } != nil)
         #expect(await MainActor.run { session.client.connectionState == .connected })
+        #expect(await collectClientEvent(from: session.events, timeout: .milliseconds(100)) {
+            if case .pairingAttemptEnded = $0 {
+                return true
+            }
+            return false
+        } == nil)
+        #expect(await collectClientEvent(from: session.events, timeout: .milliseconds(100)) {
+            if case let .pairingCodeChanged(snapshot) = $0 {
+                return snapshot.code == nil
+            }
+            return false
+        } == nil)
         try await session.server.sendJSON(#"{"type":"server/state","payload":{}}"#)
         #expect(await MainActor.run { session.client.connectionState == .connected })
         await session.client.disconnect()
     }
 
-    @Test("invalid server confirmation increments once, clears code, and keeps connection open")
+    @Test("invalid server confirmation retries with a fresh round and can then succeed")
     func serverConfirmationFailure() async throws {
-        let session = try await makeDynamicTestSession()
-        _ = try await dynamicServerTranscript(session, badServerConfirmation: true)
-        _ = try await waitForClientMessage(session.server, type: PairAbortMessage.typeString)
-        #expect(await session.store.dynamicPairingFailureCount() == 1)
-        #expect(await endedEvent(session.events, reason: .pairingCodeMismatch) != nil)
-        #expect(await collectClientEvent(from: session.events) { $0 == .pairingCodeChanged(nil) } != nil)
-        #expect(await MainActor.run { session.client.connectionState == .connected })
+        let fixture = try dynamicFixture()
+        let session = try await makeDynamicTestSession(
+            nonceBOverride: dataFromHex(fixture.nonceB),
+            pairingHandshakeHashOverride: dataFromHex(fixture.handshakeHash)
+        )
+        let (emission, _) = try await dynamicServerTranscript(session, badServerConfirmation: true)
+        _ = try await waitForClientMessage(session.server, type: ClientPairRetryMessage.typeString)
+        #expect(try await session.store.dynamicPairingRoundCount() == 2)
+        #expect(emission.payload.count == 6)
+
+        let retryEventTask = Task { await codeEvent(session.events) }
+        try await session.server.sendJSON(#"{"type":"server/pair-init","payload":{}}"#)
+        let retryEmissionEvent = try #require(await retryEventTask.value)
+        let retryEmission = try retryEmissionEvent.unwrapEmission()
+        #expect(retryEmission.payload == emission.payload)
+        let roundTwoSID = CPaceSessionIdentifier.make(
+            handshakeHash: dataFromHex(fixture.handshakeHash),
+            counter: fixture.counter,
+            round: 2
+        )
+        let retryCPace = try CPace(
+            role: .initiator,
+            prs: Data(retryEmission.payload.utf8),
+            sid: roundTwoSID,
+            scalarOverride: dataFromHex(fixture.scalarA)
+        )
+        try await session.server.sendJSON(#require(String(data: JSONEncoder().encode(ServerPairAuthMessage(
+            payload: ServerPairAuthPayload(pakeMsg1: Base64URL.encode(retryCPace.publicShare))
+        )), encoding: .utf8)))
+        let retryAuth = try await JSONDecoder().decode(
+            ClientPairAuthMessage.self,
+            from: waitForClientMessage(session.server, type: ClientPairAuthMessage.typeString, count: 2)
+        )
+        let retryShare = try #require(Base64URL.decode(retryAuth.payload.pakeMsg2, count: 32))
+        let retrySecrets = try retryCPace.derive(remoteShare: retryShare)
+        let retryTag = CPaceX25519.mcfTag(
+            isk: retrySecrets.isk,
+            sid: roundTwoSID,
+            share: retryCPace.publicShare,
+            associatedData: CPaceX25519.defaultInitiatorAD
+        )
+        try await session.server.sendJSON(#require(String(data: JSONEncoder().encode(ServerPairConfirmMessage(
+            payload: ServerPairConfirmPayload(serverKc: Base64URL.encode(retryTag))
+        )), encoding: .utf8)))
+        _ = try await waitForClientMessage(session.server, type: ClientPairConfirmMessage.typeString, count: 1)
+        _ = try await waitForClientMessage(session.server, type: ClientPairFinalizeMessage.typeString, count: 1)
+        #expect(try await session.store.dynamicPairingRoundCount() == 0)
+        try await session.server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
+        #expect(await waitUntil { await session.store.listRecords().contains { $0.serverId != nil } })
         await session.client.disconnect()
     }
 
@@ -426,61 +574,39 @@ struct DynamicPairingTranscriptTests {
     }
 }
 
-@Suite("Dynamic pairing failure counter", .timeLimit(.minutes(1)))
+@MainActor
+@Suite("Dynamic pairing budget", .timeLimit(.minutes(1)))
 struct DynamicPairingFailureCounterTests {
-    @Test("one failure below the escalation threshold starts immediately")
-    func oneBelowEscalationThresholdStartsImmediately() async throws {
-        let store = InMemoryPairingRecordStore()
-        for _ in 0 ..< dynamicPairingFailureEscalationThreshold - 1 {
-            _ = await store.incrementDynamicPairingFailureCount()
-        }
-        let session = try await makeDynamicTestSession(store: store)
-        try await activateDynamic(session.server)
-        _ = try await waitForClientMessage(session.server, type: ClientPairInitMessage.typeString)
-        #expect(await session.server.clientJSONMessages(ofType: ClientPairPendingMessage.typeString).isEmpty)
-        try await session.client.cancelPairingAttempt()
-        await session.client.disconnect()
-    }
-
-    @Test("counter increments only for server confirmation failures and resets after success")
+    @Test("verified confirmation resets the dynamic budget")
     func counterSemantics() async throws {
         let store = InMemoryPairingRecordStore()
         let session = try await makeDynamicTestSession(store: store)
         _ = try await dynamicServerTranscript(session, badServerConfirmation: true)
-        _ = try await waitForClientMessage(session.server, type: PairAbortMessage.typeString)
-        #expect(await store.dynamicPairingFailureCount() == 1)
+        _ = try await waitForClientMessage(session.server, type: ClientPairRetryMessage.typeString)
+        #expect(try await store.dynamicPairingRoundCount() == 2)
         #expect(await MainActor.run { session.client.connectionState == .connected })
         await session.client.disconnect()
 
-        let success = try await makeDynamicTestSession(store: store)
+        let successStore = InMemoryPairingRecordStore()
+        let success = try await makeDynamicTestSession(store: successStore)
         _ = try await dynamicServerTranscript(success)
         _ = try await waitForClientMessage(success.server, type: ClientPairConfirmMessage.typeString)
         _ = try await waitForClientMessage(success.server, type: ClientPairFinalizeMessage.typeString)
-        #expect(await store.dynamicPairingFailureCount() == 0)
+        #expect(try await successStore.dynamicPairingRoundCount() == 0)
         await success.client.disconnect()
 
-        let escalatedStore = InMemoryPairingRecordStore()
-        for _ in 0 ..< dynamicPairingFailureEscalationThreshold {
-            _ = await escalatedStore.incrementDynamicPairingFailureCount()
-        }
-        let escalated = try await makeDynamicTestSession(store: escalatedStore)
-        try await activateDynamic(escalated.server)
-        _ = try await waitForClientMessage(escalated.server, type: ClientPairPendingMessage.typeString)
-        #expect(await escalated.server.clientJSONMessages(ofType: ClientPairInitMessage.typeString).isEmpty)
-        try await escalated.client.openPairingWindow()
-        _ = try await waitForClientMessage(escalated.server, type: ClientPairInitMessage.typeString)
-        try await escalated.client.cancelPairingAttempt()
-        await escalated.client.disconnect()
+        await session.client.disconnect()
     }
 }
 
+@MainActor
 @Suite("Pairing window", .timeLimit(.minutes(1)))
 struct PairingWindowTests {
-    @Test("escalated dynamic attempt waits for one open window and does not time out while pending")
-    func dynamicEscalation() async throws {
+    @Test("round-limit attempts wait for an operator window and do not start the timeout")
+    func roundLimitWaitsForWindow() async throws {
         let store = InMemoryPairingRecordStore()
-        for _ in 0 ..< dynamicPairingFailureEscalationThreshold {
-            _ = await store.incrementDynamicPairingFailureCount()
+        for _ in 0 ..< dynamicPairingRoundLimit {
+            _ = try await store.reserveDynamicPairingRound(limit: dynamicPairingRoundLimit)
         }
         let session = try await makeDynamicTestSession(store: store, attemptTimeout: .milliseconds(100))
         try await activateDynamic(session.server)
@@ -488,13 +614,179 @@ struct PairingWindowTests {
         #expect(await session.server.clientJSONMessages(ofType: ClientPairInitMessage.typeString).isEmpty)
         try await Task.sleep(for: .milliseconds(150))
         #expect(await session.server.clientJSONMessages(ofType: PairAbortMessage.typeString).isEmpty)
-        try await session.client.openPairingWindow()
+        let attemptID = try #require(await MainActor.run { session.client.currentPairing?.id })
+        try await session.client.openPairingWindow(for: attemptID)
         _ = try await waitForClientMessage(session.server, type: ClientPairInitMessage.typeString)
-        try await session.client.cancelPairingAttempt()
+        let refreshedAttemptID = try #require(await MainActor.run { session.client.currentPairing?.id })
+        try await session.client.cancelPairing(attemptID: refreshedAttemptID)
         await session.client.disconnect()
     }
 }
 
+@MainActor
+@Suite("Pairing final fences", .timeLimit(.minutes(1)))
+struct PairingFinalFenceTests {
+    @Test("reset failure publishes no authorization window or code and disconnects")
+    func resetFailureIsTerminalBeforeWindowPublication() async throws {
+        let store = FinalFenceStore(initialRounds: dynamicPairingRoundLimit, reset: .throws)
+        let session = try await makeDynamicTestSession(store: store)
+        try await activateDynamic(session.server)
+        _ = try await waitForClientMessage(session.server, type: ClientPairPendingMessage.typeString)
+        let attemptID = try #require(session.client.currentPairing?.id)
+
+        await #expect(throws: PairingRecordStoreError.storageExhausted) {
+            try await session.client.openPairingWindow(for: attemptID)
+        }
+        #expect(await waitUntil { await session.server.disconnectCalled })
+        #expect(session.client.pairingWindow == nil)
+        #expect(session.client.currentPairing?.code == nil)
+        #expect(await session.server.clientJSONMessages(ofType: ClientPairInitMessage.typeString).isEmpty)
+        await session.client.disconnect()
+    }
+
+    @Test("reserve failure publishes no authorization window or code and disconnects")
+    func reserveFailureIsTerminalBeforeWindowPublication() async throws {
+        let store = FinalFenceStore(initialRounds: dynamicPairingRoundLimit, reset: .succeeds, reserve: .throwsAfterReset)
+        let session = try await makeDynamicTestSession(store: store)
+        try await activateDynamic(session.server)
+        _ = try await waitForClientMessage(session.server, type: ClientPairPendingMessage.typeString)
+        let attemptID = try #require(session.client.currentPairing?.id)
+
+        await #expect(throws: PairingRecordStoreError.storageExhausted) {
+            try await session.client.openPairingWindow(for: attemptID)
+        }
+        #expect(await waitUntil { await session.server.disconnectCalled })
+        #expect(session.client.pairingWindow == nil)
+        #expect(session.client.currentPairing?.code == nil)
+        #expect(await session.server.clientJSONMessages(ofType: ClientPairInitMessage.typeString).isEmpty)
+        await session.client.disconnect()
+    }
+
+    @Test("cancellation while reset is blocked makes the public open stale")
+    func cancellationDuringResetCannotPublishWindow() async throws {
+        let store = FinalFenceStore(initialRounds: dynamicPairingRoundLimit, reset: .blocks)
+        let session = try await makeDynamicTestSession(store: store)
+        try await activateDynamic(session.server)
+        _ = try await waitForClientMessage(session.server, type: ClientPairPendingMessage.typeString)
+        let attemptID = try #require(session.client.currentPairing?.id)
+        let open = Task { () -> Result<Void, Error> in
+            do {
+                try await session.client.openPairingWindow(for: attemptID)
+                return .success(())
+            } catch { return .failure(error) }
+        }
+        #expect(await waitUntil { await store.resetStarted })
+
+        try await session.client.cancelPairing(attemptID: attemptID)
+        _ = try await waitForClientMessage(session.server, type: PairAbortMessage.typeString)
+        await store.releaseReset()
+        let result = await open.value
+        guard case let .failure(error) = result else {
+            Issue.record("opening a cancelled attempt must not report success")
+            await session.client.disconnect()
+            return
+        }
+        #expect(error as? SendspinClientError == .stalePairingAttempt(attemptID))
+        #expect(session.client.pairingWindow == nil)
+        #expect(await session.server.clientJSONMessages(ofType: ClientPairInitMessage.typeString).isEmpty)
+        #expect(await MainActor.run { session.client.connectionState == .connected })
+        await session.client.disconnect()
+    }
+
+    @Test("retry exhaustion sends a terminal abort and leaves no live attempt")
+    func retryExhaustionAbortsTerminally() async throws {
+        let store = InMemoryPairingRecordStore()
+        for _ in 0 ..< dynamicPairingRoundLimit - 1 {
+            _ = try await store.reserveDynamicPairingRound(limit: dynamicPairingRoundLimit)
+        }
+        let session = try await makeDynamicTestSession(store: store)
+        _ = try await dynamicServerTranscript(session, badServerConfirmation: true)
+
+        let abort = try await waitForClientMessage(session.server, type: PairAbortMessage.typeString)
+        #expect(try JSONDecoder().decode(PairAbortMessage.self, from: abort).payload.reason == .pairingCodeMismatch)
+        #expect(await endedEvent(session.events, reason: .pairingCodeMismatch) != nil)
+        #expect(await collectClientEvent(from: session.events, timeout: .milliseconds(100)) {
+            if case let .pairingCodeChanged(snapshot) = $0 {
+                return snapshot.code == nil
+            }
+            return false
+        } != nil)
+        #expect(await MainActor.run { session.client.connectionState == .connected })
+        await session.client.disconnect()
+    }
+}
+
+private enum FinalFenceReset: Sendable {
+    case succeeds
+    case `throws`
+    case blocks
+}
+
+private enum FinalFenceReserve: Sendable {
+    case succeeds
+    case throwsAfterReset
+}
+
+private actor FinalFenceStore: PairingRecordStore {
+    private var rounds: UInt32
+    private let resetMode: FinalFenceReset
+    private let reserveMode: FinalFenceReserve
+    private var resetContinuation: CheckedContinuation<Void, Never>?
+    private(set) var resetStarted = false
+
+    init(
+        initialRounds: UInt32 = 0,
+        reset: FinalFenceReset = .succeeds,
+        reserve: FinalFenceReserve = .succeeds
+    ) {
+        rounds = initialRounds
+        resetMode = reset
+        reserveMode = reserve
+    }
+
+    func listRecords() async -> [PairingRecord] {
+        []
+    }
+
+    func insert(_: PairingRecord) async throws {
+        throw PairingRecordStoreError.storageExhausted
+    }
+
+    func remove(pskId _: String) async {}
+    func markUsed(pskId _: String) async {}
+    func dynamicPairingRoundCount() async throws -> UInt32 {
+        rounds
+    }
+
+    func reserveDynamicPairingRound(limit: UInt32) async throws -> DynamicPairingRoundReservation {
+        if reserveMode == .throwsAfterReset, rounds == 0 {
+            throw PairingRecordStoreError.storageExhausted
+        }
+        guard rounds < limit else { return .exhausted }
+        rounds += 1
+        return .reserved(round: rounds, remaining: limit - rounds)
+    }
+
+    func resetDynamicPairingBudget() async throws {
+        switch resetMode {
+        case .succeeds:
+            rounds = 0
+        case .throws:
+            throw PairingRecordStoreError.storageExhausted
+        case .blocks:
+            resetStarted = true
+            await withCheckedContinuation { resetContinuation = $0 }
+            rounds = 0
+        }
+    }
+
+    func releaseReset() {
+        resetContinuation?.resume()
+        resetContinuation = nil
+    }
+}
+
+@MainActor
 @Suite("Dynamic pairing protocol errors", .timeLimit(.minutes(1)))
 struct DynamicPairingProtocolErrorTests {
     @Test("wrong nonce length silently closes without abort or persistence")
@@ -523,11 +815,12 @@ struct DynamicPairingProtocolErrorTests {
         try await session.server.sendJSON(#"{"type":"server/pair-auth","payload":{"pake_msg_1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#)
         #expect(await waitUntil { await session.server.disconnectCalled })
         #expect(await session.server.clientJSONMessages(ofType: PairAbortMessage.typeString).isEmpty)
-        #expect(await session.store.dynamicPairingFailureCount() == 0)
+        #expect(try await session.store.dynamicPairingRoundCount() == 1)
         await session.client.disconnect()
     }
 }
 
+@MainActor
 @Suite("Dynamic pairing timeout and admissibility", .timeLimit(.minutes(1)))
 struct DynamicPairingTimeoutTests {
     @Test("attempt timeout uses the exact attempt_timeout reason")
@@ -540,7 +833,12 @@ struct DynamicPairingTimeoutTests {
         let abort = try JSONDecoder().decode(PairAbortMessage.self, from: abortData)
         #expect(abort.payload.reason.rawValue == "attempt_timeout")
         #expect(await endedEvent(session.events, reason: .attemptTimeout) != nil)
-        #expect(await collectClientEvent(from: session.events) { $0 == .pairingCodeChanged(nil) } != nil)
+        #expect(await collectClientEvent(from: session.events) {
+            if case let .pairingCodeChanged(snapshot) = $0 {
+                return snapshot.code == nil
+            }
+            return false
+        } != nil)
         #expect(await session.store.listRecords().allSatisfy { $0.serverId == nil })
         await session.client.disconnect()
     }
@@ -559,7 +857,12 @@ struct DynamicPairingTimeoutTests {
         // The events stream is single-consumer and the connection enqueues the
         // ended reason before the code clear, so sequential reads are ordered.
         #expect(await endedEvent(session.events, reason: .userCancelled) != nil)
-        #expect(await collectClientEvent(from: session.events) { $0 == .pairingCodeChanged(nil) } != nil)
+        #expect(await collectClientEvent(from: session.events) {
+            if case let .pairingCodeChanged(snapshot) = $0 {
+                return snapshot.code == nil
+            }
+            return false
+        } != nil)
         await session.client.disconnect()
     }
 

@@ -602,6 +602,16 @@ private actor ThrowingPairingRecordStore: PairingRecordStore {
     func remove(pskId _: String) async {}
 
     func markUsed(pskId _: String) async {}
+
+    func dynamicPairingRoundCount() async throws -> UInt32 {
+        0
+    }
+
+    func reserveDynamicPairingRound(limit: UInt32) async throws -> DynamicPairingRoundReservation {
+        .reserved(round: 1, remaining: limit > 0 ? limit - 1 : 0)
+    }
+
+    func resetDynamicPairingBudget() async throws {}
 }
 
 /// A bounded store whose free space cannot fit a stored-pubkey record. The
@@ -609,6 +619,7 @@ private actor ThrowingPairingRecordStore: PairingRecordStore {
 /// path) so pairing must go through the record-mode fallback.
 private actor ExhaustedPairingRecordStore: PairingRecordStore {
     private(set) var records: [PairingRecord] = []
+    private var rounds: UInt32 = 0
     private let retainsPreProvisionedRecord: Bool
 
     init(retainsPreProvisionedRecord: Bool) {
@@ -639,5 +650,19 @@ private actor ExhaustedPairingRecordStore: PairingRecordStore {
 
     func storageAccounting() async -> PairingStorageAccounting? {
         PairingStorageAccounting(free: 0, capacity: 10, costIndividual: 1, costShared: 1)
+    }
+
+    func dynamicPairingRoundCount() async throws -> UInt32 {
+        rounds
+    }
+
+    func reserveDynamicPairingRound(limit: UInt32) async throws -> DynamicPairingRoundReservation {
+        guard rounds < limit else { return .exhausted }
+        rounds += 1
+        return .reserved(round: rounds, remaining: limit - rounds)
+    }
+
+    func resetDynamicPairingBudget() async throws {
+        rounds = 0
     }
 }

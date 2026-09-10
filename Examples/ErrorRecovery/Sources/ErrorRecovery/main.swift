@@ -84,7 +84,8 @@ private func isRetryableError(_ error: any Error) -> Bool {
             // move. `notConnected` and `handshakeIncomplete` are likewise fine
             // to retry — connect() rebuilds from scratch.
             return true
-        case .roleNotActive, .streamNotActive, .invalidServerURL, .noDiscoveredServers, .serverURLRequired:
+        case .stalePairingAttempt, .roleNotActive, .streamNotActive,
+             .invalidServerURL, .noDiscoveredServers, .serverURLRequired:
             // Logic/configuration errors are not transient connection failures —
             // retrying the connection won't help.
             return false
@@ -148,16 +149,8 @@ struct ErrorRecovery: AsyncParsableCommand {
     var retryDelay: Double = 1.0
 
     @MainActor
-    func run() async throws {
-        let url = try await resolveServerURL(server: server, discover: discover, timeout: timeout)
-
-        // Shared quit flag: SIGINT handler and the event loop both set this;
-        // the retry loop reads it. All accesses happen on MainActor.
-        let state = RetryState()
-
-        // Build client once. disconnect() resets state to .disconnected, so
-        // we can call connect() again on the same instance without rebuilding.
-        let client = try SendspinClient(
+    private func makeClient() throws -> SendspinClient {
+        try SendspinClient(
             identity: .generate(),
             name: "Error Recovery",
             roles: [.playerV1],
@@ -168,6 +161,19 @@ struct ErrorRecovery: AsyncParsableCommand {
                 ]
             )
         )
+    }
+
+    @MainActor
+    func run() async throws {
+        let url = try await resolveServerURL(server: server, discover: discover, timeout: timeout)
+
+        // Shared quit flag: SIGINT handler and the event loop both set this;
+        // the retry loop reads it. All accesses happen on MainActor.
+        let state = RetryState()
+
+        // Build client once. disconnect() resets state to .disconnected, so
+        // we can call connect() again on the same instance without rebuilding.
+        let client = try makeClient()
 
         // SIGINT: graceful shutdown. Set flag first so the retry loop exits,
         // then disconnect to send client/goodbye. The dispatch handler runs on
@@ -252,10 +258,26 @@ struct ErrorRecovery: AsyncParsableCommand {
                         }
                         break eventLoop
 
-                    case .paired, .pairingCodeChanged, .pairingAttemptEnded, .audioOutputChanged, .outputFormatStatusChanged, .streamingFailed,
-                         .streamFormatChanged, .streamCleared, .groupUpdated, .metadataReceived,
-                         .controllerStateUpdated, .controllerStateCleared, .colorStateUpdated, .colorStateCleared,
-                         .artworkStreamStarted, .visualizerStreamStarted, .outputDelayChanged, .lastPlayedServerChanged:
+                    // Explicit cases keep this example current as events evolve; apps may use `default: break` to ignore other events.
+                    case .paired,
+                         .pairingCodeChanged,
+                         .pairingAttemptEnded,
+                         .pairingWindowChanged,
+                         .audioOutputChanged,
+                         .outputFormatStatusChanged,
+                         .streamingFailed,
+                         .streamFormatChanged,
+                         .streamCleared,
+                         .groupUpdated,
+                         .metadataReceived,
+                         .controllerStateUpdated,
+                         .controllerStateCleared,
+                         .colorStateUpdated,
+                         .colorStateCleared,
+                         .artworkStreamStarted,
+                         .visualizerStreamStarted,
+                         .outputDelayChanged,
+                         .lastPlayedServerChanged:
                         break
                     }
                 }

@@ -106,6 +106,10 @@ private struct LockedState: @unchecked Sendable {
     /// The audio thread cannot query the HAL, so the value is read once and stored here.
     var deviceLatencyUs: Int64 = 0
 
+    /// Runtime delay beyond the local output port, in the local clock domain.
+    /// It shifts scheduling earlier; cursor timestamps remain in server time.
+    var outputDelayUs: Int64 = 0
+
     /// Absolute time `AudioQueueStart` was called, or 0 before it has been.
     var queueStartAbsoluteUs: Int64 = 0
 
@@ -508,6 +512,10 @@ actor AudioPlayer {
         let queueDepthUs = Int64(audioQueueBufferCount) * Int64(audioQueueBufferByteSize) * 1_000_000
             / Int64(format.sampleRate * bytesPerFrame)
         return queueDepthUs + lockedState.withLock { $0.deviceLatencyUs }
+    }
+
+    func setOutputDelayMicroseconds(_ delay: Int64) {
+        lockedState.withLock { $0.outputDelayUs = max(0, delay) }
     }
 
     /// Wait until the device has delivered its first callback. Before that, PCM released on
@@ -979,6 +987,21 @@ actor AudioPlayer {
         let enqueue: Bool
     }
 
+    /// Server-time cursor target for a frame handed to hardware at `localNow`.
+    /// All latency is local-domain time before one exact snapshot inverse mapping. Saturating
+    /// arithmetic keeps malformed snapshots or extreme latency values from trapping the callback.
+    static func correctionEquilibriumServerTime(
+        snapshot: TimeFilterSnapshot,
+        localNow: Int64,
+        pipelineLatencyUs: Int64,
+        outputDelayUs: Int64
+    ) -> Int64 {
+        let audibleLocalTime = localNow
+            .saturatingAdding(max(0, pipelineLatencyUs))
+            .saturatingAdding(max(0, outputDelayUs))
+        return snapshot.localTimeToServer(audibleLocalTime)
+    }
+
     private static func updateCorrectionSchedule(
         state: inout LockedState,
         capacity: Int,
@@ -987,19 +1010,22 @@ actor AudioPlayer {
     ) {
         guard state.cursorMicroseconds > 0, let snapshot = state.timeSnapshot else { return }
         let nowAbsolute = MonotonicClock.absoluteMicroseconds()
-        let expectedServerTime = snapshot.localTimeToServer(nowAbsolute)
 
         // Everything between pulling a frame here and hearing it: every primed buffer — so this
         // must use the same count `prepare()` primes — plus the device path beyond them.
         let queueDepthUs = Int64(audioQueueBufferCount * capacity) * 1_000_000 / Int64(sampleRate * frameSize)
-        let aqLatencyUs = queueDepthUs + state.deviceLatencyUs
+        let equilibriumServerTime = correctionEquilibriumServerTime(
+            snapshot: snapshot,
+            localNow: nowAbsolute,
+            pipelineLatencyUs: queueDepthUs + state.deviceLatencyUs,
+            outputDelayUs: state.outputDelayUs
+        )
 
         // A frame pulled here is audible `aqLatencyUs` from now, and must be audible at
-        // `local(cursor)` — so in equilibrium the cursor LEADS `expectedServerTime` by that
-        // latency. Subtracting it instead of adding puts the reported error `2 * aqLatencyUs`
-        // from the truth, which makes every change to the latency model move the equilibrium
-        // by twice the change. Positive means late: the cursor is behind where it should be.
-        let syncErrorUs = (expectedServerTime + aqLatencyUs) - state.cursorMicroseconds
+        // `local(cursor)` — so in equilibrium the cursor LEADS the mapped local instant by
+        // that latency. The shared helper maps the complete local target through the same
+        // nonzero-drift snapshot used by scheduling.
+        let syncErrorUs = equilibriumServerTime - state.cursorMicroseconds
         state.lastSyncErrorUs = syncErrorUs
 
         let framesInBuffer = capacity / frameSize
@@ -1016,8 +1042,10 @@ actor AudioPlayer {
                 // callback correct only real drift.
                 state.startupOffsetUs = syncErrorUs
                 state.cursorMicroseconds = graceExpiryRebaselineCursor(
-                    expectedServerTime: expectedServerTime,
-                    audioQueueLatencyUs: aqLatencyUs
+                    snapshot: snapshot,
+                    localNow: nowAbsolute,
+                    pipelineLatencyUs: queueDepthUs + state.deviceLatencyUs,
+                    outputDelayUs: state.outputDelayUs
                 )
                 state.cursorRemainder = 0
                 state.correctionSchedule = CorrectionSchedule()
@@ -1041,12 +1069,13 @@ actor AudioPlayer {
         if newSchedule.reanchor {
             // Can't reset the ring buffer and cursor here safely while iterating,
             // so signal the actor to handle it on the next poll.
-            // The cursor leads by the pipeline latency in equilibrium, so a reanchor must
-            // target that, not bare `expectedServerTime` — which would leave the very next
-            // callback reporting the latency itself as error.
+            // The cursor leads by the physical and local delay in equilibrium, so a reanchor
+            // must use the shared mapped target rather than a bare current-time conversion.
             state.pendingReanchorServerTime = graceExpiryRebaselineCursor(
-                expectedServerTime: expectedServerTime,
-                audioQueueLatencyUs: aqLatencyUs
+                snapshot: snapshot,
+                localNow: nowAbsolute,
+                pipelineLatencyUs: queueDepthUs + state.deviceLatencyUs,
+                outputDelayUs: state.outputDelayUs
             )
             state.reanchorRequested = true
             state.correctionSchedule = CorrectionSchedule()
@@ -1276,8 +1305,8 @@ actor AudioPlayer {
     /// Cursor position that makes the sync-error formula evaluate to equilibrium
     /// at the startup correction-grace handoff.
     ///
-    /// Cursor position at which the sync-error formula reads zero — the equilibrium in
-    /// which the cursor leads `expectedServerTime` by the pipeline latency.
+    /// Cursor position at which the sync-error formula reads zero: the shared snapshot mapping
+    /// of the local time after physical pipeline and commanded local output delay.
     ///
     /// While startup grace is open, correction is intentionally disabled so AudioQueue
     /// callback/cursor bookkeeping can settle without pitch-shifting output. On the
@@ -1287,8 +1316,18 @@ actor AudioPlayer {
     /// This *asserts* the equilibrium rather than measuring it, so whatever misalignment
     /// exists at grace expiry becomes permanent and subsequently reads as perfect sync.
     /// `TelemetrySnapshot.startupOffsetUs` is the only place that misalignment is visible.
-    static func graceExpiryRebaselineCursor(expectedServerTime: Int64, audioQueueLatencyUs: Int64) -> Int64 {
-        expectedServerTime + audioQueueLatencyUs
+    static func graceExpiryRebaselineCursor(
+        snapshot: TimeFilterSnapshot,
+        localNow: Int64,
+        pipelineLatencyUs: Int64,
+        outputDelayUs: Int64
+    ) -> Int64 {
+        correctionEquilibriumServerTime(
+            snapshot: snapshot,
+            localNow: localNow,
+            pipelineLatencyUs: pipelineLatencyUs,
+            outputDelayUs: outputDelayUs
+        )
     }
 
     /// Convert linear volume (0.0-1.0) to perceptual amplitude.

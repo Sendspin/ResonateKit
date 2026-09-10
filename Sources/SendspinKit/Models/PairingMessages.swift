@@ -53,8 +53,19 @@ struct ServerPairInitMessage: SendspinMessage, Equatable {
 }
 
 struct ServerPairInitPayload: Codable, Equatable, Sendable {
-    let nonceA: String
+    let nonceA: String?
     enum CodingKeys: String, CodingKey { case nonceA = "nonce_A" }
+}
+
+struct ClientPairRetryMessage: SendspinMessage, Equatable {
+    static let typeString = "client/pair-retry"
+    let type = Self.typeString
+    let payload: ClientPairRetryPayload
+    private enum CodingKeys: String, CodingKey { case type, payload }
+}
+
+struct ClientPairRetryPayload: Codable, Equatable, Sendable {
+    private enum CodingKeys: CodingKey {}
 }
 
 struct ServerPairAuthMessage: SendspinMessage, Equatable {

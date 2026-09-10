@@ -18,6 +18,9 @@ public extension SendspinClient {
     ///
     /// Call ``exitExternalSource()`` to return to normal operation.
     ///
+    /// This is the non-interruptible external-source path: the client remains
+    /// unavailable while the external activity owns its output.
+    ///
     /// - Throws: ``SendspinClientError/notConnected`` if not connected,
     ///   or ``SendspinClientError/sendFailed(_:)`` if the server notification fails.
     @MainActor
@@ -30,9 +33,9 @@ public extension SendspinClient {
 
     /// Return to normal synchronized operation after ``enterExternalSource()``.
     ///
-    /// Tells the server this client is ready to receive audio again.
-    /// The server will typically move the client back into its previous group
-    /// via `group/update`.
+    /// Tells the server this client is ready to receive audio again. The server
+    /// does not automatically rejoin the previous group; rejoining requires an
+    /// explicit group switch or another server-directed group change.
     ///
     /// The local state is rolled back if the server notification fails
     /// (see ``enterExternalSource()`` for rationale).
@@ -45,6 +48,26 @@ public extension SendspinClient {
         // Signal engine to resume underrun monitoring only after the server
         // accepted the state transition; failed sends leave engine/facade aligned.
         await connection?.setExternalSource(false)
+    }
+}
+
+// MARK: - Group membership
+
+public extension SendspinClient {
+    /// Leave the current server group without changing local group state.
+    ///
+    /// This operation is available to every client role. The server moves the
+    /// client to a stopped solo group; returning to the previous group requires
+    /// an explicit server-directed switch or group update.
+    ///
+    /// - Throws: ``SendspinClientError/notConnected`` when disconnected,
+    ///   ``SendspinClientError/handshakeIncomplete`` during re-handshake, or
+    ///   ``SendspinClientError/sendFailed(_:)`` when the encrypted send fails.
+    @MainActor
+    func leaveGroup() async throws {
+        try requireOpen()
+        guard let connection else { throw SendspinClientError.notConnected }
+        try await connection.leaveGroup()
     }
 }
 
@@ -146,20 +169,36 @@ extension SendspinClient {
 }
 
 public extension SendspinClient {
-    /// Open the connection-owned pairing window for one code-based attempt.
+    /// Open the attempt-scoped pairing window for `attemptID`.
+    /// Dynamic pairing resets the global budget and performs a fallible round reservation;
+    /// static pairing does neither. The window controls eligibility, not peer trust.
     @MainActor
-    func openPairingWindow() async throws {
+    func openPairingWindow(for attemptID: PairingAttemptID) async throws {
         try requireOpen()
-        guard let connection else { throw SendspinClientError.notConnected }
-        await connection.openPairingWindow()
+        let candidates = [connection, pairingConnection].compactMap(\.self)
+        guard !candidates.isEmpty else { throw SendspinClientError.notConnected }
+        for candidate in candidates {
+            guard let snapshot = await candidate.pairingAttemptSnapshot(), snapshot.id == attemptID else { continue }
+            try await candidate.openPairingWindow(attemptID: attemptID)
+            return
+        }
+        throw SendspinClientError.stalePairingAttempt(attemptID)
     }
 
-    /// Cancel the current code-based pairing attempt, if any.
+    /// Cancel exactly the attempt represented by `attemptID`. The ID is matched
+    /// against both the primary and parked pairing connection; it never retargets
+    /// another connection after the original attempt ends.
     @MainActor
-    func cancelPairingAttempt() async throws {
+    func cancelPairing(attemptID: PairingAttemptID) async throws {
         try requireOpen()
-        guard let connection else { throw SendspinClientError.notConnected }
-        await connection.cancelPairingAttempt()
+        let candidates = [connection, pairingConnection].compactMap(\.self)
+        guard !candidates.isEmpty else { throw SendspinClientError.notConnected }
+        for candidate in candidates {
+            guard let snapshot = await candidate.pairingAttemptSnapshot(), snapshot.id == attemptID else { continue }
+            try await candidate.cancelPairing(attemptID: attemptID)
+            return
+        }
+        throw SendspinClientError.stalePairingAttempt(attemptID)
     }
 
     /// Start playback.

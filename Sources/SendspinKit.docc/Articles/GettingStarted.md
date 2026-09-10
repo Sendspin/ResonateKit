@@ -47,6 +47,48 @@ include ``SpectrumConfiguration`` whenever the requested types contain ``Visuali
 These role configurations seed the initial `client/state` snapshot; dynamic preference changes use the
 corresponding state-preference APIs.
 
+A visualizer consumer owns one bounded subscription. Consume frames FIFO, use the monotonic
+``PresentationClock`` to await each future ``VisualizerFrame/presentationTime``, then check
+``VisualizerFrame/isValid`` before handing the due value to the UI. `isValid` checks stream generation
+only, so a due frame can remain valid; `eligibilityForScheduling(at:)` is the pre-deadline gate.
+Never convert these instants through wall-clock time or retain an unbounded app queue.
+
+```swift
+let frames = try client.acquireVisualizerFrames()
+let consumer = Task {
+    var iterator = frames.makeAsyncIterator()
+    let clock = PresentationClock()
+    while let frame = await iterator.next() {
+        if frame.eligibilityForScheduling(at: clock.now) {
+            try await clock.sleep(until: frame.presentationTime)
+        }
+        guard frame.isValid else { continue }
+        // Replace the latest due value for this type in a bounded UI mailbox.
+        submitDueFrame(frame)
+    }
+}
+
+// On shutdown: consumer.cancel(); frames.cancel(); await client.close()
+```
+
+A display-link submission is not a guarantee of the next screen refresh or screen-photon time; an
+app must not claim exact refresh synchronization without an independently measured clock mapping.
+See the runnable ``VisualizerClient`` example for a SwiftUI/AppKit implementation.
+
+## Leave a group
+
+Any client role can leave its current server group:
+
+```swift
+try await client.leaveGroup()
+```
+
+This sends `client/leave` with an empty payload. The server places the client in a stopped solo group;
+SendspinKit does not invent or clear local group state, and returning to the previous group requires an
+explicit server-directed group change. For non-interruptible local playback, use
+``SendspinClient/enterExternalSource()`` and ``SendspinClient/exitExternalSource()``. Exiting an external
+source makes the client available again but does not automatically rejoin its previous group.
+
 ## Connect to a server
 
 There are two connection patterns:
@@ -108,35 +150,39 @@ for await event in client.events() {
 ## Pair with a code
 
 Code-based pairing is coordinated by the host app. Pass a ``PairingConfiguration`` with the
-method enabled, start consuming ``SendspinClient/events``, and use the pairing events to drive the
-operator UI:
+method enabled, start consuming ``SendspinClient/events``, and retain the complete
+``PairingAttemptSnapshot`` that drives the operator UI:
 
 ```swift
 for await event in client.events() {
     switch event {
-    case let .pairingCodeChanged(emission?):
-        print("Pairing \(emission.format.rawValue): \(emission.payload)")
-        // Display or speak digits; render the complete SP:1 payload as a QR code.
-        if let pack = emission.digitAudioPack {
-            playDigitAudio(pack) // The host app decodes and plays the ten clips.
+    case let .pairingCodeChanged(snapshot):
+        if let code = snapshot.code {
+            print("Pairing \(code.format.rawValue): \(code.payload)")
         }
-    case .pairingCodeChanged(nil):
-        print("Pairing code cleared")
-    case let .pairingAttemptEnded(reason):
-        print("Pairing attempt ended: \(reason.rawValue)")
+    case let .pairingAttemptEnded(snapshot):
+        print("Pairing attempt \(snapshot.id.rawValue) ended: \(snapshot.phase)")
+    case let .paired(snapshot):
+        print("Paired with \(snapshot.peer.name); trust: \(snapshot.peer.trustLevel)")
     default:
         break
     }
 }
 ```
 
-Call ``SendspinClient/openPairingWindow()`` when the app receives its physical-gesture or other
-operator-confirmation signal. It returns after recording or consuming the connection-owned window;
-it does not wait for the attempt. ``SendspinClient/cancelPairingAttempt()`` cancels an attempt or
-closes the local window. Dynamic codes are six contiguous digits or a complete version-one `SP:1`
-token. If the dynamic method includes a speaker output capability, the digits emission also includes
-a validated ``DigitAudioPack``; the host app decodes and plays its clips. Static pairing instead
-requires the host to provision and persist a device-unique eight-digit ASCII decimal code with
+Call ``SendspinClient/openPairingWindow(for:)`` with the ID captured by the rendered snapshot when
+the app receives its physical-gesture or other operator-confirmation signal. It returns after
+recording or consuming the connection-owned window; it does not wait for the attempt. To cancel,
+call ``SendspinClient/cancelPairing(attemptID:)`` with that same captured ID. A stale ID throws
+``SendspinClientError/stalePairingAttempt(_:)`` and never retargets a newer attempt. The observable
+``SendspinClient/currentPairing`` retains the latest terminal snapshot until a new attempt starts;
+``SendspinClient/pairingWindow`` becomes `nil` when its authorization window expires or closes, and
+its `expiresAt` is not a trust assertion. The peer ID is unverified while
+``PairingPeer/trustLevel`` is `.none`; the authorization window is not proof of server trust. Dynamic
+codes are six contiguous digits or a complete version-one `SP:1` token. If
+the dynamic method includes a speaker output capability, the code emission also includes a validated
+``DigitAudioPack``; the host app decodes and plays its clips. Static pairing instead requires the
+host to provision and persist a device-unique eight-digit ASCII decimal code with
 ``PairingConfiguration/init(pairingPsk:store:enabled:dynamicPairingCodeEnabled:staticPairingCode:staticPairingCodeEnabled:digitAudio:)``;
 the library never supplies a fixed default or emits that secret. Choose at most one code method in
 ``PairingConfiguration``. Dynamic pairing binds device presence, while a leaked static code is

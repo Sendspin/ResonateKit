@@ -1441,6 +1441,86 @@ struct SendspinConnectionSessionTests {
 
     // MARK: - Outbound whole-message serialization
 
+    @Test("a queued pairing send rejects a cancelled attempt after replacement without reaching the wire")
+    func queuedPairingSendRejectsStaleAttemptAfterReplacement() async throws {
+        let transport = MockTransport()
+        let connection = try await makeConnectionWithTransport(transport)
+        #expect(await waitUntil { await connection.clockSyncTask != nil })
+        await connection.clockSyncTask?.cancel()
+        await connection.clockSyncTask?.value
+        #expect(await waitUntil { await !connection.outboundInFlight })
+
+        await connection.admitPairingAttempt()
+        let oldAttemptID = try #require(await connection.pairingAttemptID)
+        await transport.enableGoodbyeGate()
+        let blocker = Task { () -> Result<Void, Error> in
+            do {
+                try await connection.send(clientMessage: OutboundTestMessage(
+                    type: .padded,
+                    note: String(repeating: "f", count: NoiseChannel.maxSinglePayload + 2_000)
+                ))
+                return .success(())
+            } catch { return .failure(error) }
+        }
+        #expect(await waitUntil { await transport.isGoodbyeGateWaiting })
+
+        let stale = Task { () -> Result<Void, Error> in
+            do {
+                try await connection.sendPairingWrapped(
+                    PairAbortMessage(payload: PairAbortPayload(reason: .userCancelled)),
+                    attemptID: oldAttemptID
+                )
+                return .success(())
+            } catch { return .failure(error) }
+        }
+        #expect(await waitUntil { await connection.outboundWaiters.count == 1 })
+        await connection.clearPairingAttempt()
+        await connection.admitPairingAttempt()
+        let replacementID = try #require(await connection.pairingAttemptID)
+        #expect(replacementID != oldAttemptID)
+        await transport.releaseGoodbyeGate()
+
+        #expect(await (try? blocker.value.get()) != nil)
+        guard case let .failure(error) = await stale.value else {
+            Issue.record("a queued send for a retired attempt must fail")
+            await connection.shutdown()
+            return
+        }
+        #expect(error is SendspinClientError)
+        let server = try #require(await connectionReadbacks.server(for: transport))
+        #expect(await waitUntil(timeout: .seconds(3)) {
+            await server.decryptedMessages.contains { typeOfDecryptedJSON($0) == .padded }
+        })
+        #expect(await server.decryptedMessages
+            .contains { SendspinEncoding.messageType(of: Data($0.dropFirst())) == PairAbortMessage.typeString } == false)
+        await connection.shutdown()
+    }
+
+    @Test("new pairing admission clears one-shot terminal abort authorization")
+    func newAdmissionClearsTerminalAbortAuthorization() async throws {
+        let transport = MockTransport()
+        let connection = try await makeConnectionWithTransport(transport)
+        await connection.admitPairingAttempt()
+        let oldAttemptID = try #require(await connection.pairingAttemptID)
+        try await connection.openPairingWindow(attemptID: oldAttemptID)
+        try await connection.cancelPairing(attemptID: oldAttemptID)
+        let server = try #require(await connectionReadbacks.server(for: transport))
+        #expect(await waitUntil { await server.clientJSONMessages(ofType: PairAbortMessage.typeString).count == 1 })
+
+        await connection.admitPairingAttempt()
+        let replacementID = try #require(await connection.pairingAttemptID)
+        #expect(replacementID != oldAttemptID)
+        await #expect(throws: SendspinClientError.stalePairingAttempt(oldAttemptID)) {
+            try await connection.sendPairingWrapped(
+                PairAbortMessage(payload: PairAbortPayload(reason: .userCancelled)),
+                attemptID: oldAttemptID,
+                allowClearedAbort: true
+            )
+        }
+        #expect(await server.clientJSONMessages(ofType: PairAbortMessage.typeString).count == 1)
+        await connection.shutdown()
+    }
+
     /// Core regression: a fragmented message parks mid-send with all fragment
     /// nonces already consumed; the peer must still decrypt both messages in send
     /// order with no AEAD gap.

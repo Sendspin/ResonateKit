@@ -317,7 +317,7 @@ struct SendspinClientTests {
         let events = client.events()
         let audio = client.audioChunks
         let artwork = client.artwork
-        let visualizer = client.visualizerData
+        let visualizer = try client.acquireVisualizerFrames()
 
         async let firstClose: Void = client.close()
         async let secondClose: Void = client.close()
@@ -351,7 +351,7 @@ struct SendspinClientTests {
         let events = client.events()
         let audio = client.audioChunks
         let artwork = client.artwork
-        let visualizer = client.visualizerData
+        let visualizer = try client.acquireVisualizerFrames()
         let collectedEvents = Task { @MainActor in
             var values: [ClientEvent] = []
             for await event in events {
@@ -1115,12 +1115,13 @@ struct SendspinClientTests {
             .compactMap { (try? decoder.decode(ClientGoodbyeMessage.self, from: $0))?.payload.reason }
     }
 
-    private func streamFinishes(_ stream: AsyncStream<some Sendable>) async -> Bool {
+    private func streamFinishes<S: AsyncSequence & Sendable>(_ stream: S) async -> Bool
+        where S.Element: Sendable {
         let result = await outcomeOfUnstructuredOperation(
             timeout: .seconds(1),
             operation: {
                 var iterator = stream.makeAsyncIterator()
-                while await iterator.next() != nil {}
+                while try await iterator.next() != nil {}
                 return true
             }
         )

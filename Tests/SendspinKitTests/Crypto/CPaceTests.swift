@@ -276,8 +276,11 @@ struct DynamicPairingCodeDerivationTests {
         let nonceA = dataFromHex(fixture.nonceA)
         let nonceB = dataFromHex(fixture.nonceB)
         let sid = dataFromHex(fixture.sid)
-        let expectedSID = CPaceSessionIdentifier.make(handshakeHash: handshakeHash, counter: fixture.counter)
-        #expect(sid == expectedSID)
+        #expect(
+            sid == dataFromHex(
+                "73656e647370696e2d706169722d70616b652d763100112233445566778899aabbccddeeff102132435465768798a9bacbdcedfe0f0000000100000001"
+            )
+        )
 
         let commit = Data(SHA256.hash(data: Data("sendspin-pair-commit-v1".utf8) + nonceB))
         #expect(commit == dataFromHex(fixture.commitB))
@@ -351,8 +354,8 @@ struct PairingSessionIdentifierTests {
     @Test("uses raw hash and big-endian counter")
     func identifierEncoding() {
         let hash = Data(repeating: 0xAB, count: CPaceSessionIdentifier.handshakeHashLength)
-        let sid = CPaceSessionIdentifier.make(handshakeHash: hash, counter: 0x0102_0304)
-        #expect(sid == Data("sendspin-pair-pake-v1".utf8) + hash + dataFromHex("01020304"))
+        let sid = CPaceSessionIdentifier.make(handshakeHash: hash, counter: 0x0102_0304, round: 0x0506_0708)
+        #expect(sid == Data("sendspin-pair-pake-v1".utf8) + hash + dataFromHex("0102030405060708"))
     }
 }
 

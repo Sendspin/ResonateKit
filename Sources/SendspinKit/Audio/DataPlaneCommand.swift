@@ -119,7 +119,7 @@ enum DataPlaneCommand {
     /// Change format at an explicitly announced input generation.
     case formatChangeAtGeneration(AudioFormatSpec, codecHeader: Data?, generation: UInt64)
 
-    /// Set output delay in milliseconds (subtracted from scheduled timestamps).
+    /// Set output delay in milliseconds (subtracted from local scheduled play times).
     case setOutputDelay(Int)
 }
 

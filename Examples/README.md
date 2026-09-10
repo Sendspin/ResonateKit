@@ -13,6 +13,7 @@ Standalone example apps demonstrating SendspinKit features. Each is a self-conta
 | **ErrorRecovery** | Reconnection with exponential backoff and error classification |
 | **ClockSyncDiagnostics** | Real-time Kalman filter clock sync diagnostics dashboard |
 | **CLIPlayer** | Full-featured player with status display |
+| **VisualizerClient** | macOS SwiftUI visualizer with bounded deadline-aware frame delivery |
 
 ## Learning Path
 
@@ -46,7 +47,16 @@ swift run MetadataClient --discover
 swift run MetadataClient --discover --timeout 10
 ```
 
-Use `--help` on any example for its full option list.
+Use `--help` on any example for its full option list. VisualizerClient is a macOS SwiftUI app and accepts an explicit URL or discovery:
+
+```bash
+cd Examples/VisualizerClient
+swift run VisualizerClient --server ws://192.168.1.100:8927/sendspin
+swift run VisualizerClient --discover --timeout 5
+```
+
+VisualizerClient uses a generated process-local identity. Add `--pairing` for explicit paired-only
+access; persist the displayed pairing token in a real application.
 
 ## Requirements
 

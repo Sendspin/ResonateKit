@@ -48,11 +48,7 @@ public struct PairingRecord: Sendable, Equatable, Hashable {
     }
 }
 
-/// Persistence for long-term pairing records.
-///
-/// SendspinKit never persists pairing records implicitly. Applications provide a
-/// Keychain, file, or database implementation when records must survive process
-/// restarts. Methods are async so storage I/O stays outside the main actor.
+/// Storage accounting for long-term pairing records.
 public struct PairingStorageAccounting: Sendable, Equatable {
     public let free: Int
     public let capacity: Int?
@@ -67,8 +63,8 @@ public struct PairingStorageAccounting: Sendable, Equatable {
     }
 }
 
-/// Dynamic pairing failures required before a code attempt waits for the host gesture.
-let dynamicPairingFailureEscalationThreshold = 5
+/// Maximum dynamic pairing rounds allowed globally since the last verified confirmation or operator reset.
+let dynamicPairingRoundLimit: UInt32 = 20
 
 /// Host-local pairing settings shared by handshake candidates and active sessions.
 public struct PairingManagementConfiguration: Sendable, Equatable {
@@ -131,6 +127,16 @@ public actor PairingConfigurationRuntime {
     }
 }
 
+/// The result of an atomic dynamic pairing round reservation.
+public enum DynamicPairingRoundReservation: Sendable, Equatable {
+    /// The round is durably reserved and may proceed. `round` starts at one.
+    case reserved(round: UInt32, remaining: UInt32)
+    /// The persisted budget has no rounds remaining.
+    case exhausted
+}
+
+/// Persistence for long-term pairing records. Applications provide a Keychain,
+/// file, or database implementation when records must survive process restarts.
 /// The store is the host app's durability boundary: mutating operations must be
 /// serialized with one another and complete durably before they return. This prevents
 /// a successful pairing from being lost while a new handshake is already using the
@@ -156,14 +162,16 @@ public protocol PairingRecordStore: Sendable {
     /// Return storage accounting, or nil when the store is unbounded or unknown.
     func storageAccounting() async -> PairingStorageAccounting?
 
-    /// Return the persisted dynamic pairing failure count.
-    func dynamicPairingFailureCount() async -> Int
+    /// Return the global number of dynamic pairing rounds since the last verified key confirmation.
+    /// This is diagnostic only; admission must use ``reserveDynamicPairingRound(limit:)``.
+    func dynamicPairingRoundCount() async throws -> UInt32
 
-    /// Increment and return the dynamic pairing failure count as one atomic operation.
-    func incrementDynamicPairingFailureCount() async -> Int
+    /// Atomically reserve the next dynamic pairing round, persisting the reservation before returning.
+    /// The limit is global across servers and addresses. A reservation is never returned above it.
+    func reserveDynamicPairingRound(limit: UInt32) async throws -> DynamicPairingRoundReservation
 
-    /// Reset the dynamic pairing failure count atomically.
-    func resetDynamicPairingFailureCount() async
+    /// Reset the global dynamic pairing budget after verified confirmation or operator action.
+    func resetDynamicPairingBudget() async throws
 }
 
 public extension PairingRecordStore {
@@ -172,16 +180,6 @@ public extension PairingRecordStore {
     func storageAccounting() async -> PairingStorageAccounting? {
         nil
     }
-
-    func dynamicPairingFailureCount() async -> Int {
-        0
-    }
-
-    func incrementDynamicPairingFailureCount() async -> Int {
-        1
-    }
-
-    func resetDynamicPairingFailureCount() async {}
 }
 
 /// Errors raised while configuring pairing records.
@@ -196,7 +194,7 @@ public enum PairingRecordStoreError: Error, Sendable, Equatable {
 /// provide an application persistence implementation.
 public actor InMemoryPairingRecordStore: PairingRecordStore {
     private var records: [PairingRecord]
-    private var dynamicPairingFailureCount = 0
+    private var dynamicPairingRoundCount: UInt32 = 0
     private let reservedPskIds: Set<String>
 
     public init(pairingPsk: Psk? = nil, preProvisionedRecord: PairingRecord? = nil) {
@@ -246,17 +244,18 @@ public actor InMemoryPairingRecordStore: PairingRecordStore {
         records.append(record)
     }
 
-    public func dynamicPairingFailureCount() async -> Int {
-        dynamicPairingFailureCount
+    public func dynamicPairingRoundCount() async throws -> UInt32 {
+        dynamicPairingRoundCount
     }
 
-    public func incrementDynamicPairingFailureCount() async -> Int {
-        dynamicPairingFailureCount += 1
-        return dynamicPairingFailureCount
+    public func reserveDynamicPairingRound(limit: UInt32) async throws -> DynamicPairingRoundReservation {
+        guard dynamicPairingRoundCount < limit else { return .exhausted }
+        dynamicPairingRoundCount += 1
+        return .reserved(round: dynamicPairingRoundCount, remaining: limit - dynamicPairingRoundCount)
     }
 
-    public func resetDynamicPairingFailureCount() async {
-        dynamicPairingFailureCount = 0
+    public func resetDynamicPairingBudget() async throws {
+        dynamicPairingRoundCount = 0
     }
 }
 
@@ -316,6 +315,9 @@ public struct PairingConfiguration: Sendable {
             pairingPsk: resolved,
             pairingPskEnabled: enabled,
             recordModePskId: fallback.pskId,
+            // The facade applies its explicit unpaired-access policy before the
+            // first handshake; this default keeps standalone configuration
+            // snapshots conservative until that owner supplies the policy.
             unpairedAccessEnabled: true,
             dynamicPairingCodeEnabled: dynamicPairingCodeEnabled,
             staticPairingCodeEnabled: staticPairingCodeEnabled,

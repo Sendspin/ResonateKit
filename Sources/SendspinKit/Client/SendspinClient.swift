@@ -40,6 +40,11 @@ public final class SendspinClient {
     public private(set) var connectionState: ConnectionState = .disconnected
     /// Trust level established by the currently admitted Noise PSK.
     public private(set) var trustLevel: TrustLevel = .none
+    /// Latest immutable pairing projection, including the terminal snapshot until a new attempt starts.
+    public private(set) var currentPairing: PairingAttemptSnapshot?
+    /// Operator authorization for one pairing attempt, or nil when no window is open.
+    /// A window does not change the peer's ``TrustLevel``; that is established only after pairing.
+    public private(set) var pairingWindow: PairingWindowSnapshot?
     /// The audio format currently being streamed by the server, or nil if no stream is active.
     public private(set) var currentStreamFormat: AudioFormatSpec?
     /// Written both here and by the control drain's `.operationalState` case, so
@@ -122,6 +127,14 @@ public final class SendspinClient {
     /// The active connection, or nil if disconnected.
     /// When a new connection replaces the old one, the old is shutdown.
     var connection: SendspinConnection?
+    /// At most one pairing connection may be parked beside a playback holder.
+    var pairingConnection: SendspinConnection?
+    var pairingConnectionDrainTask: Task<Void, Never>?
+    var pairingActivationGate: ConnectionActivationGate?
+    var pairingDataDelivery: ConnectionDataDelivery?
+    var pairingSessionValidity: SessionValidityToken?
+    var pairingPromotionInProgress = false
+    var deferredPairingEvents: [ConnectionEvent] = []
 
     /// Client-lifetime audio-output capability service. The facade owns exactly
     /// one provider; connections consume later session snapshots but never own it.
@@ -146,7 +159,7 @@ public final class SendspinClient {
     /// `retireSession()` can invalidate it synchronously — before old-connection
     /// teardown is awaited — per the design's retire contract (both guards must
     /// reject a dying connection's late events *during* teardown, not after).
-    private(set) var sessionValidity: SessionValidityToken?
+    var sessionValidity: SessionValidityToken?
 
     /// Exact player catalog advertised by the active session. Cleared on reusable disconnect.
     private(set) var effectivePlayerFormats: [AudioFormatSpec]?
@@ -190,9 +203,15 @@ public final class SendspinClient {
     /// Most recent artwork payload received from the artwork data stream.
     public private(set) var currentArtwork: ArtworkData?
 
-    let visualizerDataContinuation: AsyncStream<VisualizerData>.Continuation
-    /// Visualizer bytes from the visualizer data stream.
-    public let visualizerData: AsyncStream<VisualizerData>
+    let visualizerFrameMailbox: VisualizerFrameMailbox
+    /// Acquire the single app-facing visualizer frame subscription.
+    ///
+    /// A subscription owns the bounded mailbox consumer until it is cancelled,
+    /// its pending read is cancelled, or it is deallocated. A second live
+    /// subscription fails instead of silently returning an empty iterator.
+    public func acquireVisualizerFrames() throws(VisualizerFrameAcquisitionError) -> VisualizerFrameSubscription {
+        try VisualizerFrameSubscription(acquiring: visualizerFrameMailbox)
+    }
 
     public convenience init(
         identity: SendspinIdentity,
@@ -294,7 +313,7 @@ public final class SendspinClient {
 
         (audioChunks, audioChunksContinuation) = AsyncStream.makeStream()
         (artwork, artworkContinuation) = AsyncStream.makeStream()
-        (visualizerData, visualizerDataContinuation) = AsyncStream.makeStream()
+        visualizerFrameMailbox = VisualizerFrameMailbox(capacityBytes: visualizerConfig?.bufferCapacity ?? 1)
 
         if roleSet.contains(.playerV1) {
             startAudioOutputCapabilityMonitoring()
@@ -321,20 +340,26 @@ public final class SendspinClient {
         eventSubscribers.removeAll()
         audioChunksContinuation.finish()
         artworkContinuation.finish()
-        visualizerDataContinuation.finish()
+        visualizerFrameMailbox.finish()
         // Safety net: dropping a connected client must not leak a live, playing
         // connection graph. Capture the connection into a local — do NOT capture
         // self. (`isolated deinit` runs on the MainActor, so reading the isolated
         // stored property is legal.)
         let conn = connection
-        Task { await conn?.shutdown() }
+        let side = pairingConnection
+        Task {
+            await conn?.shutdown()
+            if side !== conn {
+                await side?.shutdown()
+            }
+        }
     }
 
     /// Create a fresh control-event stream for one caller.
     ///
     /// Each call returns an independent stream that receives future control events.
     /// Binary role payloads are not emitted here; use ``audioChunks``, ``artwork``,
-    /// and ``visualizerData`` for data-plane bytes.
+    /// and ``acquireVisualizerFrames()`` for data-plane bytes.
     public func events() -> AsyncStream<ClientEvent> {
         let id = UUID()
         let (stream, continuation) = AsyncStream<ClientEvent>.makeStream()
@@ -351,7 +376,7 @@ public final class SendspinClient {
         return stream
     }
 
-    private func emitEvent(_ event: ClientEvent) {
+    func emitEvent(_ event: ClientEvent) {
         for continuation in eventSubscribers.values {
             continuation.yield(event)
         }
@@ -396,7 +421,7 @@ public final class SendspinClient {
         currentStreamFormat = format
     }
 
-    private func updateMetadata(_ metadata: TrackMetadata?) {
+    func updateMetadata(_ metadata: TrackMetadata?) {
         currentMetadata = metadata
     }
 
@@ -412,8 +437,44 @@ public final class SendspinClient {
         currentControllerState = state
     }
 
+    func updateCurrentPairing(_ snapshot: PairingAttemptSnapshot?) {
+        currentPairing = snapshot
+    }
+
+    func updatePairingWindow(_ window: PairingWindowSnapshot?) {
+        pairingWindow = window
+    }
+
+    func clearPairingWindow() {
+        pairingWindow = nil
+    }
+
     private func updateCodecHeader(_ header: Data?) {
         currentCodecHeader = header
+    }
+
+    func applyPromotedProjection(_ snapshot: SendspinConnection.ProjectionSnapshot) {
+        resetServerSessionState()
+        playerStreamActive = snapshot.playerStreamActive
+        artworkStreamActive = snapshot.artworkStreamActive
+        currentVisualizerStreamConfiguration = snapshot.visualizerConfiguration
+        updateStreamFormat(snapshot.streamFormat)
+        updateCodecHeader(snapshot.codecHeader)
+        currentArtwork = nil
+        updateMetadata(snapshot.metadata)
+        updateGroup(snapshot.group)
+        updateControllerState(snapshot.controller)
+        updateColorState(snapshot.color)
+        clientOperationalState = snapshot.operationalState
+        isClockSynced = snapshot.clockSynced
+        currentOutputFormatStatus = snapshot.outputFormatStatus
+        currentServerId = snapshot.serverId
+        currentActivities = snapshot.activities
+        trustLevel = snapshot.trustLevel
+        currentVolume = snapshot.volume
+        currentMuted = snapshot.muted
+        outputDelayMs = snapshot.outputDelayMs
+        shouldEmitRawAudio = playerConfig?.emitRawAudioEvents ?? false
     }
 
     // MARK: - Connection lifecycle
@@ -587,6 +648,7 @@ public final class SendspinClient {
         drainConnectionEventsTask?.cancel()
         drainConnectionEventsTask = nil
         sessionValidity?.invalidate()
+        visualizerFrameMailbox.clear()
         let retired = connection
         connection = nil
         return retired
@@ -603,7 +665,8 @@ public final class SendspinClient {
         outcome: consuming HandshakeDriver.Result,
         negotiation: SessionFormatNegotiation,
         runtimeConfiguration: PairingManagementConfiguration,
-        setupEpoch: Int
+        setupEpoch: Int,
+        installAsPairingSide: Bool = false
     ) async {
         guard !isTerminated else {
             await transport.disconnect()
@@ -615,32 +678,52 @@ public final class SendspinClient {
             await transport.disconnect()
             return
         }
-        // A new connection is a new session: drop any server-reported state carried
-        // over from a prior connection (notably one lost without an explicit
-        // disconnect) before the first server/state update is applied.
-        // Placed here, not in handleServerHello — that also fires on a same-connection
-        // re-hello, where the accumulated state is still valid.
-        resetServerSessionState()
-        isClockSynced = false
-        effectivePlayerFormats = negotiation.effectivePlayerFormats
+        if !installAsPairingSide {
+            // A new primary session drops server-reported state carried over from
+            // a prior connection before the first server/state update is applied.
+            resetServerSessionState()
+            isClockSynced = false
+            effectivePlayerFormats = negotiation.effectivePlayerFormats
 
-        // Retire the old session synchronously (token + identity guards both
-        // reject its late events from this point), then await its teardown.
-        // `oldConnection` is nil for current callers. Re-check the epoch after
-        // that suspension: teardown can take arbitrarily long.
-        let oldConnection = retireSession()
-        if let oldConnection {
-            await oldConnection.shutdown()
-        }
-        guard sessionEpoch == setupEpoch else {
-            await transport.disconnect()
-            return
+            // Retire the old primary and any parked pairing side synchronously,
+            // then await both teardowns before installing the replacement.
+            let oldConnection = retireSession()
+            let oldPairingConnection = detachPairingConnection()
+            if let oldConnection {
+                await oldConnection.shutdown()
+            }
+            if let oldPairingConnection {
+                await oldPairingConnection.shutdown()
+            }
+            guard sessionEpoch == setupEpoch else {
+                await transport.disconnect()
+                return
+            }
         }
 
         // Build the SendspinConnection with configuration from this facade
         let validity = SessionValidityToken()
-        sessionValidity = validity
+        if !installAsPairingSide {
+            sessionValidity = validity
+        }
         let clockSync = ClockSynchronizer()
+        let deliveryArtworkObserver: (@Sendable (ArtworkData) -> Void) = { [weak self] artwork in
+            Task { @MainActor [weak self] in
+                validity.performIfValid {
+                    self?.currentArtwork = artwork.clearsArtwork ? nil : artwork
+                }
+            }
+        }
+        let dataDelivery = ConnectionDataDelivery(
+            audio: audioChunksContinuation,
+            artwork: artworkContinuation,
+            visualizer: visualizerFrameMailbox,
+            artworkObserver: deliveryArtworkObserver
+        )
+        if !installAsPairingSide {
+            dataDelivery.promoteToPrimary()
+        }
+        let activationGate = installAsPairingSide ? ConnectionActivationGate() : nil
 
         let audioEngine = makeAudioEngine(clock: clockSync, validity: validity)
 
@@ -706,20 +789,11 @@ public final class SendspinClient {
             outputNegotiationSleep: outputNegotiationSleep,
             audioSink: audioChunksContinuation,
             artworkSink: artworkContinuation,
-            visualizerSink: visualizerDataContinuation,
+            visualizerDelivery: nil,
+            dataDelivery: dataDelivery,
+            activationGate: activationGate,
             emitRawAudio: playerConfig?.emitRawAudioEvents ?? false,
-            artworkObserver: { [weak self] artwork in
-                Task { @MainActor [weak self] in
-                    // Same session-validity contract as the public artwork
-                    // stream's yieldIfValid: a retired connection's in-flight
-                    // artwork must not mutate facade state. The token check and
-                    // write happen under the token lock, closing the snapshot/use
-                    // window that a separate `isValid` read would leave open.
-                    validity.performIfValid {
-                        self?.currentArtwork = artwork.clearsArtwork ? nil : artwork
-                    }
-                }
-            },
+            artworkObserver: nil,
             validity: validity,
             advertisedCommands: advertisedCommands,
             roles: roleSet,
@@ -751,8 +825,36 @@ public final class SendspinClient {
         )
         // No suspension occurs between the re-check above and this install.
 
-        connection = newConnection
-        currentOutputFormatStatus = nil
+        if installAsPairingSide {
+            pairingConnection = newConnection
+            pairingActivationGate = activationGate
+            pairingDataDelivery = dataDelivery
+            pairingSessionValidity = validity
+            pairingConnectionDrainTask?.cancel()
+            pairingConnectionDrainTask = Task { @MainActor [weak self] in
+                if let activationGate {
+                    self?.observePairingActivations(from: activationGate, connection: newConnection)
+                }
+                for await event in newConnection.events {
+                    newConnection.controlSink.decrementDepth()
+                    guard let self else { return }
+                    guard !isTerminated,
+                          pairingConnection === newConnection || connection === newConnection else { return }
+                    if pairingConnection === newConnection || pairingPromotionInProgress {
+                        if pairingPromotionInProgress {
+                            deferredPairingEvents.append(event)
+                        } else {
+                            applyPairingConnectionEvent(event)
+                        }
+                    } else {
+                        applyConnectionEvent(event)
+                    }
+                }
+            }
+        } else {
+            connection = newConnection
+            currentOutputFormatStatus = nil
+        }
 
         // Pairing setup sends its first protocol message. Mark the connection
         // running for that handoff send, but defer the supervisor until setup is
@@ -761,9 +863,13 @@ public final class SendspinClient {
             await newConnection.prepareInitialPairingActivation(outcomePairing)
         }
         await newConnection.start()
+        if !installAsPairingSide, let snapshot = await newConnection.pairingAttemptSnapshot() {
+            updateCurrentPairing(snapshot)
+        }
 
         // Drain control events without retaining the client: upgrade weak `self` per event.
         // Otherwise a parked task prevents deinit and its cleanup safety net.
+        guard !installAsPairingSide else { return }
         drainConnectionEventsTask = Task { [weak self] in
             guard newConnection === self?.connection else { return }
             if let sequence = self?.audioOutputSnapshotSequence,
@@ -781,9 +887,15 @@ public final class SendspinClient {
                 guard let self else { return }
                 // Identity guard: if connection was replaced, ignore this stale event.
                 guard newConnection === connection else { return }
+                // Promotion deliberately awaits the incumbent's graceful teardown
+                // before swapping facade ownership. Its terminal event is not a
+                // session loss; applying it here would retire the parked winner.
+                guard !pairingPromotionInProgress else { continue }
                 applyConnectionEvent(event)
             }
         }
+
+        guard !installAsPairingSide else { return }
 
         // Set should-emit-raw-audio flag
         shouldEmitRawAudio = playerConfig?.emitRawAudioEvents ?? false
@@ -859,6 +971,17 @@ public final class SendspinClient {
         sessionValidity?.invalidate()
         sessionValidity = nil
         let retiredConnection = connection
+        let retiredPairingConnection = pairingConnection
+        pairingConnectionDrainTask?.cancel()
+        pairingConnectionDrainTask = nil
+        pairingActivationGate?.cancel()
+        pairingActivationGate = nil
+        pairingPromotionInProgress = false
+        deferredPairingEvents.removeAll()
+        pairingDataDelivery = nil
+        pairingSessionValidity?.invalidate()
+        pairingSessionValidity = nil
+        pairingConnection = nil
         connection = nil
         let candidates = Array(pendingTransports.values)
         pendingTransports.removeAll()
@@ -873,6 +996,9 @@ public final class SendspinClient {
             }
             if let retiredConnection {
                 await retiredConnection.disconnect(reason: .shutdown)
+            }
+            if let retiredPairingConnection {
+                await retiredPairingConnection.disconnect(reason: .shutdown)
             }
             await capabilityTask?.value
             await capabilityProvider.stopMonitoring()
@@ -899,7 +1025,7 @@ public final class SendspinClient {
         eventSubscribers.removeAll()
         audioChunksContinuation.finish()
         artworkContinuation.finish()
-        visualizerDataContinuation.finish()
+        visualizerFrameMailbox.finish()
     }
 
     /// Record the host application's audio-session activation state.
@@ -943,11 +1069,26 @@ public final class SendspinClient {
         sessionEpoch += 1
 
         guard let conn = connection else {
+            if let side = pairingConnection {
+                dropPairingConnection(side)
+            }
             // Mid-dial: there is no connection to say goodbye to, but the caller's
             // intent must still land, or `connectionState` stays `.connecting` forever.
             if connectionState != .disconnected {
                 applyDisconnected(reason: .explicit(reason))
             }
+            return
+        }
+        // Promotion owns the incumbent goodbye. Retire facade state immediately if
+        // a concurrent disconnect invalidates that promotion; finish teardown in the
+        // background rather than waiting on the gated send.
+        let promotionWasInProgress = pairingPromotionInProgress
+        if let side = pairingConnection {
+            dropPairingConnection(side)
+        }
+        if promotionWasInProgress {
+            applyConnectionEvent(.disconnected(reason: .explicit(reason)))
+            Task { await conn.disconnect(reason: reason) }
             return
         }
         await conn.disconnect(reason: reason)
@@ -961,17 +1102,36 @@ public final class SendspinClient {
     /// event to the public stream. Called per event by the drain
     /// task, which holds `self` only for the duration of the call.
     @MainActor
-    private func applyConnectionEvent(_ event: ConnectionEvent) { // swiftlint:disable:this function_body_length
+    func applyConnectionEvent(_ event: ConnectionEvent) { // swiftlint:disable:this function_body_length
         guard !isTerminated else { return }
         switch event {
-        case let .paired(serverId):
-            emitEvent(.paired(serverId: serverId))
+        case let .paired(snapshot):
+            currentPairing = snapshot
+            // A late success from an older attempt must not close a newer window.
+            if pairingWindow?.attemptID == snapshot.id {
+                pairingWindow = nil
+            }
+            emitEvent(.paired(snapshot))
 
-        case let .pairingCodeChanged(emission):
-            emitEvent(.pairingCodeChanged(emission))
+        case let .pairingCodeChanged(snapshot):
+            // A terminal nil-code projection follows the ended event so a
+            // consumer can observe both lifecycle and code removal in order.
+            if case .ended = currentPairing?.phase, snapshot.code == nil,
+               snapshot.id == currentPairing?.id {
+                emitEvent(.pairingCodeChanged(snapshot))
+            } else {
+                currentPairing = snapshot
+                emitEvent(.pairingCodeChanged(snapshot))
+            }
 
-        case let .pairingAttemptEnded(reason):
-            emitEvent(.pairingAttemptEnded(reason))
+        case let .pairingAttemptEnded(snapshot):
+            currentPairing = snapshot
+            pairingWindow = nil
+            emitEvent(.pairingAttemptEnded(snapshot))
+
+        case let .pairingWindowChanged(window):
+            pairingWindow = window
+            emitEvent(.pairingWindowChanged(window))
 
         case let .serverConnected(info):
             currentServerId = info.serverId
@@ -1129,6 +1289,12 @@ public final class SendspinClient {
     private func applyDisconnected(reason: DisconnectReason) {
         guard connection != nil || connectionState != .disconnected else { return }
         // Terminal event: retire the connection and apply reconnect logic.
+        // A parked pairing side belongs to the same session and must not outlive
+        // a lost primary transport.
+        let retiredPairingConnection = detachPairingConnection()
+        if let retiredPairingConnection {
+            Task { await retiredPairingConnection.shutdown() }
+        }
         // Volume/mute/outputDelay deliberately survive (device-user state,
         // like the spec's output-delay persistence): the next session is
         // seeded from facade state and re-applies them to its fresh engine.
@@ -1169,6 +1335,7 @@ public final class SendspinClient {
         playerStreamActive = false
         artworkStreamActive = false
         currentVisualizerStreamConfiguration = nil
+        visualizerFrameMailbox.clear()
     }
 
     /// Clear server-reported state that is scoped to a single connection. A

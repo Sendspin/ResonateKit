@@ -186,6 +186,17 @@ struct MessageEncodingTests {
         #expect(state?.supportedCommands.count == 3)
     }
 
+    // MARK: - client/leave
+
+    @Test("client/leave encodes an exact empty payload")
+    func clientLeave_encodesEmptyPayload() throws {
+        let data = try SendspinEncoding.makeEncoder().encode(ClientLeaveMessage())
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let payload = try #require(object["payload"] as? [String: Any])
+        #expect(object["type"] as? String == ClientLeaveMessage.typeString)
+        #expect(payload.isEmpty)
+    }
+
     // MARK: - client/goodbye
 
     @Test

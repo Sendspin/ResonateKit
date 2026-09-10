@@ -49,8 +49,25 @@ actor AudioEngine {
     private var playbackTimeline = AudioChunkPlaybackTimeline()
     private var playbackTimelineTransitionEnabled = false
 
-    /// Output delay in milliseconds (subtracted from scheduled timestamps)
+    /// Output delay in milliseconds, applied in the local scheduling domain.
     private var outputDelayMs: Int = 0
+
+    /// Map a server timestamp into the local scheduling domain, applying output delay once.
+    /// Server-domain metadata and correction cursors continue to use the original timestamp.
+    static func localPlayTime(mappedLocalTime: Int64, outputDelayMicroseconds: Int64) -> Int64? {
+        let result = mappedLocalTime.subtractingReportingOverflow(max(0, outputDelayMicroseconds))
+        return result.overflow ? nil : result.partialValue
+    }
+
+    private static func outputDelayMicroseconds(_ milliseconds: Int) -> Int64 {
+        let result = Int64(max(0, milliseconds)).multipliedReportingOverflow(by: 1_000)
+        return result.overflow ? Int64.max : result.partialValue
+    }
+
+    private static func localDelayShift(from oldDelayUs: Int64, to newDelayUs: Int64) -> Int64 {
+        let result = oldDelayUs.subtractingReportingOverflow(newDelayUs)
+        return result.overflow ? (oldDelayUs >= newDelayUs ? Int64.max : Int64.min) : result.partialValue
+    }
 
     // Task tracking for shutdown
     private var drainTask: Task<Void, Never>?
@@ -182,6 +199,8 @@ actor AudioEngine {
     private var startupReleaseInvocation: UInt64 = 0
     private var startupReleaseInProgress = false
     private var outputHasStarted = false
+    /// Absolute time source for startup selection; injectable only through the internal test init.
+    private let startupNow: @Sendable () -> Int64
     private let engineID = UUID().uuidString
 
     private struct StartupBuffer {
@@ -201,7 +220,7 @@ actor AudioEngine {
 
     private struct StartupBufferedChunk {
         let pcmData: Data
-        let playTimeMicroseconds: Int64
+        var playTimeMicroseconds: Int64
         let originalTimestamp: Int64
         let generation: UInt64
     }
@@ -338,11 +357,13 @@ actor AudioEngine {
         scheduler: AudioScheduler,
         clock: any ClockSyncProtocol,
         enableStartupBuffering: Bool = false,
-        startupMinBufferMs: Int = 0
+        startupMinBufferMs: Int = 0,
+        startupNow: @escaping @Sendable () -> Int64 = { MonotonicClock.absoluteMicroseconds() }
     ) {
         self.output = output
         audioScheduler = scheduler
         self.clock = clock
+        self.startupNow = startupNow
         let sink = DataPlaneSink()
         _commandsSink = sink
         _commandStream = sink.commands
@@ -377,6 +398,7 @@ actor AudioEngine {
         output = audioPlayer
         self.audioScheduler = audioScheduler
         self.clock = clock
+        startupNow = { MonotonicClock.absoluteMicroseconds() }
         let sink = DataPlaneSink()
         _commandsSink = sink
         _commandStream = sink.commands
@@ -385,6 +407,8 @@ actor AudioEngine {
         self.reportContinuation = reportContinuation
         startupBufferingEnabled = true
         startupMinBufferUs = Int64(config.minBufferMs) * 1_000
+        outputDelayMs = config.initialOutputDelayMs
+        _commandsSink.enqueue(.setOutputDelay(config.initialOutputDelayMs))
     }
 
     // MARK: - Public interface
@@ -713,7 +737,13 @@ actor AudioEngine {
             await applyStreamEnd(roles: roles)
 
         case let .setOutputDelay(delayMs):
+            let oldDelayUs = Self.outputDelayMicroseconds(outputDelayMs)
+            let newDelayUs = Self.outputDelayMicroseconds(delayMs)
             outputDelayMs = delayMs
+            await audioScheduler.rebaseOutputDelay(from: oldDelayUs, to: newDelayUs)
+            rebaseStartupChunks(from: oldDelayUs, to: newDelayUs)
+            playbackTimeline.rebaseOutputDelay(from: oldDelayUs, to: newDelayUs)
+            await output.setOutputDelayMicroseconds(newDelayUs)
         }
     }
 
@@ -772,6 +802,22 @@ actor AudioEngine {
         }
     }
 
+    private static func rebase(_ chunks: inout [StartupBufferedChunk], from oldDelayUs: Int64, to newDelayUs: Int64) {
+        let shift = localDelayShift(from: oldDelayUs, to: newDelayUs)
+        guard shift != 0 else { return }
+        for index in chunks.indices {
+            chunks[index].playTimeMicroseconds = chunks[index].playTimeMicroseconds.saturatingAdding(shift)
+        }
+    }
+
+    private func rebaseStartupChunks(from oldDelayUs: Int64, to newDelayUs: Int64) {
+        if var startupBuffer {
+            Self.rebase(&startupBuffer.chunks, from: oldDelayUs, to: newDelayUs)
+            self.startupBuffer = startupBuffer
+        }
+        Self.rebase(&startupReleaseDeferredChunks, from: oldDelayUs, to: newDelayUs)
+    }
+
     /// Schedule a chunk for playback.
     private func applyChunk(data: Data, ts: Int64, generation: UInt64?, routeEpoch: UInt64? = nil) async {
         if let generation, generation < streamGeneration {
@@ -791,14 +837,9 @@ actor AudioEngine {
                     sampleRate: format.sampleRate
                 )
             }
-            // `ts` is unvalidated wire data; a hostile or buggy server can put it near
-            // the Int64 bounds where the delay adjustment would trap.
-            let delayed = ts.subtractingReportingOverflow(Int64(outputDelayMs) * 1_000)
-            guard !delayed.overflow else {
-                Log.audio.warning("Dropping chunk with an unrepresentable timestamp")
-                return
-            }
-            let adjustedTs = delayed.partialValue
+            // `ts` stays in the server domain for cursor, metadata, and cadence diagnostics.
+            // Output delay is local-domain correction applied only after clock mapping.
+            let localDelayUs = Self.outputDelayMicroseconds(outputDelayMs)
             let frameSize = chunkTimingFormat.map {
                 $0.channels * ($0.effectiveOutputBitDepth / 8)
             } ?? 1
@@ -806,11 +847,18 @@ actor AudioEngine {
             let decodedDurationUs = Int64(
                 (Double(pcm.count / max(1, frameSize)) * 1_000_000.0 / Double(sampleRate)).rounded()
             )
-            let wirePlayTime = await clock.serverTimeToLocal(adjustedTs)
+            let mappedLocalTime = await clock.serverTimeToLocal(ts)
+            guard let wirePlayTime = Self.localPlayTime(
+                mappedLocalTime: mappedLocalTime,
+                outputDelayMicroseconds: localDelayUs
+            ) else {
+                Log.audio.warning("Dropping chunk with an unrepresentable local play time")
+                return
+            }
             let playTime: Int64
             if playbackTimelineTransitionEnabled {
                 let timeline = playbackTimeline.playTime(
-                    wireTimestampUs: adjustedTs,
+                    wireTimestampUs: ts,
                     wirePlayTimeUs: wirePlayTime,
                     decodedDurationUs: max(1, decodedDurationUs)
                 )
@@ -828,7 +876,7 @@ actor AudioEngine {
                     startupReleaseDeferredChunks.append(StartupBufferedChunk(
                         pcmData: pcm,
                         playTimeMicroseconds: playTime,
-                        originalTimestamp: adjustedTs,
+                        originalTimestamp: ts,
                         generation: chunkGeneration
                     ))
                     return
@@ -843,7 +891,7 @@ actor AudioEngine {
                     startupBuffer?.chunks.append(StartupBufferedChunk(
                         pcmData: pcm,
                         playTimeMicroseconds: playTime,
-                        originalTimestamp: adjustedTs,
+                        originalTimestamp: ts,
                         generation: chunkGeneration
                     ))
                     if !startupReleaseInProgress {
@@ -852,13 +900,18 @@ actor AudioEngine {
                 } else {
                     await audioScheduler.schedule(
                         pcm: pcm,
-                        serverTimestamp: adjustedTs,
+                        serverTimestamp: ts,
                         playTimeMicroseconds: playTime,
                         generation: chunkGeneration
                     )
                 }
             } else {
-                await audioScheduler.schedule(pcm: pcm, serverTimestamp: adjustedTs, generation: chunkGeneration)
+                await audioScheduler.schedule(
+                    pcm: pcm,
+                    serverTimestamp: ts,
+                    playTimeMicroseconds: playTime,
+                    generation: chunkGeneration
+                )
             }
         } catch {
             // Per-chunk decode failures are silent; stream-start failures are reported separately.
@@ -891,6 +944,7 @@ actor AudioEngine {
         // Claim the buffer before the first await. This is the single-flight boundary: later
         // chunk arrivals go to `startupReleaseDeferredChunks`, never to a second release.
         startupBuffer = nil
+        var bufferDelayUs = Self.outputDelayMicroseconds(outputDelayMs)
         buffer.chunks.sort { $0.playTimeMicroseconds < $1.playTimeMicroseconds }
         // Releasing into a device that has not begun producing hands PCM to a pipeline that
         // is not consuming. The coordinator waits for the device transition once, then resumes
@@ -911,6 +965,9 @@ actor AudioEngine {
         var currentBuffer = startupBuffer ?? buffer
         currentBuffer.chunks.append(contentsOf: startupReleaseDeferredChunks)
         startupReleaseDeferredChunks.removeAll(keepingCapacity: true)
+        let currentDelayUs = Self.outputDelayMicroseconds(outputDelayMs)
+        Self.rebase(&currentBuffer.chunks, from: bufferDelayUs, to: currentDelayUs)
+        bufferDelayUs = currentDelayUs
         buffer = currentBuffer
         guard startupReleaseInProgress, startupSequence == sequence, !outputHasStarted else {
             let invalidatedLog = "startup release invalidated engine=\(engineID) sequence=\(sequence) invocation=\(invocation) stage=device-probe"
@@ -918,7 +975,7 @@ actor AudioEngine {
             return
         }
 
-        let nowUs = MonotonicClock.absoluteMicroseconds()
+        let nowUs = startupNow()
         let playTimes = buffer.chunks.map(\.playTimeMicroseconds)
         let candidate = Self.releaseSelection(
             playTimes: playTimes,
@@ -1004,6 +1061,8 @@ actor AudioEngine {
         var deferred: [StartupBufferedChunk] = []
 
         do {
+            Self.rebase(&buffer.chunks, from: bufferDelayUs, to: Self.outputDelayMicroseconds(outputDelayMs))
+            bufferDelayUs = Self.outputDelayMicroseconds(outputDelayMs)
             for chunk in buffer.chunks where chunk.playTimeMicroseconds <= releaseHorizon {
                 guard startupReleaseInProgress, startupSequence == sequence else {
                     let invalidatedLog = "startup priming invalidated engine=\(engineID) sequence=\(sequence) invocation=\(invocation) stage=pcm"

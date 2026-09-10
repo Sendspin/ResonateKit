@@ -8,17 +8,22 @@ enum CPaceSessionIdentifier {
     static let handshakeHashLength = 32
     static let counterLength = 4
 
-    static func make(handshakeHash: Data, counter: UInt32) -> Data {
+    static func make(handshakeHash: Data, counter: UInt32, round: UInt32) -> Data {
         precondition(handshakeHash.count == handshakeHashLength)
         var result = Data()
-        result.reserveCapacity(label.count + handshakeHash.count + counterLength)
+        result.reserveCapacity(label.count + handshakeHash.count + counterLength * 2)
         result.append(label)
         result.append(handshakeHash)
-        result.append(UInt8((counter >> 24) & 0xFF))
-        result.append(UInt8((counter >> 16) & 0xFF))
-        result.append(UInt8((counter >> 8) & 0xFF))
-        result.append(UInt8(counter & 0xFF))
+        appendBigEndian(counter, to: &result)
+        appendBigEndian(round, to: &result)
         return result
+    }
+
+    private static func appendBigEndian(_ value: UInt32, to data: inout Data) {
+        data.append(UInt8((value >> 24) & 0xFF))
+        data.append(UInt8((value >> 16) & 0xFF))
+        data.append(UInt8((value >> 8) & 0xFF))
+        data.append(UInt8(value & 0xFF))
     }
 }
 

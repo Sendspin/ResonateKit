@@ -50,6 +50,23 @@ struct SyncCorrectionTests {
     }
 
     @Test
+    func decodedTimelineRebasesLocalDelayOnceAndKeepsWireCadence() {
+        var timeline = AudioChunkPlaybackTimeline()
+        _ = timeline.playTime(wireTimestampUs: 1_000_000, wirePlayTimeUs: 10_000_000, decodedDurationUs: 96_000)
+        _ = timeline.playTime(wireTimestampUs: 1_104_490, wirePlayTimeUs: 10_104_490, decodedDurationUs: 96_000)
+        timeline.rebaseOutputDelay(from: 100_000, to: 350_000)
+        let third = timeline.playTime(
+            wireTimestampUs: 1_200_490,
+            wirePlayTimeUs: 10_200_490 - 250_000,
+            decodedDurationUs: 96_000
+        )
+
+        #expect(third.playTimeUs == 10_192_000 - 250_000)
+        #expect(third.playTimeUs > 10_096_000 - 250_000)
+        #expect(timeline.usesDecodedTimeline)
+    }
+
+    @Test
     func chunkTimingExactCadenceHasNoMismatch() {
         var diagnostics = ChunkTimingDiagnostics()
         diagnostics.record(timestampUs: 1_000_000, decodedFrameCount: 960, sampleRate: 48_000)
@@ -110,6 +127,21 @@ struct SyncCorrectionTests {
         let planner = CorrectionPlanner()
         let schedule = planner.plan(errorMicroseconds: Self.deadbandUs - 1, sampleRate: 48_000, currentlyCorrecting: false)
         #expect(schedule == CorrectionSchedule())
+    }
+
+    @Test
+    func correctionIntervalsStayBoundedAtSupportedSampleRates() {
+        let planner = CorrectionPlanner()
+        for sampleRate in [24_000, 32_000, 44_100, 48_000, 96_000] {
+            let schedule = planner.plan(
+                errorMicroseconds: 100_000,
+                sampleRate: UInt32(sampleRate),
+                currentlyCorrecting: false
+            )
+            #expect(schedule.dropEveryNFrames > 0)
+            let maxInterval = UInt32(Double(sampleRate) / (Double(sampleRate) * CorrectionPlanner.defaultMaxSpeedCorrection))
+            #expect(schedule.dropEveryNFrames >= maxInterval - 1)
+        }
     }
 
     @Test

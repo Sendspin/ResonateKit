@@ -39,6 +39,8 @@ actor NoOpAudioOutput: AudioOutput {
         0
     }
 
+    func setOutputDelayMicroseconds(_: Int64) {}
+
     func startupLeadMicroseconds() -> Int64 {
         0
     }

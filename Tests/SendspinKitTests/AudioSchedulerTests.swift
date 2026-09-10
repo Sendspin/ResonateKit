@@ -38,6 +38,49 @@ struct AudioSchedulerTests {
     }
 
     @Test
+    func schedulerMapsNonzeroOffsetAndDriftDeterministically() async {
+        let clockSync = MockClockSynchronizer(offset: 125_000, drift: 0.002)
+        let scheduler = AudioScheduler(clockSync: clockSync)
+        let serverTimestamp: Int64 = 2_000_000
+
+        await scheduler.schedule(pcm: Data([0x01]), serverTimestamp: serverTimestamp)
+
+        let chunks = await scheduler.queuedChunks
+        let chunk = chunks[0]
+        let expected = Int64((Double(serverTimestamp - 125_000) / 1.002).rounded())
+        #expect(chunk.originalTimestamp == serverTimestamp)
+        #expect(chunk.playTimeMicroseconds == expected)
+    }
+
+    @Test
+    func schedulerRebasesPendingDelayWithoutChangingWireMetadataOrOrder() async {
+        let clockSync = MockClockSynchronizer(offset: 0, drift: 0.0)
+        let scheduler = AudioScheduler(clockSync: clockSync)
+        let first: Int64 = 10_000_000
+        let second: Int64 = 10_100_000
+        await scheduler.schedule(pcm: Data([1]), serverTimestamp: first, playTimeMicroseconds: first)
+        await scheduler.schedule(pcm: Data([2]), serverTimestamp: second, playTimeMicroseconds: second)
+
+        await scheduler.rebaseOutputDelay(from: 100_000, to: 350_000)
+        let rebased = await scheduler.queuedChunks
+
+        #expect(rebased.map(\.originalTimestamp) == [first, second])
+        #expect(rebased.map(\.playTimeMicroseconds) == [first - 250_000, second - 250_000])
+        #expect(rebased[0].playTimeMicroseconds < rebased[1].playTimeMicroseconds)
+    }
+
+    @Test
+    func schedulerRebaseDoesNotShiftAlreadyYieldedChunk() async {
+        let clockSync = MockClockSynchronizer(offset: 0, drift: 0.0)
+        let scheduler = AudioScheduler(clockSync: clockSync)
+        let playTime = MonotonicClock.absoluteMicroseconds()
+        await scheduler.schedule(pcm: Data([1]), serverTimestamp: playTime, playTimeMicroseconds: playTime)
+        await scheduler.checkQueue()
+        await scheduler.rebaseOutputDelay(from: 0, to: 250_000)
+        #expect(await scheduler.queuedChunks.isEmpty)
+    }
+
+    @Test
     func schedulerMaintainsSortedQueue() async {
         let clockSync = MockClockSynchronizer(offset: 0, drift: 0.0)
         let scheduler = AudioScheduler(clockSync: clockSync)
@@ -248,13 +291,15 @@ struct AudioSchedulerTests {
 /// Mock ClockSynchronizer for testing
 actor MockClockSynchronizer: ClockSyncProtocol {
     private let offset: Int64
+    private let drift: Double
 
     var hasSynced: Bool {
         true
     }
 
-    init(offset: Int64, drift _: Double) {
+    init(offset: Int64, drift: Double) {
         self.offset = offset
+        self.drift = drift
     }
 
     func processServerTime(
@@ -265,11 +310,11 @@ actor MockClockSynchronizer: ClockSyncProtocol {
     ) {}
 
     func serverTimeToLocal(_ serverTime: Int64) -> Int64 {
-        serverTime - offset
+        Int64(((Double(serverTime) - Double(offset)) / (1.0 + drift)).rounded())
     }
 
     func localTimeToServer(_ localTime: Int64) -> Int64 {
-        localTime + offset
+        Int64((Double(localTime) * (1.0 + drift)) + Double(offset))
     }
 
     func snapshot() -> TimeFilterSnapshot? {
