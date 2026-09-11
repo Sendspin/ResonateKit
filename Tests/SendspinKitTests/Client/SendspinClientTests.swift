@@ -28,7 +28,7 @@ struct SendspinClientTests {
         )
 
         let payload = client.buildClientHelloPayload(configuration: PairingManagementConfiguration(
-            pairingPsk: .sentinel, pairingPskEnabled: false, recordModePskId: "", unpairedAccessEnabled: true
+            pairingPsk: .sentinel, pairingPskEnabled: false, unpairedAccessEnabled: true
         ))
 
         #expect(payload.supportedRoles == [.metadataV1, .controllerV1])
@@ -48,7 +48,6 @@ struct SendspinClientTests {
         await pairing.runtime.update(PairingManagementConfiguration(
             pairingPsk: configuration.pairingPsk,
             pairingPskEnabled: configuration.pairingPskEnabled,
-            recordModePskId: configuration.recordModePskId,
             unpairedAccessEnabled: configuration.unpairedAccessEnabled,
             dynamicPairingCodeEnabled: configuration.dynamicPairingCodeEnabled,
             staticPairingCodeEnabled: true,
@@ -84,11 +83,10 @@ struct SendspinClientTests {
             [PairMethod.pairingPsk])
 
         let longTermPsk = Psk.generate()
-        try await pairing.store.insert(PairingRecord(psk: longTermPsk, serverId: "server"))
+        try await pairing.store.insertOrReplace(PairingRecord(psk: longTermPsk, serverId: "server"))
         await pairing.runtime.update(PairingManagementConfiguration(
             pairingPsk: pairingPsk,
             pairingPskEnabled: false,
-            recordModePskId: pairing.recordModePskId,
             unpairedAccessEnabled: enabled.unpairedAccessEnabled
         ))
         let disabled = await pairing.runtime.snapshot()
@@ -96,7 +94,7 @@ struct SendspinClientTests {
         #expect(client.buildClientHelloPayload(configuration: disabled)
             .supportedPairMethods.isEmpty)
 
-        let candidates = await PairingCandidateBuilder.candidates(configuration: pairing)
+        let candidates = try await PairingCandidateBuilder.candidates(configuration: pairing)
         #expect(candidates.contains(where: { $0.category == .pairing }) == false)
         #expect(candidates.contains(where: { $0.psk == longTermPsk && $0.category == .longTerm }))
     }
@@ -135,7 +133,7 @@ struct SendspinClientTests {
         )
 
         let payload = client.buildClientHelloPayload(configuration: PairingManagementConfiguration(
-            pairingPsk: .sentinel, pairingPskEnabled: false, recordModePskId: "", unpairedAccessEnabled: true
+            pairingPsk: .sentinel, pairingPskEnabled: false, unpairedAccessEnabled: true
         ))
 
         #expect(payload.supportedRoles == [.colorV1])
@@ -158,7 +156,7 @@ struct SendspinClientTests {
         )
 
         let payload = client.buildClientHelloPayload(configuration: PairingManagementConfiguration(
-            pairingPsk: .sentinel, pairingPskEnabled: false, recordModePskId: "", unpairedAccessEnabled: true
+            pairingPsk: .sentinel, pairingPskEnabled: false, unpairedAccessEnabled: true
         ))
 
         #expect(payload.deviceInfo == deviceInfo)

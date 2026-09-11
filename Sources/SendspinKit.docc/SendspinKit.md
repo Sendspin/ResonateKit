@@ -16,15 +16,16 @@ A client can reuse ``SendspinClient/disconnect(reason:)`` across sessions. When 
 import SendspinKit
 
 let client = try SendspinClient(
-    identity: .generate(),
+    device: SendspinDevice.ephemeral(), // demos and tests; open durable storage in production
     name: "Living Room Speaker",
     roles: [.playerV1],
-    playerConfig: PlayerConfiguration(
+    playerConfig: try PlayerConfiguration(
         bufferCapacity: 1_048_576,
         supportedFormats: [
-            AudioFormatSpec(codec: .opus, channels: 2, sampleRate: 48000, bitDepth: 16)
+            try AudioFormatSpec(codec: .opus, channels: 2, sampleRate: 48000, bitDepth: 16)
         ]
-    )
+    ),
+    access: .allowUnpaired
 )
 
 let discovery = ServerDiscovery()
@@ -48,6 +49,10 @@ for await servers in discovery.servers {
 
 ### Configuration
 
+- ``SendspinDevice``
+- ``KeychainSendspinDeviceStorage``
+- ``PairingPresentation``
+- ``AccessPolicy``
 - ``PlayerConfiguration``
 - ``ArtworkConfiguration``
 - ``AudioFormatSpec``

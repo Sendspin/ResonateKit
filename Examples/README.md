@@ -55,8 +55,10 @@ swift run VisualizerClient --server ws://192.168.1.100:8927/sendspin
 swift run VisualizerClient --discover --timeout 5
 ```
 
-VisualizerClient uses a generated process-local identity. Add `--pairing` for explicit paired-only
-access; persist the displayed pairing token in a real application.
+Example targets run on ephemeral demo devices — identity and pairing state vanish at process exit —
+with `.allowUnpaired` access unless `--pairing` is given. Add `--pairing` for paired-only access
+with display code presentation; a real application persists its device via
+`SendspinDevice.open(storage:)` (for example `KeychainSendspinDeviceStorage`) instead.
 
 ## Requirements
 

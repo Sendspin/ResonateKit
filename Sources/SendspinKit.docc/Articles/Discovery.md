@@ -35,20 +35,22 @@ await discovery.stopDiscovery()
 
 ## Server-initiated connections
 
-``ClientAdvertiser`` publishes a `_sendspin._tcp` service and listens for incoming WebSocket connections:
+The client owns Bonjour advertising, incoming handshakes, and connection arbitration:
 
 ```swift
-let advertiser = ClientAdvertiser(
-    name: "Living Room",
-    port: SendspinDefaults.clientPort
-)
-try await advertiser.start()
-
-for await connection in advertiser.connections {
-    try await client.acceptConnection(connection)
-}
+try await client.startAdvertising(port: SendspinDefaults.clientPort)
+// Returns when the listener is ready, not when a server has connected.
 ```
+
+Observe `client.listenerState` independently from `client.connectionState`. Outgoing connections
+and advertising are mutually exclusive; stop the listener and disconnect admitted sessions
+before switching modes. `ClientAdvertiser` and `acceptConnection(_:)` remain advanced transport hooks.
 
 ## Lifecycle
 
-Both ``ServerDiscovery`` and ``ClientAdvertiser`` are actors with a one-shot lifecycle. Once stopped, they cannot be restarted — create a new instance instead. Attempting to use a stopped instance throws ``TerminatedError``.
+`client.stopAdvertising()` stops new candidates but retains admitted sessions. A subsequent
+`startAdvertising()` creates a fresh listener. `client.disconnect()` retires sessions without
+stopping an active listener; `client.close()` permanently stops both and finishes the client streams.
+
+The lower-level ``ServerDiscovery`` and ``ClientAdvertiser`` actors remain one-shot: create a new
+instance after stopping them.

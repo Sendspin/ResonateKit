@@ -146,14 +146,38 @@ struct PskCandidateTests {
         let pairingPsk = Psk.generate()
         let store = InMemoryPairingRecordStore(pairingPsk: pairingPsk)
         await #expect(throws: PairingRecordStoreError.duplicatePskId) {
-            try await store.insert(PairingRecord(psk: pairingPsk))
+            try await store.insertOrReplace(PairingRecord(psk: pairingPsk))
         }
         let record = PairingRecord(psk: Psk.generate(), serverId: "server")
-        try await store.insert(record)
-        await store.markUsed(pskId: record.pskId)
-        #expect(await (store.listRecords()).first?.used == true)
+        try await store.insertOrReplace(record)
+        try await store.markUsed(pskId: record.pskId)
+        #expect(try await store.listRecords().first?.used == true)
         await #expect(throws: PairingRecordStoreError.duplicatePskId) {
-            try await store.insert(record)
+            try await store.insertOrReplace(PairingRecord(psk: record.psk, serverId: "server-2"))
+        }
+    }
+
+    @Test("Pairing records replace by server and evict only unprotected records")
+    func pairingRecordsReplaceAndEvict() async throws {
+        let records = (0 ..< minimumPairingRecordCapacity).map { PairingRecord(psk: .generate(), serverId: "server-\($0)") }
+        let store = try InMemoryPairingRecordStore(records: records, capacity: minimumPairingRecordCapacity)
+        try await store.insertOrReplace(PairingRecord(psk: .generate(), serverId: "server-2"))
+        let currentAfterReplacement = try await store.listRecords()
+        #expect(currentAfterReplacement.count == 5)
+        var leases: [PairingRecordProtectionLease] = []
+        for record in currentAfterReplacement where record.serverId != "server-0" {
+            try await leases.append(store.acquireProtection(pskId: record.pskId, serverId: record.serverId))
+        }
+        let newest = PairingRecord(psk: .generate(), serverId: "server-new")
+        try await store.insertOrReplace(newest)
+        let current = try await store.listRecords()
+        #expect(!current.contains(where: { $0.serverId == "server-0" }))
+        #expect(current.contains(where: { $0.serverId == "server-new" }))
+        await #expect(throws: PairingRecordStoreError.storageExhausted) {
+            try await store.acquireProtection(pskId: newest.pskId, serverId: newest.serverId)
+        }
+        for lease in leases {
+            try await store.releaseProtection(lease)
         }
     }
 
@@ -239,15 +263,28 @@ private func reserveRound(
 }
 
 private actor FailingDynamicBudgetStore: PairingRecordStore {
-    func listRecords() async -> [PairingRecord] {
+    func listRecords() async throws -> [PairingRecord] {
         []
     }
 
-    func insert(_: PairingRecord) async throws {}
+    func insertOrReplace(_: PairingRecord) async throws {}
 
-    func remove(pskId _: String) async {}
+    func insertOrReplaceAndProtect(_: PairingRecord) async throws -> PairingRecordProtectionLease {
+        throw PairingRecordStoreError.storageExhausted
+    }
 
-    func markUsed(pskId _: String) async {}
+    func remove(pskId _: String) async throws {}
+
+    func markUsed(pskId _: String) async throws {}
+    func storageAccounting() async throws -> PairingStorageAccounting? {
+        nil
+    }
+
+    func acquireProtection(pskId: String, serverId _: String?) async throws -> PairingRecordProtectionLease {
+        PairingRecordProtectionLease(id: UUID(), pskIds: [pskId])
+    }
+
+    func releaseProtection(_: PairingRecordProtectionLease) async throws {}
 
     func dynamicPairingRoundCount() async throws -> UInt32 {
         throw PairingRecordStoreError.storageExhausted

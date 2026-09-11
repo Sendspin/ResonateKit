@@ -298,7 +298,7 @@ struct SpeakerDigitAudioTranscriptTests {
         let hello = try #require(await session.server.clientJSONMessages(ofType: ClientHelloMessage.typeString).last)
         let decodedHello = try JSONDecoder().decode(ClientHelloMessage.self, from: hello)
         let method = try #require(decodedHello.payload.supportedPairMethods[PairMethod.dynamicPairingCode])
-        #expect(method.outChannels == ["display", "speaker"])
+        #expect(method.outChannels == ["speaker"])
         #expect(method.digitAudio == descriptor)
 
         try await activateDigits(session.server)

@@ -63,7 +63,8 @@ extension SendspinClient {
                         configuration: runtimeConfiguration
                     ),
                     supportedRoles: roleSet,
-                    unpairedAccessEnabled: runtimeConfiguration.unpairedAccessEnabled
+                    unpairedAccessEnabled: runtimeConfiguration.unpairedAccessEnabled,
+                    pairingStore: pairingConfiguration?.store
                 ),
                 phaseTimeout: handshakeTimeout
             )

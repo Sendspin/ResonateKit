@@ -9,7 +9,16 @@ public final class SendspinClient {
     // Configuration
     let identity: SendspinIdentity
     let name: String
-    let unpairedAccessEnabled: Bool
+    var unpairedAccessEnabled: Bool
+    @ObservationIgnored var ownedDevice: SendspinDevice?
+    @ObservationIgnored var deviceLease: UUID?
+    @ObservationIgnored var accessPolicyUpdateTask: Task<Void, Error>?
+
+    /// The explicitly selected policy for normal unpaired role access.
+    public var accessPolicy: AccessPolicy {
+        unpairedAccessEnabled ? .allowUnpaired : .pairedOnly
+    }
+
     let roles: [VersionedRole]
     let roleSet: Set<VersionedRole>
     let deviceInfo: DeviceInfo?
@@ -23,7 +32,7 @@ public final class SendspinClient {
     /// ties are resolved as if no last-played server has been remembered.
     let persistenceProvider: (any SendspinPersistenceProvider)?
     /// Pairing PSK and long-term record persistence for Noise sessions.
-    public let pairingConfiguration: PairingConfiguration?
+    let pairingConfiguration: PairingConfiguration?
     /// Resolved volume capabilities (the concrete `VolumeControl` lives in `AudioEngine`).
     let volumeCapabilities: VolumeCapabilities
 
@@ -187,8 +196,23 @@ public final class SendspinClient {
     /// every concurrent API call observes terminal intent immediately.
     private(set) var isTerminated = false
     private var closeTask: Task<Void, Never>?
-    private var pendingTransports: [UUID: any SendspinTransport] = [:]
+    var pendingTransports: [UUID: any SendspinTransport] = [:]
+    var advertisingPendingIDs: Set<UUID> = []
+    var advertisingAccepting = false
     var pairingSetupComplete = false
+
+    // Client-owned advertising. These defaults intentionally avoid initializer plumbing so
+    // device-backed initializers can evolve independently.
+    var advertisingState: AdvertisingState = .stopped
+    var advertiser: (any ClientAdvertising)?
+    var advertisingStartTask: Task<Void, Never>?
+    var advertisingStartWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+    var advertisingStartError: Error?
+    var advertisingIncomingTask: Task<Void, Never>?
+    var outgoingAttemptInProgress = false
+    var advertisingFactoryStorage: @Sendable (String, UInt16, String) -> any ClientAdvertising = { name, port, path in
+        ClientAdvertiser(name: name, port: port, path: path)
+    }
 
     /// Event streams
     private var eventSubscribers: [UUID: AsyncStream<ClientEvent>.Continuation] = [:]
@@ -213,7 +237,7 @@ public final class SendspinClient {
         try VisualizerFrameSubscription(acquiring: visualizerFrameMailbox)
     }
 
-    public convenience init(
+    convenience init(
         identity: SendspinIdentity,
         name: String,
         roles: some Sequence<VersionedRole>,
@@ -347,10 +371,17 @@ public final class SendspinClient {
         // stored property is legal.)
         let conn = connection
         let side = pairingConnection
+        let advertiser = advertiser
+        let device = ownedDevice
+        let lease = deviceLease
         Task {
+            await advertiser?.stop()
             await conn?.shutdown()
             if side !== conn {
                 await side?.shutdown()
+            }
+            if let device, let lease {
+                try? device.release(lease)
             }
         }
     }
@@ -489,12 +520,17 @@ public final class SendspinClient {
         guard connectionState == .disconnected else {
             throw SendspinClientError.alreadyConnected
         }
+        guard advertiser == nil, advertisingState == .stopped, !advertisingAccepting else {
+            throw SendspinClientError.modeConflict
+        }
 
         connectionState = .connecting
         sessionEpoch += 1
         let dialEpoch = sessionEpoch
         await preparePairingConfiguration()
 
+        outgoingAttemptInProgress = true
+        defer { outgoingAttemptInProgress = false }
         let transport = outboundTransportFactory(url)
         let pendingID = registerPendingTransport(transport)
         defer { pendingTransports.removeValue(forKey: pendingID) }
@@ -533,13 +569,17 @@ public final class SendspinClient {
                     candidates: pairingCandidates(),
                     clientHello: hello,
                     supportedRoles: roleSet,
-                    unpairedAccessEnabled: runtimeConfiguration.unpairedAccessEnabled
+                    unpairedAccessEnabled: runtimeConfiguration.unpairedAccessEnabled,
+                    pairingStore: pairingConfiguration?.store
                 ),
                 phaseTimeout: handshakeTimeout
             )
-            try requireOpen()
-            guard sessionEpoch == dialEpoch else {
+            guard !isTerminated, sessionEpoch == dialEpoch else {
+                if let lease = outcome.protectionLease, let store = outcome.pairingStore {
+                    try? await store.releaseProtection(lease)
+                }
                 await transport.disconnect()
+                try requireOpen()
                 throw SendspinClientError.alreadyConnected
             }
             await setupConnection(
@@ -570,8 +610,18 @@ public final class SendspinClient {
     @MainActor
     public func acceptConnection(_ transport: any SendspinTransport) async throws {
         try requireOpen()
+        guard !outgoingAttemptInProgress || connection != nil else {
+            await transport.disconnect()
+            throw SendspinClientError.modeConflict
+        }
         let pendingID = registerPendingTransport(transport)
-        defer { pendingTransports.removeValue(forKey: pendingID) }
+        if advertisingAccepting {
+            advertisingPendingIDs.insert(pendingID)
+        }
+        defer {
+            pendingTransports.removeValue(forKey: pendingID)
+            advertisingPendingIDs.remove(pendingID)
+        }
         if connection == nil {
             if connectionState == .disconnected {
                 connectionState = .connecting
@@ -595,14 +645,17 @@ public final class SendspinClient {
                         candidates: pairingCandidates(),
                         clientHello: hello,
                         supportedRoles: roleSet,
-                        unpairedAccessEnabled: runtimeConfiguration.unpairedAccessEnabled
+                        unpairedAccessEnabled: runtimeConfiguration.unpairedAccessEnabled,
+                        pairingStore: pairingConfiguration?.store
                     ),
                     phaseTimeout: handshakeTimeout
                 )
-                try requireOpen()
-                guard sessionEpoch == acceptEpoch else {
-                    // A disconnect/close or a promoted competitor invalidated this claim.
+                guard !isTerminated, sessionEpoch == acceptEpoch else {
+                    if let lease = outcome.protectionLease, let store = outcome.pairingStore {
+                        try? await store.releaseProtection(lease)
+                    }
                     await transport.disconnect()
+                    try requireOpen()
                     throw SendspinClientError.alreadyConnected
                 }
                 await setupConnection(
@@ -668,13 +721,10 @@ public final class SendspinClient {
         setupEpoch: Int,
         installAsPairingSide: Bool = false
     ) async {
-        guard !isTerminated else {
-            await transport.disconnect()
-            return
-        }
-        // Claim the epoch re-check: an interleaved `disconnect()` or promoted
-        // competitor bumps the epoch; this candidate must not install for it.
-        guard sessionEpoch == setupEpoch else {
+        guard !isTerminated, sessionEpoch == setupEpoch else {
+            if let lease = outcome.protectionLease, let store = outcome.pairingStore {
+                try? await store.releaseProtection(lease)
+            }
             await transport.disconnect()
             return
         }
@@ -695,7 +745,10 @@ public final class SendspinClient {
             if let oldPairingConnection {
                 await oldPairingConnection.shutdown()
             }
-            guard sessionEpoch == setupEpoch else {
+            guard !isTerminated, sessionEpoch == setupEpoch else {
+                if let lease = outcome.protectionLease, let store = outcome.pairingStore {
+                    try? await store.releaseProtection(lease)
+                }
                 await transport.disconnect()
                 return
             }
@@ -743,6 +796,7 @@ public final class SendspinClient {
         let outcomeIdentityPrivateKey = outcome.identityPrivateKey
         let outcomeServerStaticPublicKey = outcome.serverStaticPublicKey
         let outcomeSuite = outcome.suite
+        let outcomeProtectionLease = outcome.protectionLease
         let sessionChannel = outcome.takeChannel()
         #if DEBUG
             let nonceBOverride = nonceBOverride
@@ -763,6 +817,7 @@ public final class SendspinClient {
             pskCategory: outcomeCategory,
             matchedPskId: outcomePskId,
             pairingStore: pairingConfiguration?.store,
+            pairingProtectionLease: outcomeProtectionLease,
             pairingConfigurationRuntime: pairingConfiguration?.runtime,
             pairingAttemptTimeout: pairingAttemptTimeout,
             pairingWindowLifetime: pairingWindowLifetime,
@@ -773,7 +828,7 @@ public final class SendspinClient {
             serverStaticPublicKey: outcomeServerStaticPublicKey,
             suite: outcomeSuite,
             candidateProvider: { [pairingConfiguration] in
-                await PairingCandidateBuilder.candidates(configuration: pairingConfiguration)
+                try await PairingCandidateBuilder.candidates(configuration: pairingConfiguration)
             },
             clientHelloPayload: buildClientHelloPayload(
                 effectivePlayerFormats: negotiation.effectivePlayerFormats,
@@ -966,6 +1021,7 @@ public final class SendspinClient {
         isTerminated = true
         sessionEpoch += 1
         arbitrationInProgress = false
+        await shutdownAdvertising()
         drainConnectionEventsTask?.cancel()
         drainConnectionEventsTask = nil
         sessionValidity?.invalidate()
@@ -1009,6 +1065,11 @@ public final class SendspinClient {
     }
 
     private func finishClose() {
+        if let ownedDevice, let deviceLease {
+            try? ownedDevice.release(deviceLease)
+        }
+        deviceLease = nil
+        ownedDevice = nil
         updateConnectionState(.disconnected)
         resetStreamState()
         resetServerSessionState()

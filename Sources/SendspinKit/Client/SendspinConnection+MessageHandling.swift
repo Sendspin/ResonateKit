@@ -148,8 +148,9 @@ extension SendspinConnection {
     func handleRehandshake(_ message: NoiseHandshakeMessage) async {
         guard !rehandshakeInProgress else { return }
         rehandshakeInProgress = true
+        var candidateLease: PairingRecordProtectionLease?
         do {
-            let candidates = await candidateProvider()
+            let candidates = try await candidateProvider()
             guard let message1 = Base64URL.decode(message.payload.data) else { throw NoiseError.malformedMessage }
             var handshake = NoiseHandshake(
                 suite: suite,
@@ -166,18 +167,49 @@ extension SendspinConnection {
                 pskCategory: inner.pskCategory,
                 serverId: currentServerId ?? ""
             ) else { throw HandshakeError.pskLookupMiss }
-            let message2 = try handshake.writeMessage2(psk: candidate.psk, payload: noiseMessage2Payload)
-            let newTransport = try handshake.makeTransport()
+            let retainsExistingLease = candidate.category == .longTerm
+                && (candidate.psk.pskId == matchedPskId
+                    || pairingProtectionLease?.pskIds.contains(candidate.psk.pskId) == true)
+            if candidate.category == .longTerm, !retainsExistingLease, let pairingStore {
+                candidateLease = try await pairingStore.acquireProtection(
+                    pskId: candidate.psk.pskId,
+                    serverId: candidate.requiredServerId
+                )
+            }
+            let message2: Data
+            do {
+                message2 = try handshake.writeMessage2(psk: candidate.psk, payload: noiseMessage2Payload)
+            } catch {
+                throw error
+            }
+            let newTransport: NoiseTransport
+            do {
+                newTransport = try handshake.makeTransport()
+            } catch {
+                throw error
+            }
             let reply = NoiseHandshakeMessage(
                 payload: NoiseHandshakePayload(data: Base64URL.encode(message2))
             )
             // The gate covers the old-key reply and the synchronous key swap.
             try await sendWrapped(reply, bypassRehandshakeGate: true)
             channel.rekey(to: newTransport)
+            if !retainsExistingLease, let oldLease = pairingProtectionLease, let pairingStore {
+                try? await pairingStore.releaseProtection(oldLease)
+                pairingProtectionLease = nil
+            }
+            pairingProtectionLease = candidateLease
+            candidateLease = nil
             pskCategory = candidate.category
             matchedPskId = candidate.psk.pskId
             if candidate.category == .longTerm, let pairingStore {
-                await pairingStore.markUsed(pskId: candidate.psk.pskId)
+                do {
+                    try await pairingStore.markUsed(pskId: candidate.psk.pskId)
+                } catch {
+                    disconnectReason = .connectionLost(nil)
+                    await transport.disconnect()
+                    return
+                }
             }
             let advertisement = await livePairingAdvertisement()
             sessionContext = ActivationAdmissibility.SessionContext(
@@ -199,6 +231,9 @@ extension SendspinConnection {
                 activities: activities
             )))
         } catch {
+            if let candidateLease, let pairingStore {
+                try? await pairingStore.releaseProtection(candidateLease)
+            }
             rehandshakeInProgress = false
             disconnectReason = .incompatibleServer
             await transport.disconnect()
@@ -223,10 +258,9 @@ extension SendspinConnection {
             methods[PairMethod.pairingPsk] = PairMethodDescriptor(locations: ["operator"])
         }
         if configuration.dynamicPairingCodeEnabled {
-            let speaker = configuration.digitAudio != nil
             methods[PairMethod.dynamicPairingCode] = PairMethodDescriptor(
-                outChannels: speaker ? ["display", "speaker"] : ["display"],
-                formats: ["digits", "qr_code"],
+                outChannels: configuration.outChannels,
+                formats: configuration.formats,
                 digitAudio: configuration.digitAudio
             )
         }
@@ -441,29 +475,9 @@ extension SendspinConnection {
         )
     }
 
-    /// The long-term PSK offered in `client/pair-finalize`. Normally freshly
-    /// generated; when bounded storage cannot fit a new stored-pubkey record,
-    /// the record-mode shared record's PSK is offered instead (spec record mode) —
-    /// that record already exists, so the finalize acknowledgement persists nothing.
-    /// The PSK is committed to the wire before the server's acknowledgement, so
-    /// this choice must happen here, not at persistence time.
+    /// Generate the PSK committed by `client/pair-finalize`.
     private func selectPairingLongTermPsk() async -> Psk {
-        guard let pairingStore,
-              let accounting = await pairingStore.storageAccounting(),
-              let costIndividual = accounting.costIndividual,
-              accounting.free < costIndividual,
-              let runtime = pairingConfigurationRuntime
-        else {
-            return Psk.generate()
-        }
-        let fallbackId = await runtime.snapshot().recordModePskId
-        let records = await pairingStore.listRecords()
-        guard let shared = records.first(where: { $0.pskId == fallbackId && $0.serverId == nil }) else {
-            // Mis-provisioned fallback: offer a fresh PSK; the insert failure
-            // at acknowledgement stays terminal.
-            return Psk.generate()
-        }
-        return shared.psk
+        Psk.generate()
     }
 
     func beginDynamicPairingAttempt(format: String?) async {
@@ -1118,16 +1132,27 @@ extension SendspinConnection {
 
     func handleServerPairFinalize(_: ServerPairFinalizeMessage) async {
         guard let generated = pendingPairingPsk, let pairingStore else { return }
-        let authorizedAttemptID = pairingAttemptID
+        guard let authorizedAttemptID = pairingAttemptID else { return }
         let successSnapshot: PairingAttemptSnapshot? = if let id = pairingAttemptID, let peer = pairingAttemptPeer {
             PairingAttemptSnapshot(id: id, peer: peer, phase: .succeeded, code: nil)
         } else {
             nil
         }
-        let records = await pairingStore.listRecords()
+        let records: [PairingRecord]
+        do {
+            records = try await pairingStore.listRecords()
+        } catch {
+            await failPairingStorage(for: authorizedAttemptID)
+            return
+        }
         guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
         if records.contains(where: { $0.pskId == generated.pskId }) {
-            await pairingStore.markUsed(pskId: generated.pskId)
+            do {
+                try await pairingStore.markUsed(pskId: generated.pskId)
+            } catch {
+                await failPairingStorage(for: authorizedAttemptID)
+                return
+            }
             guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
             clearPairingAttempt()
             if let successSnapshot {
@@ -1136,8 +1161,17 @@ extension SendspinConnection {
             return
         }
         do {
-            try await pairingStore.insert(PairingRecord(psk: generated, serverId: currentServerId))
-            guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else { return }
+            let lease = try await pairingStore.insertOrReplaceAndProtect(
+                PairingRecord(psk: generated, serverId: currentServerId)
+            )
+            guard pairingAttemptID == authorizedAttemptID, pairingAttemptActive else {
+                try? await pairingStore.releaseProtection(lease)
+                return
+            }
+            if let incumbentLease = pairingProtectionLease {
+                try? await pairingStore.releaseProtection(incumbentLease)
+            }
+            pairingProtectionLease = lease
             clearPairingAttempt()
             if let successSnapshot {
                 controlSink.enqueue(.paired(successSnapshot))
@@ -1154,9 +1188,13 @@ extension SendspinConnection {
     func handleServerUnpair(_: ServerUnpairMessage) async {
         guard case .longTerm = pskCategory else { return }
         if let pairingStore {
-            let records = await pairingStore.listRecords()
-            if let record = records.first(where: { $0.psk.pskId == matchedPskId }), record.serverId != nil {
-                await pairingStore.remove(pskId: matchedPskId)
+            do {
+                let records = try await pairingStore.listRecords()
+                if let record = records.first(where: { $0.psk.pskId == matchedPskId }), record.serverId != nil {
+                    try await pairingStore.remove(pskId: matchedPskId)
+                }
+            } catch {
+                Log.client.error("Pairing record removal failed: \(error.localizedDescription)")
             }
         }
         try? await sendWrapped(ClientGoodbyeMessage(payload: GoodbyePayload(reason: .unpaired)))

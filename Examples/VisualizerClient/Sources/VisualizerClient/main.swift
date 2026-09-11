@@ -223,11 +223,12 @@ private final class VisualizerAppModel {
                 discover: options.discover,
                 timeout: .milliseconds(Int(options.timeout * 1_000))
             )
-            let identity = SendspinIdentity.generate()
-            let pairing = options.pairing ? PairingConfiguration(dynamicPairingCodeEnabled: true) : nil
-            if let pairing {
-                let token = PairingToken(clientKey: identity.publicKeyBytes, pairingPsk: pairing.pairingPsk)
-                print("Pairing token (persist this in a real app): \(token.string)")
+            // Ephemeral demo device: identity and pairing state vanish when the process exits.
+            let device = SendspinDevice.ephemeral()
+            let pairing: PairingPresentation = options.pairing ? .display : .tokenOnly
+            if options.pairing {
+                let token = device.makePairingToken()
+                print("Pairing token (a real app pairs from a durable device): \(token.string)")
             }
 
             let visualizer = try VisualizerConfiguration(
@@ -238,12 +239,12 @@ private final class VisualizerAppModel {
             )
             scheduler = VisualizerPresentationScheduler(capacityBytes: visualizer.bufferCapacity)
             let client = try SendspinClient(
-                identity: identity,
+                device: device,
                 name: options.name,
                 roles: [.visualizerV1, .metadataV1],
                 visualizerConfig: visualizer,
-                unpairedAccessEnabled: !options.pairing,
-                pairing: pairing
+                pairing: pairing,
+                access: options.pairing ? .pairedOnly : .allowUnpaired
             )
             let subscription = try client.acquireVisualizerFrames()
             self.client = client

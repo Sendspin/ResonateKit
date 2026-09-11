@@ -199,6 +199,14 @@ extension SendspinConnection {
         pairingAttemptID = nil
         pairingAttemptPeer = nil
         pairingAttemptTask?.cancel()
+        if let lease = pairingProtectionLease {
+            pairingProtectionLease = nil
+            do {
+                try await pairingStore?.releaseProtection(lease)
+            } catch {
+                Log.client.error("Pairing protection release failed: \(error.localizedDescription)")
+            }
+        }
 
         // Stop the engine (async cleanup: close output, finish channels)
         await audioEngine.shutdown()
@@ -221,6 +229,14 @@ extension SendspinConnection {
         lifecycle = .stopped
         validity.invalidate()
         visualizerFrameValidity.invalidate()
+        if let lease = pairingProtectionLease {
+            pairingProtectionLease = nil
+            do {
+                try await pairingStore?.releaseProtection(lease)
+            } catch {
+                Log.client.error("Pairing protection release failed: \(error.localizedDescription)")
+            }
+        }
         if let dataDelivery {
             dataDelivery.clearVisualizer()
         } else {

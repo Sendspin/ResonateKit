@@ -54,6 +54,15 @@ private func staticFixture() throws -> StaticFixture {
     return try JSONDecoder().decode(StaticFixtureResource.self, from: Data(contentsOf: url)).staticTranscript
 }
 
+private func pairingRecords(_ store: any PairingRecordStore) async -> [PairingRecord] {
+    do {
+        return try await store.listRecords()
+    } catch {
+        Issue.record("Pairing record listing failed: \(error)")
+        return []
+    }
+}
+
 private struct StaticTestSession {
     let client: SendspinClient
     let server: MockNoiseServer
@@ -253,7 +262,6 @@ struct StaticPairingWindowTests {
         await runtime.update(PairingManagementConfiguration(
             pairingPsk: pairingPsk,
             pairingPskEnabled: false,
-            recordModePskId: "",
             unpairedAccessEnabled: true,
             staticPairingCodeEnabled: true,
             staticPairingCode: nil
@@ -273,7 +281,6 @@ struct StaticPairingWindowTests {
         await runtime.update(PairingManagementConfiguration(
             pairingPsk: pairingPsk,
             pairingPskEnabled: false,
-            recordModePskId: "",
             unpairedAccessEnabled: true,
             staticPairingCodeEnabled: true,
             staticPairingCode: "12345678"
@@ -343,7 +350,7 @@ struct StaticPairingTranscriptTests {
         _ = try await staticServerTranscript(session, operatorOpen: true)
         try await session.server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
         let serverID = await session.server.serverId
-        #expect(await waitUntil { await session.store.listRecords().contains { $0.serverId == serverID } })
+        #expect(await waitUntil { await pairingRecords(session.store).contains { $0.serverId == serverID } })
         let windowEvents = await observeTask(windowEventsTask, timeout: .seconds(2))
         guard case let .completed(events) = windowEvents else {
             Issue.record("parked static pairing window did not emit open then nil")
@@ -379,7 +386,7 @@ struct StaticPairingTranscriptTests {
         let wrapped = try #require(finalize.payload.wrappedPsk)
         #expect(wrapped.count == Base64URL.encode(dataFromHex(fixture.wrappedPsk)).count)
         #expect(Base64URL.decode(wrapped, count: 48) != nil)
-        #expect(await session.store.listRecords().filter { $0.serverId != nil }.isEmpty)
+        #expect(await pairingRecords(session.store).filter { $0.serverId != nil }.isEmpty)
         let types = await pairingTypes(session.server).filter {
             $0 == ClientPairInitMessage.typeString || $0 == ClientPairAuthMessage.typeString
                 || $0 == ClientPairConfirmMessage.typeString || $0 == ClientPairFinalizeMessage.typeString
@@ -392,7 +399,7 @@ struct StaticPairingTranscriptTests {
         ])
         try await session.server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
         #expect(await waitUntil {
-            let records = await session.store.listRecords()
+            let records = await pairingRecords(session.store)
             let serverId = await session.server.serverId
             return records.contains { $0.serverId == serverId }
         })
@@ -446,7 +453,7 @@ struct StaticPairingTranscriptTests {
         let abort = try JSONDecoder().decode(PairAbortMessage.self, from: abortData)
         #expect(abort.payload.reason == .pairingCodeMismatch)
         #expect(try await store.dynamicPairingRoundCount() == 0)
-        #expect(await store.listRecords().allSatisfy { $0.serverId == nil })
+        #expect(await pairingRecords(store).allSatisfy { $0.serverId == nil })
         #expect(await MainActor.run { session.client.connectionState == .connected })
         await session.client.disconnect()
     }
@@ -484,7 +491,7 @@ struct StaticPairingProtocolErrorTests {
         try await session.server.sendJSON(#"{"type":"server/pair-init","payload":{"nonce_A":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#)
         #expect(await waitUntil { await session.server.disconnectCalled })
         #expect(await session.server.clientJSONMessages(ofType: PairAbortMessage.typeString).isEmpty)
-        #expect(await session.store.listRecords().allSatisfy { $0.serverId == nil })
+        #expect(await pairingRecords(session.store).allSatisfy { $0.serverId == nil })
         #expect(try await session.store.dynamicPairingRoundCount() == 0)
         await session.client.disconnect()
     }
@@ -500,7 +507,7 @@ struct StaticPairingProtocolErrorTests {
             try await session.server.sendJSON(#"{"type":"server/pair-auth","payload":{"pake_msg_1":"\#(share)"}}"#)
             #expect(await waitUntil { await session.server.disconnectCalled })
             #expect(await session.server.clientJSONMessages(ofType: PairAbortMessage.typeString).isEmpty)
-            #expect(await session.store.listRecords().allSatisfy { $0.serverId == nil })
+            #expect(await pairingRecords(session.store).allSatisfy { $0.serverId == nil })
             #expect(try await session.store.dynamicPairingRoundCount() == 0)
             await session.client.disconnect()
         }
@@ -517,7 +524,7 @@ struct PairingCancellationTests {
         _ = try await waitForStaticClientMessage(session.server, type: ClientPairPendingMessage.typeString)
         try await session.server.sendJSON(#"{"type":"server/activate","payload":{"activities":[],"active_roles":[]}}"#)
         #expect(try await session.store.dynamicPairingRoundCount() == 0)
-        #expect(await session.store.listRecords().allSatisfy { $0.serverId == nil })
+        #expect(await pairingRecords(session.store).allSatisfy { $0.serverId == nil })
         await session.client.disconnect()
     }
 
@@ -549,7 +556,7 @@ struct PairingCancellationTests {
         let abort = try JSONDecoder().decode(PairAbortMessage.self, from: abortData)
         #expect(abort.payload.reason == .attemptTimeout)
         #expect(try await session.store.dynamicPairingRoundCount() == 0)
-        #expect(await session.store.listRecords().allSatisfy { $0.serverId == nil })
+        #expect(await pairingRecords(session.store).allSatisfy { $0.serverId == nil })
         await session.client.disconnect()
     }
 }

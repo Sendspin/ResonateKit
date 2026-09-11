@@ -8,14 +8,14 @@ struct SessionFormatNegotiation: Sendable {
 }
 
 enum PairingCandidateBuilder {
-    static func candidates(configuration: PairingConfiguration?) async -> [PskCandidate] {
+    static func candidates(configuration: PairingConfiguration?) async throws -> [PskCandidate] {
         var candidates = [PskCandidate(psk: .sentinel, category: .sentinel)]
         guard let configuration else { return candidates }
         let current = await configuration.runtime.snapshot()
         if current.pairingPskEnabled {
             candidates.append(PskCandidate(psk: current.pairingPsk, category: .pairing))
         }
-        let records = await configuration.store.listRecords()
+        let records = try await configuration.store.listRecords()
         candidates.append(contentsOf: records.map {
             PskCandidate(psk: $0.psk, category: .longTerm, requiredServerId: $0.serverId)
         })
@@ -25,8 +25,8 @@ enum PairingCandidateBuilder {
 
 extension SendspinClient {
     /// Build the live candidate set for one connection attempt.
-    func pairingCandidates() async -> [PskCandidate] {
-        await PairingCandidateBuilder.candidates(configuration: pairingConfiguration)
+    func pairingCandidates() async throws -> [PskCandidate] {
+        try await PairingCandidateBuilder.candidates(configuration: pairingConfiguration)
     }
 
     /// Capture one capability snapshot and derive the player catalog for a session.
@@ -54,12 +54,10 @@ extension SendspinClient {
         )
     }
 
-    /// Prepare pairing storage once per client lifetime.
+    /// Mark pairing configuration as ready for handshake use.
     func preparePairingConfiguration() async {
-        guard !pairingSetupComplete, let configuration = pairingConfiguration else { return }
+        guard !pairingSetupComplete, pairingConfiguration != nil else { return }
         pairingSetupComplete = true
-        await configuration.store.ensurePreProvisionedSharedRecord(configuration.preProvisionedSharedRecord)
-        // Pairing configuration is host-owned and supplied at construction time.
     }
 
     func pairingRuntimeConfiguration() async -> PairingManagementConfiguration {
@@ -67,11 +65,10 @@ extension SendspinClient {
             return PairingManagementConfiguration(
                 pairingPsk: .sentinel,
                 pairingPskEnabled: false,
-                recordModePskId: "",
                 unpairedAccessEnabled: unpairedAccessEnabled,
-                dynamicPairingCodeEnabled: false,
-                staticPairingCodeEnabled: false,
-                staticPairingCode: nil,
+                presentation: nil,
+                outChannels: [],
+                formats: [],
                 digitAudio: nil
             )
         }
@@ -82,12 +79,12 @@ extension SendspinClient {
         return PairingManagementConfiguration(
             pairingPsk: configuration.pairingPsk,
             pairingPskEnabled: configuration.pairingPskEnabled,
-            recordModePskId: configuration.recordModePskId,
             unpairedAccessEnabled: unpairedAccessEnabled,
-            dynamicPairingCodeEnabled: configuration.dynamicPairingCodeEnabled,
-            staticPairingCodeEnabled: configuration.staticPairingCodeEnabled,
-            staticPairingCode: configuration.staticPairingCode,
-            digitAudio: configuration.digitAudio
+            presentation: configuration.pairingPresentation,
+            outChannels: configuration.outChannels,
+            formats: configuration.formats,
+            digitAudio: configuration.digitAudio,
+            staticPairingCode: configuration.staticPairingCode
         )
     }
 
@@ -115,10 +112,9 @@ extension SendspinClient {
                     methods[PairMethod.pairingPsk] = PairMethodDescriptor(locations: ["operator"])
                 }
                 if configuration.dynamicPairingCodeEnabled {
-                    let speaker = configuration.digitAudio != nil
                     methods[PairMethod.dynamicPairingCode] = PairMethodDescriptor(
-                        outChannels: speaker ? ["display", "speaker"] : ["display"],
-                        formats: ["digits", "qr_code"],
+                        outChannels: configuration.outChannels,
+                        formats: configuration.formats,
                         digitAudio: configuration.digitAudio
                     )
                 }

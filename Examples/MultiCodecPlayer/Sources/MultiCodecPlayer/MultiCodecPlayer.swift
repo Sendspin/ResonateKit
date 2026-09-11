@@ -115,12 +115,13 @@ struct MultiCodecPlayer: AsyncParsableCommand {
             supportedFormats: formats
         )
 
-        // 4. Create client with playerV1 role
+        // 4. Create client with playerV1 role — ephemeral demo device, unpaired access
         let client = try SendspinClient(
-            identity: .generate(),
+            device: .ephemeral(),
             name: "MultiCodecPlayer",
             roles: [.playerV1],
-            playerConfig: playerConfig
+            playerConfig: playerConfig,
+            access: .allowUnpaired
         )
 
         // 5. If duration > 0, permanently close after the deadline

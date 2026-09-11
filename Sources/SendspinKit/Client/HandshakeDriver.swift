@@ -11,6 +11,8 @@ enum HandshakeDriver {
         let identityPrivateKey: Curve25519.KeyAgreement.PrivateKey
         let serverName: String
         let matchedCandidate: PskCandidate
+        var protectionLease: PairingRecordProtectionLease?
+        let pairingStore: (any PairingRecordStore)?
         let activities: Set<Activity>
         let activeRoles: Set<VersionedRole>
         let pairing: PairingDirective?
@@ -27,6 +29,44 @@ enum HandshakeDriver {
         let clientHello: ClientHelloPayload
         let supportedRoles: Set<VersionedRole>
         let unpairedAccessEnabled: Bool
+        let pairingStore: (any PairingRecordStore)?
+
+        init(
+            identity: SendspinIdentity,
+            candidates: [PskCandidate],
+            clientHello: ClientHelloPayload,
+            supportedRoles: Set<VersionedRole>,
+            unpairedAccessEnabled: Bool,
+            pairingStore: (any PairingRecordStore)? = nil
+        ) {
+            self.identity = identity
+            self.candidates = candidates
+            self.clientHello = clientHello
+            self.supportedRoles = supportedRoles
+            self.unpairedAccessEnabled = unpairedAccessEnabled
+            self.pairingStore = pairingStore
+        }
+    }
+
+    private static func protectionHooks(
+        for configuration: Configuration
+    ) -> NoiseSessionEstablisher.ProtectionHooks {
+        NoiseSessionEstablisher.ProtectionHooks(
+            onCandidateMatched: { candidate in
+                guard candidate.category == .longTerm else { return nil }
+                guard let pairingStore = configuration.pairingStore else {
+                    throw PairingRecordStoreError.storageUnavailable
+                }
+                return try await pairingStore.acquireProtection(
+                    pskId: candidate.psk.pskId,
+                    serverId: candidate.requiredServerId
+                )
+            },
+            releaseCandidateLease: { lease in
+                guard let pairingStore = configuration.pairingStore else { return }
+                try? await pairingStore.releaseProtection(lease)
+            }
+        )
     }
 
     static func establish(
@@ -34,14 +74,18 @@ enum HandshakeDriver {
         configuration: Configuration,
         phaseTimeout: Duration = NoiseSessionEstablisher.defaultPhaseTimeout
     ) async throws -> Result {
+        var protectionLease: PairingRecordProtectionLease?
         do {
             var outcome = try await NoiseSessionEstablisher.establish(
                 on: transport,
                 identity: configuration.identity,
-                suite: .chaChaPoly,
                 candidates: configuration.candidates,
-                phaseTimeout: phaseTimeout
+                options: NoiseSessionEstablisher.Options(
+                    phaseTimeout: phaseTimeout,
+                    protectionHooks: protectionHooks(for: configuration)
+                )
             )
+            protectionLease = outcome.protectionLease
             let helloData = try await nextJSON(
                 from: transport,
                 channel: &outcome.channel,
@@ -88,6 +132,8 @@ enum HandshakeDriver {
                         identityPrivateKey: configuration.identity.privateKey,
                         serverName: hello.payload.name,
                         matchedCandidate: outcome.matchedCandidate,
+                        protectionLease: protectionLease,
+                        pairingStore: configuration.pairingStore,
                         activities: activities,
                         activeRoles: resolvedRoles,
                         pairing: activate.payload.pairing,
@@ -110,6 +156,9 @@ enum HandshakeDriver {
                 }
             }
         } catch {
+            if let protectionLease, let pairingStore = configuration.pairingStore {
+                try? await pairingStore.releaseProtection(protectionLease)
+            }
             await transport.disconnect()
             throw error
         }
@@ -122,6 +171,9 @@ enum HandshakeDriver {
     ) async {
         let outcome = outcome
         var channel = outcome.channel
+        if let protectionLease = outcome.protectionLease, let pairingStore = outcome.pairingStore {
+            try? await pairingStore.releaseProtection(protectionLease)
+        }
         if outcome.activities == [.pairing], reason == .concurrentAttempt {
             try? await sendJSON(
                 PairAbortMessage(payload: PairAbortPayload(reason: .concurrentAttempt)),

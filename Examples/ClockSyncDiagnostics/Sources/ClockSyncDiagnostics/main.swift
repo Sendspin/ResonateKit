@@ -149,13 +149,13 @@ struct ClockSyncDiagnostics: AsyncParsableCommand {
     func run() async throws {
         let url = try await resolveServerURL(server: server, discover: discover, timeout: timeout)
 
-        // Connect with metadata role only — it's the lightest role that still triggers
-        // the clock sync protocol. The server/hello handshake initiates time exchanges
-        // for all connected clients regardless of role.
+        // Metadata is the lightest role that triggers clock sync; server/hello time exchanges apply to every role.
+        // Use an ephemeral, unpaired device so the diagnostics run against any server.
         let client = try SendspinClient(
-            identity: .generate(),
+            device: .ephemeral(),
             name: "Clock Sync Diagnostics",
-            roles: [.metadataV1]
+            roles: [.metadataV1],
+            access: .allowUnpaired
         )
 
         let state = DashboardState(serverName: url.host ?? url.absoluteString)

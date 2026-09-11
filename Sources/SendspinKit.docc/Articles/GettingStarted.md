@@ -18,13 +18,18 @@ dependencies: [
 
 ## Create a client
 
-A ``SendspinClient`` needs a ``SendspinIdentity``, display name, and at least one role. Players also need a ``PlayerConfiguration`` declaring supported audio formats. Artwork and visualizer roles likewise require their role configuration.
+A ``SendspinClient`` needs a ``SendspinDevice``, display name, at least one role, and an explicit ``AccessPolicy``. Open the device from app-owned storage — ``KeychainSendspinDeviceStorage`` keeps the identity, pairing secret, and per-server pairing records across launches — or use ``SendspinDevice/ephemeral()`` for a deliberately non-persistent demo or test device. Players also need a ``PlayerConfiguration`` declaring supported audio formats. Artwork and visualizer roles likewise require their role configuration.
 
 ```swift
 import SendspinKit
 
+// App-defined namespace; the device snapshot is created on first open and reloaded afterwards.
+let device = try await SendspinDevice.open(
+    storage: try KeychainSendspinDeviceStorage(service: "com.example.app", account: "sendspin-device")
+)
+
 let client = try SendspinClient(
-    identity: .generate(),
+    device: device,
     name: "Kitchen Speaker",
     roles: [.playerV1, .metadataV1],
     playerConfig: try PlayerConfiguration(
@@ -36,7 +41,8 @@ let client = try SendspinClient(
         ],
         requiredLeadTimeMs: 100,
         minBufferMs: 500
-    )
+    ),
+    access: .allowUnpaired // convenient for first-run demos; use .pairedOnly in production
 )
 ```
 
@@ -111,61 +117,50 @@ for await servers in discovery.servers {
 
 ### Server-initiated (advertise and accept)
 
-Use ``ClientAdvertiser`` to publish your client on the network and let servers connect to you:
+Let the client publish its name and manage incoming connections:
 
 ```swift
-let advertiser = ClientAdvertiser(
-    name: "Kitchen Speaker",
-    port: SendspinDefaults.clientPort
-)
-try await advertiser.start()
-
-for await connection in advertiser.connections {
-    try await client.acceptConnection(connection)
-    break
-}
+try await client.startAdvertising(port: SendspinDefaults.clientPort)
 ```
+
+This returns when the listener is ready. `client.listenerState` reports the listener lifecycle;
+`client.connectionState` reports the admitted session. `client.stopAdvertising()` stops new
+candidates without disconnecting admitted sessions. `client.close()` permanently stops both.
+Do not advertise while using an outgoing connection. See <doc:Discovery> for lifecycle details.
 
 ## Listen for events
 
-``SendspinClient`` exposes an ``AsyncStream`` of ``ClientEvent`` values covering the full lifecycle:
+``SendspinClient`` exposes an ``AsyncStream`` of ``ClientEvent`` values covering the full lifecycle.
+Handle the cases your app renders; see <doc:Events> for the complete list.
 
 ```swift
 for await event in client.events() {
-    switch event {
-    case .serverConnected(let info):
+    if case let .serverConnected(info) = event {
         print("Connected to \(info.name)")
-    case .metadataReceived(let metadata):
+    } else if case let .metadataReceived(metadata) = event {
         print("Now playing: \(metadata.title ?? "Unknown")")
-    case .streamStarted(let format):
+    } else if case let .streamStarted(format) = event {
         print("Streaming \(format.codec) at \(format.sampleRate)Hz")
-    case .disconnected(let reason):
+    } else if case let .disconnected(reason) = event {
         print("Disconnected: \(reason)")
-    default:
-        break
     }
 }
 ```
 
 ## Pair with a code
 
-Code-based pairing is coordinated by the host app. Pass a ``PairingConfiguration`` with the
-method enabled, start consuming ``SendspinClient/events``, and retain the complete
-``PairingAttemptSnapshot`` that drives the operator UI:
+Code-based pairing is coordinated by the host app. Declare the presentation your device can actually provide via the client's `pairing` argument (``PairingPresentation``): `.display`, `.digitDisplay`, `.speaker(audio:)`, `.displayAndSpeaker(audio:)`, or `.staticCode` — the default `.tokenOnly` presents no dynamic code. Then start consuming ``SendspinClient/events`` and retain the complete ``PairingAttemptSnapshot`` that drives the operator UI:
 
 ```swift
 for await event in client.events() {
-    switch event {
-    case let .pairingCodeChanged(snapshot):
+    if case let .pairingCodeChanged(snapshot) = event {
         if let code = snapshot.code {
             print("Pairing \(code.format.rawValue): \(code.payload)")
         }
-    case let .pairingAttemptEnded(snapshot):
+    } else if case let .pairingAttemptEnded(snapshot) = event {
         print("Pairing attempt \(snapshot.id.rawValue) ended: \(snapshot.phase)")
-    case let .paired(snapshot):
+    } else if case let .paired(snapshot) = event {
         print("Paired with \(snapshot.peer.name); trust: \(snapshot.peer.trustLevel)")
-    default:
-        break
     }
 }
 ```
@@ -182,11 +177,15 @@ its `expiresAt` is not a trust assertion. The peer ID is unverified while
 codes are six contiguous digits or a complete version-one `SP:1` token. If
 the dynamic method includes a speaker output capability, the code emission also includes a validated
 ``DigitAudioPack``; the host app decodes and plays its clips. Static pairing instead requires the
-host to provision and persist a device-unique eight-digit ASCII decimal code with
-``PairingConfiguration/init(pairingPsk:store:enabled:dynamicPairingCodeEnabled:staticPairingCode:staticPairingCodeEnabled:digitAudio:)``;
-the library never supplies a fixed default or emits that secret. Choose at most one code method in
-``PairingConfiguration``. Dynamic pairing binds device presence, while a leaked static code is
-exposed to man-in-the-middle pairing.
+host to provision a device-unique eight-digit ASCII decimal code when opening the device —
+``SendspinDevice/open(storage:staticCode:capacity:)`` — and to declare `pairing: .staticCode` when
+creating the client; the library never supplies a fixed default or emits that secret. Declare
+exactly one presentation per client. Dynamic pairing binds device presence, while a leaked static
+code is exposed to man-in-the-middle pairing.
+
+The device's setup token is exported only through ``SendspinDevice/makePairingToken()``. Treat the
+returned ``PairingToken`` as a secret: present it from an explicit operator-facing setup flow, and
+never log or transmit it during normal startup.
 
 ## Observe state in SwiftUI
 

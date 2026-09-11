@@ -39,10 +39,12 @@ struct MetadataClient: AsyncParsableCommand {
 
     @MainActor
     private func makeClient() throws -> SendspinClient {
+        // Demo observer: ephemeral device plus unpaired access so it works against any server.
         try SendspinClient(
-            identity: .generate(),
+            device: .ephemeral(),
             name: "Metadata Client",
-            roles: [.metadataV1]
+            roles: [.metadataV1],
+            access: .allowUnpaired
         )
     }
 

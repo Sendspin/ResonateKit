@@ -98,10 +98,12 @@ struct ControllerClient: AsyncParsableCommand {
 
         let url = try await resolveServerURL(server: server, discover: discover, timeout: timeout)
 
+        // Demo controller: ephemeral device plus unpaired access so it works against any server.
         let client = try SendspinClient(
-            identity: .generate(),
+            device: .ephemeral(),
             name: "Controller Client",
-            roles: [.controllerV1, .metadataV1]
+            roles: [.controllerV1, .metadataV1],
+            access: .allowUnpaired
         )
 
         try await client.connect(to: url)

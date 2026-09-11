@@ -3,6 +3,19 @@ import Foundation
 @testable import SendspinKit
 import Testing
 
+private func rehandshakeServerID(_ seed: Int) -> String {
+    Base64URL.encode(Data(repeating: UInt8(seed & 0xFF), count: 32))
+}
+
+private func pairingRecords(_ store: any PairingRecordStore) async -> [PairingRecord] {
+    do {
+        return try await store.listRecords()
+    } catch {
+        Issue.record("Pairing record listing failed: \(error)")
+        return []
+    }
+}
+
 /// The in-band re-handshake against a genuine Noise initiator: key promotion for
 /// pairing, the hard key-swap boundary, and the write gate around the exchange.
 @Suite("In-band re-handshake", .timeLimit(.minutes(1)))
@@ -25,12 +38,14 @@ struct RehandshakeTests {
         activeRoles: [VersionedRole] = [.playerV1],
         seededLongTermPsk: Psk? = nil,
         seededLongTermShared: Bool = false,
+        pairingPsk suppliedPairingPsk: Psk? = nil,
+        serverStaticKey: Curve25519.KeyAgreement.PrivateKey = .init(),
         pairingEnabled: Bool = true,
         initialPsk: Psk = .sentinel,
         store suppliedStore: (any PairingRecordStore)? = nil,
         pairingAttemptTimeout: Duration = .seconds(120)
     ) async throws -> Session {
-        let pairingPsk = Psk.generate()
+        let pairingPsk = suppliedPairingPsk ?? Psk.generate()
         let store: any PairingRecordStore = suppliedStore ?? InMemoryPairingRecordStore(pairingPsk: pairingPsk)
         let playerConfig = try PlayerConfiguration(
             bufferCapacity: 1_024,
@@ -48,9 +63,9 @@ struct RehandshakeTests {
             pairingAttemptTimeout: pairingAttemptTimeout
         )
         let transport = MockTransport()
-        let server = MockNoiseServer(transport: transport, psk: initialPsk)
+        let server = MockNoiseServer(transport: transport, staticKey: serverStaticKey, psk: initialPsk)
         if let seededLongTermPsk {
-            try await store.insert(
+            try await store.insertOrReplace(
                 PairingRecord(psk: seededLongTermPsk, serverId: seededLongTermShared ? nil : server.serverId)
             )
         }
@@ -98,7 +113,6 @@ struct RehandshakeTests {
         await runtime.update(PairingManagementConfiguration(
             pairingPsk: current.pairingPsk,
             pairingPskEnabled: false,
-            recordModePskId: current.recordModePskId,
             unpairedAccessEnabled: current.unpairedAccessEnabled
         ))
 
@@ -117,7 +131,6 @@ struct RehandshakeTests {
         await runtime.update(PairingManagementConfiguration(
             pairingPsk: current.pairingPsk,
             pairingPskEnabled: true,
-            recordModePskId: current.recordModePskId,
             unpairedAccessEnabled: current.unpairedAccessEnabled
         ))
 
@@ -151,16 +164,16 @@ struct RehandshakeTests {
         let finalize = try JSONDecoder().decode(ClientPairFinalizeMessage.self, from: finalizeData)
         let longTermPsk = try #require(Psk(base64URL: finalize.payload.longTermPsk))
 
-        // The shared fallback is present before pairing; the server-bound record waits for acknowledgement.
-        #expect(await session.store.listRecords().allSatisfy { $0.serverId == nil })
+        // The pending pairing PSK is not durable until the server acknowledges finalize.
+        #expect(await pairingRecords(session.store).allSatisfy { $0.serverId == nil })
         try await server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
-        #expect(await waitUntil { await session.store.listRecords().contains { $0.serverId == serverId } })
-        let record = try #require(await session.store.listRecords().first { $0.serverId == serverId })
+        #expect(await waitUntil { await pairingRecords(session.store).contains { $0.serverId == serverId } })
+        let record = try #require(await pairingRecords(session.store).first { $0.serverId == serverId })
         #expect(record.psk == longTermPsk)
 
         // Promotion to the delivered long-term PSK marks the record as used.
         try await rehandshake(server, to: longTermPsk, pskCategory: .longTerm)
-        #expect(await session.store.listRecords().first { $0.serverId == serverId }?.used == true)
+        #expect(await pairingRecords(session.store).first { $0.serverId == serverId }?.used == true)
 
         let timeCountBeforeActivate = await server.clientJSONMessages(ofType: ClientTimeMessage.typeString).count
         try await server.sendActivation(activities: [.playback], activeRoles: [.playerV1])
@@ -248,8 +261,8 @@ struct RehandshakeTests {
         )
         let abort = try #require(await server.clientJSONMessages(ofType: PairAbortMessage.typeString).first)
         #expect(try JSONDecoder().decode(PairAbortMessage.self, from: abort).payload.reason == .attemptTimeout)
-        #expect(await session.store.listRecords().allSatisfy { $0.serverId == nil }, "a timed-out attempt must not persist")
-        #expect(await session.client.connectionState == .connected)
+        #expect(await pairingRecords(session.store).allSatisfy { $0.serverId == nil }, "a timed-out attempt must not persist")
+        #expect(await MainActor.run { session.client.connectionState == .connected })
         await session.client.disconnect()
     }
 
@@ -276,7 +289,7 @@ struct RehandshakeTests {
         #expect(await waitUntil {
             await server.clientJSONMessages(ofType: PairAbortMessage.typeString).count == 1
         })
-        #expect(await session.client.connectionState == .connected)
+        #expect(await MainActor.run { session.client.connectionState == ConnectionState.connected })
         #expect(await session.client.connection?.isRehandshakeInProgress == false)
         await session.client.disconnect()
     }
@@ -462,7 +475,7 @@ struct RehandshakeTests {
         try await server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
 
         #expect(await !waitUntil(timeout: .milliseconds(300)) {
-            await session.store.listRecords().contains { $0.serverId != nil }
+            await pairingRecords(session.store).contains { $0.serverId != nil }
         })
         #expect(await MainActor.run { session.client.connectionState == .connected })
         await session.client.disconnect()
@@ -478,8 +491,7 @@ struct RehandshakeTests {
         let boundServer = bound.server
         try await boundServer.sendJSON(#"{"type":"server/unpair","payload":{}}"#)
         #expect(await waitUntil { await MainActor.run { bound.client.connectionState == .disconnected } })
-        #expect(await bound.store.listRecords().isEmpty == false)
-        #expect(await bound.store.listRecords().allSatisfy { $0.serverId == nil })
+        #expect(await pairingRecords(bound.store).isEmpty)
         let boundGoodbye = try #require(await boundServer.clientJSONMessages(ofType: ClientGoodbyeMessage.typeString).first)
         #expect(try JSONDecoder().decode(ClientGoodbyeMessage.self, from: boundGoodbye).payload.reason == .unpaired)
 
@@ -490,22 +502,23 @@ struct RehandshakeTests {
             initialPsk: sharedPsk
         )
         let sharedServer = shared.server
-        let sharedRecordsBeforeUnpair = await shared.store.listRecords()
+        let sharedRecordsBeforeUnpair = await pairingRecords(shared.store)
         try await sharedServer.sendJSON(#"{"type":"server/unpair","payload":{}}"#)
         #expect(await waitUntil { await MainActor.run { shared.client.connectionState == .disconnected } })
-        #expect(await shared.store.listRecords() == sharedRecordsBeforeUnpair)
-        #expect(await shared.store.listRecords().allSatisfy { $0.serverId == nil })
+        #expect(await pairingRecords(shared.store) == sharedRecordsBeforeUnpair)
+        #expect(await pairingRecords(shared.store).allSatisfy { $0.serverId == nil })
         let sharedGoodbye = try #require(await sharedServer.clientJSONMessages(ofType: ClientGoodbyeMessage.typeString).first)
         #expect(try JSONDecoder().decode(ClientGoodbyeMessage.self, from: sharedGoodbye).payload.reason == .unpaired)
 
         let sentinel = try await makePairableSession()
         let sentinelServer = sentinel.server
+        let unrelatedRecord = PairingRecord(psk: .generate(), serverId: SendspinIdentity.generate().clientId)
+        try await sentinel.store.insertOrReplace(unrelatedRecord)
         try await sentinelServer.sendJSON(#"{"type":"server/unpair","payload":{}}"#)
         #expect(await !waitUntil(timeout: .milliseconds(300)) {
             await MainActor.run { sentinel.client.connectionState == .disconnected }
         })
-        #expect(await sentinel.store.listRecords().isEmpty == false)
-        #expect(await sentinel.store.listRecords().allSatisfy { $0.serverId == nil })
+        #expect(await pairingRecords(sentinel.store) == [unrelatedRecord])
         #expect(await !waitUntil(timeout: .milliseconds(300)) {
             await sentinelServer.clientJSONMessages(ofType: ClientGoodbyeMessage.typeString).count > 0
         })
@@ -532,6 +545,163 @@ struct RehandshakeTests {
         await session.client.disconnect()
     }
 
+    @Test("A live pair-finalize fences eviction until teardown releases its lease")
+    func liveFinalizeFencesEvictionUntilTeardown() async throws {
+        let pairingPsk = Psk.generate()
+        let store = RecordingPairingRecordStore(
+            pairingPsk: pairingPsk,
+            capacity: SendspinDevice.minimumCapacity
+        )
+        let session = try await makePairableSession(
+            pairingPsk: pairingPsk,
+            store: store
+        )
+        let server = session.server
+        let serverId = await server.serverId
+
+        try await rehandshake(server, to: pairingPsk)
+        try await server.sendJSON(
+            #"{"type":"server/activate","payload":{"activities":["pairing"],"active_roles":[],"pairing":{"method":"pairing_psk"}}}"#
+        )
+        #expect(await waitUntil {
+            await server.clientJSONMessages(ofType: ClientPairFinalizeMessage.typeString).count == 1
+        })
+        let finalizeData = try #require(await server.clientJSONMessages(ofType: ClientPairFinalizeMessage.typeString).first)
+        let finalize = try JSONDecoder().decode(ClientPairFinalizeMessage.self, from: finalizeData)
+        let finalizedPsk = try #require(Psk(base64URL: finalize.payload.longTermPsk))
+        try await server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
+        #expect(await waitUntil {
+            await pairingRecords(store).contains { $0.serverId == serverId && $0.psk == finalizedPsk }
+        })
+
+        var otherRecords: [PairingRecord] = []
+        for index in 60 ..< 64 {
+            let record = PairingRecord(psk: .generate(), serverId: rehandshakeServerID(index))
+            otherRecords.append(record)
+            try await store.insertOrReplace(record)
+        }
+        var otherLeases: [PairingRecordProtectionLease] = []
+        for record in otherRecords.dropLast() {
+            try await otherLeases.append(
+                store.acquireProtection(pskId: record.pskId, serverId: record.serverId)
+            )
+        }
+        let firstInsertion = PairingRecord(psk: .generate(), serverId: rehandshakeServerID(70))
+        try await store.insertOrReplace(firstInsertion)
+        let whileConnected = try await store.records()
+        #expect(whileConnected.contains { $0.psk == finalizedPsk })
+        #expect(whileConnected.contains(firstInsertion))
+
+        await session.client.disconnect()
+        #expect(await waitUntil { await store.releaseCount == 1 })
+        let secondInsertion = PairingRecord(psk: .generate(), serverId: rehandshakeServerID(71))
+        try await store.insertOrReplace(secondInsertion)
+        let afterTeardown = try await store.records()
+        #expect(!afterTeardown.contains { $0.psk == finalizedPsk })
+        #expect(afterTeardown.contains(secondInsertion))
+
+        for lease in otherLeases {
+            try await store.releaseProtection(lease)
+        }
+    }
+
+    @Test("A same-session re-handshake succeeds at the protection limit")
+    func rehandshakeRetainsLeaseAtProtectionLimit() async throws {
+        let longTermPsk = Psk.generate()
+        let pairingPsk = Psk.generate()
+        let store = RecordingPairingRecordStore(
+            pairingPsk: pairingPsk,
+            capacity: SendspinDevice.minimumCapacity
+        )
+        let session = try await makePairableSession(
+            seededLongTermPsk: longTermPsk,
+            pairingPsk: pairingPsk,
+            initialPsk: longTermPsk,
+            store: store
+        )
+        var leases: [PairingRecordProtectionLease] = []
+        for index in 0 ..< 3 {
+            let record = PairingRecord(psk: .generate(), serverId: rehandshakeServerID(50 + index))
+            try await store.insertOrReplace(record)
+            try await leases.append(
+                store.acquireProtection(pskId: record.pskId, serverId: record.serverId)
+            )
+        }
+
+        try await rehandshake(session.server, to: longTermPsk, pskCategory: .longTerm)
+        #expect(await MainActor.run { session.client.connectionState == .connected })
+        #expect(await session.server.rehandshakeComplete)
+
+        for lease in leases {
+            try await store.releaseProtection(lease)
+        }
+        await session.client.disconnect()
+    }
+
+    @Test("Live pair-finalize invokes atomic commit for a same-server replacement while incumbent stays live")
+    func liveFinalizeUsesAtomicCommitForSameServerReplacement() async throws {
+        let oldPsk = Psk.generate()
+        let pairingPsk = Psk.generate()
+        let store = RecordingPairingRecordStore(pairingPsk: pairingPsk)
+        let staticKey = Curve25519.KeyAgreement.PrivateKey()
+        let incumbent = try await makePairableSession(
+            seededLongTermPsk: oldPsk,
+            pairingPsk: pairingPsk,
+            serverStaticKey: staticKey,
+            initialPsk: oldPsk,
+            store: store
+        )
+        let serverId = await incumbent.server.serverId
+        let replacement = try await makePairableSession(
+            seededLongTermPsk: oldPsk,
+            pairingPsk: pairingPsk,
+            serverStaticKey: staticKey,
+            initialPsk: .sentinel,
+            store: store
+        )
+        let server = replacement.server
+
+        try await rehandshake(server, to: pairingPsk)
+        try await server.sendJSON(
+            #"{"type":"server/activate","payload":{"activities":["pairing"],"active_roles":[],"pairing":{"method":"pairing_psk"}}}"#
+        )
+        #expect(await waitUntil {
+            await server.clientJSONMessages(ofType: ClientPairFinalizeMessage.typeString).count == 1
+        })
+        let finalizeData = try #require(await server.clientJSONMessages(ofType: ClientPairFinalizeMessage.typeString).first)
+        let finalize = try JSONDecoder().decode(ClientPairFinalizeMessage.self, from: finalizeData)
+        let replacementPsk = try #require(Psk(base64URL: finalize.payload.longTermPsk))
+        try await server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
+
+        #expect(await waitUntil { await store.atomicCommitCount == 1 })
+        #expect(try await store.records() == [PairingRecord(psk: replacementPsk, serverId: serverId)])
+        #expect(replacementPsk != oldPsk)
+        #expect(await MainActor.run { incumbent.client.connectionState == ConnectionState.connected })
+
+        await replacement.client.disconnect()
+        await incumbent.client.disconnect()
+        #expect(await waitUntil { await store.releaseCount >= 2 })
+    }
+
+    @Test("Connection teardown completes when lease release fails")
+    func leaseReleaseFailureDoesNotWedgeTeardown() async throws {
+        let oldPsk = Psk.generate()
+        let store = RecordingPairingRecordStore(pairingPsk: Psk.generate())
+        let session = try await makePairableSession(
+            seededLongTermPsk: oldPsk,
+            initialPsk: oldPsk,
+            store: store
+        )
+        #expect(await store.releaseCount == 0)
+        await store.setFailReleases(true)
+
+        await session.client.disconnect()
+
+        #expect(await waitUntil { await MainActor.run { session.client.connection == nil } })
+        #expect(await session.client.connectionState == .disconnected)
+        #expect(await store.releaseCount == 1)
+    }
+
     @Test("Pairing persistence failure terminates the connection")
     func pairingPersistenceFailureTerminatesConnection() async throws {
         let session = try await makePairableSession(store: ThrowingPairingRecordStore())
@@ -548,60 +718,112 @@ struct RehandshakeTests {
         #expect(await waitUntil { await MainActor.run { session.client.connectionState == .disconnected } })
     }
 
-    @Test("Exhausted storage pairs under the record-mode shared record")
-    func exhaustedStoragePairsUnderSharedFallback() async throws {
-        let store = ExhaustedPairingRecordStore(retainsPreProvisionedRecord: true)
-        let session = try await makePairableSession(store: store)
-        let server = session.server
-        let shared = try #require(await store.records.first { $0.serverId == nil })
+    @Test("Pairing records persist one replacement per server")
+    func pairingRecordsReplaceByServer() async throws {
+        let store = InMemoryPairingRecordStore(capacity: minimumPairingRecordCapacity)
+        let old = PairingRecord(psk: .generate(), serverId: "server")
+        try await store.insertOrReplace(old)
+        let replacement = PairingRecord(psk: .generate(), serverId: "server")
+        try await store.insertOrReplace(replacement)
+        let records = try await store.listRecords()
+        #expect(records.count == 1)
+        #expect(records.first == replacement)
+    }
+}
 
-        try await rehandshake(server, to: session.pairingPsk)
-        try await server.sendJSON(
-            #"{"type":"server/activate","payload":{"activities":["pairing"],"active_roles":[],"pairing":{"method":"pairing_psk"}}}"#
-        )
-        #expect(await waitUntil {
-            await server.clientJSONMessages(ofType: ClientPairFinalizeMessage.typeString).count == 1
-        })
-        let finalizeData = try #require(await server.clientJSONMessages(ofType: ClientPairFinalizeMessage.typeString).first)
-        let finalize = try JSONDecoder().decode(ClientPairFinalizeMessage.self, from: finalizeData)
-        #expect(finalize.payload.longTermPsk == shared.psk.base64URL, "the shared record's PSK must be offered")
+private actor RecordingPairingRecordStore: PairingRecordStore {
+    private let base: InMemoryPairingRecordStore
+    private(set) var atomicCommitCount = 0
+    private(set) var releaseCount = 0
+    private var failReleases = false
 
-        try await server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
-        #expect(await waitUntil { await store.records.first { $0.serverId == nil }?.used == true })
-        #expect(await MainActor.run { session.client.connectionState == .connected })
-        await session.client.disconnect()
+    init(pairingPsk: Psk, capacity: Int = minimumPairingRecordCapacity) {
+        base = InMemoryPairingRecordStore(pairingPsk: pairingPsk, capacity: capacity)
     }
 
-    @Test("Exhausted storage without the fallback record stays terminal")
-    func exhaustedStorageWithoutFallbackRecordStaysTerminal() async throws {
-        let store = ExhaustedPairingRecordStore(retainsPreProvisionedRecord: false)
-        let session = try await makePairableSession(store: store)
-        let server = session.server
+    func listRecords() async throws -> [PairingRecord] {
+        try await base.listRecords()
+    }
 
-        try await rehandshake(server, to: session.pairingPsk)
-        try await server.sendJSON(
-            #"{"type":"server/activate","payload":{"activities":["pairing"],"active_roles":[],"pairing":{"method":"pairing_psk"}}}"#
-        )
-        #expect(await waitUntil {
-            await server.clientJSONMessages(ofType: ClientPairFinalizeMessage.typeString).count == 1
-        })
-        try await server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
-        #expect(await waitUntil { await MainActor.run { session.client.connectionState == .disconnected } })
+    func insertOrReplace(_ record: PairingRecord) async throws {
+        try await base.insertOrReplace(record)
+    }
+
+    func insertOrReplaceAndProtect(_ record: PairingRecord) async throws -> PairingRecordProtectionLease {
+        atomicCommitCount += 1
+        return try await base.insertOrReplaceAndProtect(record)
+    }
+
+    func remove(pskId: String) async throws {
+        try await base.remove(pskId: pskId)
+    }
+
+    func markUsed(pskId: String) async throws {
+        try await base.markUsed(pskId: pskId)
+    }
+
+    func acquireProtection(pskId: String, serverId: String?) async throws -> PairingRecordProtectionLease {
+        try await base.acquireProtection(pskId: pskId, serverId: serverId)
+    }
+
+    func releaseProtection(_ lease: PairingRecordProtectionLease) async throws {
+        releaseCount += 1
+        if failReleases {
+            throw PairingRecordStoreError.storageUnavailable
+        }
+        try await base.releaseProtection(lease)
+    }
+
+    func setFailReleases(_ value: Bool) {
+        failReleases = value
+    }
+
+    func storageAccounting() async throws -> PairingStorageAccounting? {
+        try await base.storageAccounting()
+    }
+
+    func dynamicPairingRoundCount() async throws -> UInt32 {
+        try await base.dynamicPairingRoundCount()
+    }
+
+    func reserveDynamicPairingRound(limit: UInt32) async throws -> DynamicPairingRoundReservation {
+        try await base.reserveDynamicPairingRound(limit: limit)
+    }
+
+    func resetDynamicPairingBudget() async throws {
+        try await base.resetDynamicPairingBudget()
+    }
+
+    func records() async throws -> [PairingRecord] {
+        try await base.listRecords()
     }
 }
 
 private actor ThrowingPairingRecordStore: PairingRecordStore {
-    func listRecords() async -> [PairingRecord] {
+    func listRecords() async throws -> [PairingRecord] {
         []
     }
 
-    func insert(_: PairingRecord) async throws {
+    func insertOrReplace(_: PairingRecord) async throws {
         throw PairingRecordStoreError.duplicatePskId
     }
 
-    func remove(pskId _: String) async {}
+    func insertOrReplaceAndProtect(_: PairingRecord) async throws -> PairingRecordProtectionLease {
+        throw PairingRecordStoreError.duplicatePskId
+    }
 
-    func markUsed(pskId _: String) async {}
+    func remove(pskId _: String) async throws {}
+
+    func markUsed(pskId _: String) async throws {}
+    func storageAccounting() async throws -> PairingStorageAccounting? {
+        nil
+    }
+
+    func acquireProtection(pskId: String, serverId _: String?) async throws -> PairingRecordProtectionLease {
+        PairingRecordProtectionLease(id: UUID(), pskIds: [pskId])
+    }
+
+    func releaseProtection(_: PairingRecordProtectionLease) async throws {}
 
     func dynamicPairingRoundCount() async throws -> UInt32 {
         0
@@ -612,57 +834,4 @@ private actor ThrowingPairingRecordStore: PairingRecordStore {
     }
 
     func resetDynamicPairingBudget() async throws {}
-}
-
-/// A bounded store whose free space cannot fit a stored-pubkey record. The
-/// pre-provisioned shared record is retained (or dropped, for the defensive
-/// path) so pairing must go through the record-mode fallback.
-private actor ExhaustedPairingRecordStore: PairingRecordStore {
-    private(set) var records: [PairingRecord] = []
-    private var rounds: UInt32 = 0
-    private let retainsPreProvisionedRecord: Bool
-
-    init(retainsPreProvisionedRecord: Bool) {
-        self.retainsPreProvisionedRecord = retainsPreProvisionedRecord
-    }
-
-    func listRecords() async -> [PairingRecord] {
-        records
-    }
-
-    func insert(_: PairingRecord) async throws {
-        throw PairingRecordStoreError.storageExhausted
-    }
-
-    func remove(pskId: String) async {
-        records.removeAll { $0.pskId == pskId }
-    }
-
-    func markUsed(pskId: String) async {
-        guard let index = records.firstIndex(where: { $0.pskId == pskId }) else { return }
-        records[index].used = true
-    }
-
-    func ensurePreProvisionedSharedRecord(_ record: PairingRecord) async {
-        guard retainsPreProvisionedRecord, !records.contains(where: { $0.pskId == record.pskId }) else { return }
-        records.append(record)
-    }
-
-    func storageAccounting() async -> PairingStorageAccounting? {
-        PairingStorageAccounting(free: 0, capacity: 10, costIndividual: 1, costShared: 1)
-    }
-
-    func dynamicPairingRoundCount() async throws -> UInt32 {
-        rounds
-    }
-
-    func reserveDynamicPairingRound(limit: UInt32) async throws -> DynamicPairingRoundReservation {
-        guard rounds < limit else { return .exhausted }
-        rounds += 1
-        return .reserved(round: rounds, remaining: limit - rounds)
-    }
-
-    func resetDynamicPairingBudget() async throws {
-        rounds = 0
-    }
 }

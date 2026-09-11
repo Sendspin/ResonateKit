@@ -54,6 +54,15 @@ private func dynamicFixture() throws -> DynamicFixture {
     return try JSONDecoder().decode(DynamicFixtureResource.self, from: Data(contentsOf: url)).dynamicTranscript
 }
 
+private func pairingRecords(_ store: any PairingRecordStore) async -> [PairingRecord] {
+    do {
+        return try await store.listRecords()
+    } catch {
+        Issue.record("Pairing record listing failed: \(error)")
+        return []
+    }
+}
+
 private struct DynamicTestSession {
     let client: SendspinClient
     let server: MockNoiseServer
@@ -321,7 +330,7 @@ struct DynamicPairingTranscriptTests {
         #expect(emission.payload == "268386")
         let confirms = try await waitForClientMessage(session.server, type: ClientPairConfirmMessage.typeString)
         let finalize = try await waitForClientMessage(session.server, type: ClientPairFinalizeMessage.typeString)
-        #expect(await session.store.listRecords().filter { $0.serverId != nil }.isEmpty)
+        #expect(await pairingRecords(session.store).filter { $0.serverId != nil }.isEmpty)
         let confirmJSON = try #require(String(data: confirms, encoding: .utf8))
         #expect(confirmJSON.contains(#""wrapped_nonce_B":"#))
         #expect(!confirmJSON.contains("wrapped_nonce__b"))
@@ -352,8 +361,8 @@ struct DynamicPairingTranscriptTests {
         #expect(wrappedPsk.count == Base64URL.encode(dataFromHex(fixture.wrappedPsk)).count)
         #expect(final.payload.longTermPsk.isEmpty)
         try await session.server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
-        #expect(await waitUntil { await session.store.listRecords().filter { $0.serverId != nil }.count == 1 })
-        #expect(await session.store.listRecords().filter { $0.serverId != nil }.count == 1)
+        #expect(await waitUntil { await pairingRecords(session.store).filter { $0.serverId != nil }.count == 1 })
+        #expect(await pairingRecords(session.store).filter { $0.serverId != nil }.count == 1)
         #expect(await collectClientEvent(from: session.events) {
             if case let .pairingCodeChanged(snapshot) = $0 {
                 return snapshot.code == nil
@@ -390,7 +399,7 @@ struct DynamicPairingTranscriptTests {
         #expect(finalize.isEmpty == false)
         try await session.server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
         let serverID = await session.server.serverId
-        #expect(await waitUntil { await session.store.listRecords().contains { $0.serverId == serverID } })
+        #expect(await waitUntil { await pairingRecords(session.store).contains { $0.serverId == serverID } })
         let windowEvents = await observeTask(windowEventsTask, timeout: .seconds(2))
         guard case let .completed(events) = windowEvents else {
             Issue.record("parked dynamic pairing window did not emit open then nil")
@@ -428,7 +437,7 @@ struct DynamicPairingTranscriptTests {
         let session = try await makeDynamicTestSession()
         _ = try await dynamicServerTranscript(session, badServerConfirmation: true)
         _ = try await waitForClientMessage(session.server, type: ClientPairRetryMessage.typeString)
-        #expect(await session.store.listRecords().allSatisfy { $0.serverId == nil })
+        #expect(await pairingRecords(session.store).allSatisfy { $0.serverId == nil })
         #expect(await MainActor.run { session.client.connectionState == .connected })
         #expect(await collectClientEvent(from: session.events, timeout: .milliseconds(100)) {
             if case .pairingAttemptEnded = $0 {
@@ -497,7 +506,7 @@ struct DynamicPairingTranscriptTests {
         _ = try await waitForClientMessage(session.server, type: ClientPairFinalizeMessage.typeString, count: 1)
         #expect(try await session.store.dynamicPairingRoundCount() == 0)
         try await session.server.sendJSON(#"{"type":"server/pair-finalize","payload":{}}"#)
-        #expect(await waitUntil { await session.store.listRecords().contains { $0.serverId != nil } })
+        #expect(await waitUntil { await pairingRecords(session.store).contains { $0.serverId != nil } })
         await session.client.disconnect()
     }
 
@@ -744,16 +753,29 @@ private actor FinalFenceStore: PairingRecordStore {
         reserveMode = reserve
     }
 
-    func listRecords() async -> [PairingRecord] {
+    func listRecords() async throws -> [PairingRecord] {
         []
     }
 
-    func insert(_: PairingRecord) async throws {
+    func insertOrReplace(_: PairingRecord) async throws {
         throw PairingRecordStoreError.storageExhausted
     }
 
-    func remove(pskId _: String) async {}
-    func markUsed(pskId _: String) async {}
+    func insertOrReplaceAndProtect(_: PairingRecord) async throws -> PairingRecordProtectionLease {
+        throw PairingRecordStoreError.storageExhausted
+    }
+
+    func remove(pskId _: String) async throws {}
+    func markUsed(pskId _: String) async throws {}
+    func storageAccounting() async throws -> PairingStorageAccounting? {
+        nil
+    }
+
+    func acquireProtection(pskId: String, serverId _: String?) async throws -> PairingRecordProtectionLease {
+        PairingRecordProtectionLease(id: UUID(), pskIds: [pskId])
+    }
+
+    func releaseProtection(_: PairingRecordProtectionLease) async throws {}
     func dynamicPairingRoundCount() async throws -> UInt32 {
         rounds
     }
@@ -797,7 +819,7 @@ struct DynamicPairingProtocolErrorTests {
         try await session.server.sendJSON(#"{"type":"server/pair-init","payload":{"nonce_A":"AA"}}"#)
         #expect(await waitUntil { await session.server.disconnectCalled })
         #expect(await session.server.clientJSONMessages(ofType: PairAbortMessage.typeString).isEmpty)
-        #expect(await session.store.listRecords().allSatisfy { $0.serverId == nil })
+        #expect(await pairingRecords(session.store).allSatisfy { $0.serverId == nil })
         await session.client.disconnect()
     }
 
@@ -839,7 +861,7 @@ struct DynamicPairingTimeoutTests {
             }
             return false
         } != nil)
-        #expect(await session.store.listRecords().allSatisfy { $0.serverId == nil })
+        #expect(await pairingRecords(session.store).allSatisfy { $0.serverId == nil })
         await session.client.disconnect()
     }
 

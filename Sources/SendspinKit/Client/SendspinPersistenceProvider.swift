@@ -1,39 +1,15 @@
 import Foundation
 
-/// Storage hook for the spec's "last played server" bookkeeping.
-///
-/// The Sendspin multi-server rules require a client to *persistently* remember the
-/// `server_id` of the server that most recently had `playback_state: playing`. When
-/// two servers compete and both connect with `connection_reason: discovery`, the
-/// client breaks the tie in favor of that remembered server.
-///
-/// ``SendspinClient`` calls ``saveLastPlayedServerId(_:)`` whenever a `group/update`
-/// reports that playback has started, and ``loadLastPlayedServerId()`` when it needs
-/// the stored value for arbitration. Back it with whatever storage is appropriate —
-/// `UserDefaults`, a file, the keychain, etc.
-///
-/// If no provider is supplied to ``SendspinClient/init(identity:name:roles:deviceInfo:playerConfig:artworkConfig:persistenceProvider:)``,
-/// SendspinKit performs no implicit persistence and treats the last-played value as
-/// absent during multi-server arbitration. Host apps that need the spec's persisted
-/// last-played tiebreak should provide an implementation explicitly.
-///
-/// Methods are `async` so implementations may perform I/O off the main actor, and the
-/// protocol is `Sendable` because the provider is shared across concurrency domains.
+/// Host persistence for the last server that entered playback.
 public protocol SendspinPersistenceProvider: Sendable {
-    /// The persisted last-played `server_id`, or `nil` if none has been stored yet.
     func loadLastPlayedServerId() async -> String?
-
-    /// Persist `serverId` as the most recently playing server.
     func saveLastPlayedServerId(_ serverId: String) async
 }
 
-/// A long-term Sendspin PSK record.
+/// A long-term PSK record bound to one server when `serverId` is non-nil.
 public struct PairingRecord: Sendable, Equatable, Hashable {
-    /// The PSK used by the record.
     public let psk: Psk
-    /// The server identity for stored-pubkey records, or `nil` for shared PSKs.
     public let serverId: String?
-    /// Whether this record has authenticated at least one session.
     public var used: Bool
 
     public init(psk: Psk, serverId: String? = nil, used: Bool = false) {
@@ -42,20 +18,19 @@ public struct PairingRecord: Sendable, Equatable, Hashable {
         self.used = used
     }
 
-    /// The identifier carried in Noise message 1.
     public var pskId: String {
         psk.pskId
     }
 }
 
-/// Storage accounting for long-term pairing records.
-public struct PairingStorageAccounting: Sendable, Equatable {
-    public let free: Int
-    public let capacity: Int?
-    public let costIndividual: Int?
-    public let costShared: Int?
+/// Compatibility diagnostic retained for internal fixtures; storage policy is store-owned.
+struct PairingStorageAccounting: Sendable, Equatable {
+    let free: Int
+    let capacity: Int?
+    let costIndividual: Int?
+    let costShared: Int?
 
-    public init(free: Int, capacity: Int? = nil, costIndividual: Int? = nil, costShared: Int? = nil) {
+    init(free: Int, capacity: Int? = nil, costIndividual: Int? = nil, costShared: Int? = nil) {
         self.free = free
         self.capacity = capacity
         self.costIndividual = costIndividual
@@ -63,41 +38,55 @@ public struct PairingStorageAccounting: Sendable, Equatable {
     }
 }
 
-/// Maximum dynamic pairing rounds allowed globally since the last verified confirmation or operator reset.
 let dynamicPairingRoundLimit: UInt32 = 20
+let minimumPairingRecordCapacity = 5
 
-/// Host-local pairing settings shared by handshake candidates and active sessions.
-public struct PairingManagementConfiguration: Sendable, Equatable {
-    public let pairingPsk: Psk
-    public let pairingPskEnabled: Bool
-    public let dynamicPairingCodeEnabled: Bool
-    public let staticPairingCodeEnabled: Bool
-    public let staticPairingCode: String?
-    public let recordModePskId: String
-    public let unpairedAccessEnabled: Bool
-    /// Optional speaker playback format requested for dynamic digit pairing.
-    public let digitAudio: DigitAudioDescriptor?
+/// Presentation capabilities shared by candidate handshakes and live sessions.
+struct PairingManagementConfiguration: Sendable, Equatable {
+    let pairingPsk: Psk
+    let pairingPskEnabled: Bool
+    let unpairedAccessEnabled: Bool
+    let pairingPresentation: PairingPresentation?
+    let outChannels: [String]
+    let formats: [String]
+    let digitAudio: DigitAudioDescriptor?
 
-    public init(
+    // Kept for internal fixture migration. New callers should use `presentation`.
+    let dynamicPairingCodeEnabled: Bool
+    let staticPairingCodeEnabled: Bool
+    let staticPairingCode: String?
+
+    init(
         pairingPsk: Psk,
         pairingPskEnabled: Bool,
-        recordModePskId: String,
         unpairedAccessEnabled: Bool,
+        presentation: PairingPresentation? = nil,
+        outChannels: [String]? = nil,
+        formats: [String]? = nil,
+        digitAudio: DigitAudioDescriptor? = nil,
         dynamicPairingCodeEnabled: Bool = false,
         staticPairingCodeEnabled: Bool = false,
-        staticPairingCode: String? = nil,
-        digitAudio: DigitAudioDescriptor? = nil
+        staticPairingCode: String? = nil
     ) {
         precondition(staticPairingCode.map(Self.isValidStaticPairingCode) ?? true)
         precondition(!(dynamicPairingCodeEnabled && staticPairingCodeEnabled), "Advertise at most one pairing-code method")
+        let resolvedPresentation = presentation ?? Self.legacyPresentation(
+            dynamicEnabled: dynamicPairingCodeEnabled,
+            staticEnabled: staticPairingCodeEnabled,
+            digitAudio: digitAudio
+        )
         self.pairingPsk = pairingPsk
         self.pairingPskEnabled = pairingPskEnabled
-        self.dynamicPairingCodeEnabled = dynamicPairingCodeEnabled
-        self.staticPairingCodeEnabled = staticPairingCodeEnabled
-        self.staticPairingCode = staticPairingCode
-        self.recordModePskId = recordModePskId
         self.unpairedAccessEnabled = unpairedAccessEnabled
-        self.digitAudio = digitAudio
+        pairingPresentation = resolvedPresentation
+        self.outChannels = outChannels ?? resolvedPresentation?.outChannels ?? []
+        self.formats = formats ?? resolvedPresentation?.formats ?? []
+        self.digitAudio = digitAudio ?? resolvedPresentation?.digitAudio
+        let resolvedDynamicPairingCodeEnabled = dynamicPairingCodeEnabled || resolvedPresentation?.usesDynamicCode == true
+        let resolvedStaticPairingCodeEnabled = staticPairingCodeEnabled || resolvedPresentation == .staticCode
+        self.dynamicPairingCodeEnabled = resolvedDynamicPairingCodeEnabled
+        self.staticPairingCodeEnabled = resolvedStaticPairingCodeEnabled
+        self.staticPairingCode = staticPairingCode
     }
 
     var staticPairingCodeIsAdvertised: Bool {
@@ -108,186 +97,254 @@ public struct PairingManagementConfiguration: Sendable, Equatable {
         let bytes = Array(code.utf8)
         return bytes.count == 8 && bytes.allSatisfy { (48 ... 57).contains($0) }
     }
+
+    private static func legacyPresentation(
+        dynamicEnabled: Bool,
+        staticEnabled: Bool,
+        digitAudio: DigitAudioDescriptor?
+    ) -> PairingPresentation? {
+        if staticEnabled {
+            return .staticCode
+        }
+        guard dynamicEnabled else { return nil }
+        return digitAudio.map { .speaker(audio: $0) } ?? .display
+    }
 }
 
-/// Shared mutable state used by handshake candidates and active sessions.
-public actor PairingConfigurationRuntime {
+/// Shared mutable pairing settings. The facade remains the policy owner.
+actor PairingConfigurationRuntime {
     private var configuration: PairingManagementConfiguration
 
-    public init(configuration: PairingManagementConfiguration) {
+    init(configuration: PairingManagementConfiguration) {
         self.configuration = configuration
     }
 
-    public func snapshot() -> PairingManagementConfiguration {
+    func snapshot() -> PairingManagementConfiguration {
         configuration
     }
 
-    public func update(_ configuration: PairingManagementConfiguration) {
+    func update(_ configuration: PairingManagementConfiguration) {
         self.configuration = configuration
     }
 }
 
-/// The result of an atomic dynamic pairing round reservation.
 public enum DynamicPairingRoundReservation: Sendable, Equatable {
-    /// The round is durably reserved and may proceed. `round` starts at one.
     case reserved(round: UInt32, remaining: UInt32)
-    /// The persisted budget has no rounds remaining.
     case exhausted
 }
 
-/// Persistence for long-term pairing records. Applications provide a Keychain,
-/// file, or database implementation when records must survive process restarts.
-/// The store is the host app's durability boundary: mutating operations must be
-/// serialized with one another and complete durably before they return. This prevents
-/// a successful pairing from being lost while a new handshake is already using the
-/// changed record set.
-public protocol PairingRecordStore: Sendable {
-    /// Return all configured records in a stable implementation-defined order.
-    func listRecords() async -> [PairingRecord]
+/// Opaque, one-shot protection held while a PSK is being authenticated or used.
+struct PairingRecordProtectionLease: Sendable, Equatable, Hashable {
+    let id: UUID
+    let pskIds: Set<String>
+}
 
-    /// Insert a record, rejecting `psk_id` collisions across all categories.
-    func insert(_ record: PairingRecord) async throws
-
-    /// Remove a record by its `psk_id`; missing records are ignored.
-    func remove(pskId: String) async
-
-    /// Mark a record as used after successful Noise authentication.
-    func markUsed(pskId: String) async
-
-    /// Ensure the generated shared fallback record exists in the provider.
-    /// Implementations insert it only when its `psk_id` is absent; repeated calls
-    /// never create duplicates.
-    func ensurePreProvisionedSharedRecord(_ record: PairingRecord) async
-
-    /// Return storage accounting, or nil when the store is unbounded or unknown.
-    func storageAccounting() async -> PairingStorageAccounting?
-
-    /// Return the global number of dynamic pairing rounds since the last verified key confirmation.
-    /// This is diagnostic only; admission must use ``reserveDynamicPairingRound(limit:)``.
+/// Durable record storage and atomic protection coordination.
+protocol PairingRecordStore: Sendable {
+    func listRecords() async throws -> [PairingRecord]
+    func insertOrReplace(_ record: PairingRecord) async throws
+    func insertOrReplaceAndProtect(_ record: PairingRecord) async throws -> PairingRecordProtectionLease
+    func remove(pskId: String) async throws
+    func markUsed(pskId: String) async throws
+    func acquireProtection(pskId: String, serverId: String?) async throws -> PairingRecordProtectionLease
+    func releaseProtection(_ lease: PairingRecordProtectionLease) async throws
+    func storageAccounting() async throws -> PairingStorageAccounting?
     func dynamicPairingRoundCount() async throws -> UInt32
-
-    /// Atomically reserve the next dynamic pairing round, persisting the reservation before returning.
-    /// The limit is global across servers and addresses. A reservation is never returned above it.
     func reserveDynamicPairingRound(limit: UInt32) async throws -> DynamicPairingRoundReservation
-
-    /// Reset the global dynamic pairing budget after verified confirmation or operator action.
     func resetDynamicPairingBudget() async throws
 }
 
-public extension PairingRecordStore {
-    func ensurePreProvisionedSharedRecord(_: PairingRecord) async {}
-
-    func storageAccounting() async -> PairingStorageAccounting? {
-        nil
-    }
-}
-
-/// Errors raised while configuring pairing records.
-public enum PairingRecordStoreError: Error, Sendable, Equatable {
-    /// The PSK identifier is already occupied by another category or record.
+enum PairingRecordStoreError: Error, Sendable, Equatable {
     case duplicatePskId
-    /// The backing store cannot persist another entry or setting.
+    case duplicateServerId
     case storageExhausted
+    case recordProtected
+    case unknownProtectionLease
+    case pskLookupMiss
+    case storageUnavailable
+    case invalidCapacity
 }
 
-/// A non-persistent pairing store suitable for clients and tests that do not
-/// provide an application persistence implementation.
-public actor InMemoryPairingRecordStore: PairingRecordStore {
+/// In-memory store for explicit ephemeral clients and test fixtures.
+actor InMemoryPairingRecordStore: PairingRecordStore {
     private var records: [PairingRecord]
     private var dynamicPairingRoundCount: UInt32 = 0
     private let reservedPskIds: Set<String>
+    private let capacity: Int
+    private var protections: [UUID: Set<String>] = [:]
 
-    public init(pairingPsk: Psk? = nil, preProvisionedRecord: PairingRecord? = nil) {
+    init(pairingPsk: Psk? = nil, preProvisionedRecord: PairingRecord? = nil, capacity: Int = 16) {
+        precondition(capacity >= minimumPairingRecordCapacity)
         var reserved = Set([Psk.sentinel.pskId])
         if let pairingPsk {
             reserved.insert(pairingPsk.pskId)
         }
         reservedPskIds = reserved
+        self.capacity = capacity
         records = preProvisionedRecord.map { [$0] } ?? []
     }
 
-    public init(records: [PairingRecord], pairingPsk: Psk? = nil) throws {
+    init(records: [PairingRecord], pairingPsk: Psk? = nil, capacity: Int = 16) throws {
+        guard capacity >= minimumPairingRecordCapacity else { throw PairingRecordStoreError.invalidCapacity }
         var reserved = Set([Psk.sentinel.pskId])
         if let pairingPsk {
             reserved.insert(pairingPsk.pskId)
         }
-        var seen = reserved
-        for record in records where seen.insert(record.pskId).inserted == false {
-            throw PairingRecordStoreError.duplicatePskId
+        var seenPskIds = reserved
+        var seenServerIds = Set<String>()
+        for record in records {
+            guard seenPskIds.insert(record.pskId).inserted else { throw PairingRecordStoreError.duplicatePskId }
+            if let serverId = record.serverId, !seenServerIds.insert(serverId).inserted {
+                throw PairingRecordStoreError.duplicateServerId
+            }
         }
         reservedPskIds = reserved
+        self.capacity = capacity
         self.records = records
     }
 
-    public func listRecords() async -> [PairingRecord] {
+    func listRecords() async throws -> [PairingRecord] {
         records
     }
 
-    public func insert(_ record: PairingRecord) async throws {
-        guard !reservedPskIds.contains(record.pskId), !records.contains(where: { $0.pskId == record.pskId }) else {
-            throw PairingRecordStoreError.duplicatePskId
+    func insertOrReplace(_ record: PairingRecord) async throws {
+        try insertOrReplaceImpl(record)
+    }
+
+    func insertOrReplaceAndProtect(_ record: PairingRecord) async throws -> PairingRecordProtectionLease {
+        let previousRecords = records
+        let replacesServerRecord = record.serverId.map { serverId in
+            records.contains { $0.serverId == serverId }
+        } ?? false
+        do {
+            try insertOrReplaceImpl(record)
+            return try acquireProtectionImpl(
+                pskId: record.pskId,
+                serverId: record.serverId,
+                allowFullProtection: replacesServerRecord
+            )
+        } catch {
+            records = previousRecords
+            throw error
+        }
+    }
+
+    private func insertOrReplaceImpl(_ record: PairingRecord) throws {
+        guard !reservedPskIds.contains(record.pskId) else { throw PairingRecordStoreError.duplicatePskId }
+        if let serverId = record.serverId, let index = records.firstIndex(where: { $0.serverId == serverId }) {
+            guard records[index].pskId == record.pskId || !records.contains(where: { $0.pskId == record.pskId }) else {
+                throw PairingRecordStoreError.duplicatePskId
+            }
+            records[index] = record
+            return
+        }
+        guard !records.contains(where: { $0.pskId == record.pskId }) else { throw PairingRecordStoreError.duplicatePskId }
+        if records.count >= capacity {
+            guard let index = records.firstIndex(where: { !isProtected($0.pskId) }) else {
+                throw PairingRecordStoreError.storageExhausted
+            }
+            records.remove(at: index)
         }
         records.append(record)
     }
 
-    public func remove(pskId: String) async {
-        records.removeAll { $0.pskId == pskId }
+    /// Explicit unpairing may remove a record even while its session lease is active;
+    /// the lease remains tracked so connection teardown can release it normally.
+    func remove(pskId: String) async throws {
+        guard let index = records.firstIndex(where: { $0.pskId == pskId }) else { return }
+        records.remove(at: index)
     }
 
-    public func markUsed(pskId: String) async {
+    func markUsed(pskId: String) async throws {
         guard let index = records.firstIndex(where: { $0.pskId == pskId }) else { return }
         records[index].used = true
     }
 
-    public func ensurePreProvisionedSharedRecord(_ record: PairingRecord) async {
-        guard !records.contains(where: { $0.pskId == record.pskId }) else { return }
-        records.append(record)
+    func acquireProtection(pskId: String, serverId: String?) async throws -> PairingRecordProtectionLease {
+        try acquireProtectionImpl(pskId: pskId, serverId: serverId)
     }
 
-    public func dynamicPairingRoundCount() async throws -> UInt32 {
+    private func acquireProtectionImpl(
+        pskId: String,
+        serverId: String?,
+        allowFullProtection: Bool = false
+    ) throws -> PairingRecordProtectionLease {
+        guard let current = records.first(where: { $0.pskId == pskId }), current.serverId == serverId else {
+            throw PairingRecordStoreError.pskLookupMiss
+        }
+        let activeLimit = max(1, capacity - 1)
+        guard allowFullProtection || protections.count < activeLimit else { throw PairingRecordStoreError.storageExhausted }
+        let lease = PairingRecordProtectionLease(id: UUID(), pskIds: [pskId])
+        protections[lease.id] = lease.pskIds
+        return lease
+    }
+
+    func releaseProtection(_ lease: PairingRecordProtectionLease) async throws {
+        guard protections.removeValue(forKey: lease.id) != nil else {
+            throw PairingRecordStoreError.unknownProtectionLease
+        }
+    }
+
+    func storageAccounting() async throws -> PairingStorageAccounting? {
+        PairingStorageAccounting(free: max(0, capacity - records.count), capacity: capacity, costIndividual: 1, costShared: 1)
+    }
+
+    func dynamicPairingRoundCount() async throws -> UInt32 {
         dynamicPairingRoundCount
     }
 
-    public func reserveDynamicPairingRound(limit: UInt32) async throws -> DynamicPairingRoundReservation {
+    func reserveDynamicPairingRound(limit: UInt32) async throws -> DynamicPairingRoundReservation {
         guard dynamicPairingRoundCount < limit else { return .exhausted }
         dynamicPairingRoundCount += 1
         return .reserved(round: dynamicPairingRoundCount, remaining: limit - dynamicPairingRoundCount)
     }
 
-    public func resetDynamicPairingBudget() async throws {
+    func resetDynamicPairingBudget() async throws {
         dynamicPairingRoundCount = 0
+    }
+
+    private func isProtected(_ pskId: String) -> Bool {
+        protections.values.contains { $0.contains(pskId) }
     }
 }
 
-/// Client-side Pairing PSK configuration.
-///
-/// The host app owns the lifetime and persistence of the pairing PSK and record store.
-/// Keep the PSK private; construct a ``PairingToken`` only for an intentional setup flow
-/// and treat its ``PairingToken/string`` value as a secret until it is delivered securely.
-public struct PairingConfiguration: Sendable {
-    /// The per-device Pairing PSK. A value is generated when omitted; persist the chosen
-    /// value with the identity if pairing must remain available after a process restart.
-    public let pairingPsk: Psk
-    /// Application persistence for long-term records.
-    public let store: any PairingRecordStore
-    /// Whether Pairing PSK is offered and included in handshake candidates.
-    public let enabled: Bool
-    /// Whether dynamic pairing-code activation is advertised.
-    public let dynamicPairingCodeEnabled: Bool
-    /// Whether static pairing-code activation is advertised.
-    public let staticPairingCodeEnabled: Bool
-    /// The device-specific static pairing code, when provisioned.
-    public let staticPairingCode: String?
-    /// Optional speaker digit-audio capability advertised with dynamic pairing.
-    public let digitAudio: DigitAudioDescriptor?
-    /// Shared-PSK fallback used when a newly paired record cannot be stored individually.
-    public let recordModePskId: String
-    /// Runtime state shared by active connections and future handshakes.
+/// Internal compatibility configuration used by legacy fixture initializers.
+struct PairingConfiguration: Sendable {
+    let pairingPsk: Psk
+    let store: any PairingRecordStore
+    let enabled: Bool
+    let dynamicPairingCodeEnabled: Bool
+    let staticPairingCodeEnabled: Bool
+    let staticPairingCode: String?
+    let digitAudio: DigitAudioDescriptor?
     let runtime: PairingConfigurationRuntime
-    /// Shared record used by Record mode when individual records cannot be stored.
-    let preProvisionedSharedRecord: PairingRecord
 
-    public init(
+    init(
+        presentation: PairingPresentation,
+        pairingPsk: Psk,
+        store: any PairingRecordStore,
+        staticPairingCode: String? = nil
+    ) {
+        precondition(presentation != .staticCode || staticPairingCode != nil)
+        precondition(staticPairingCode.map(PairingManagementConfiguration.isValidStaticPairingCode) ?? true)
+        self.pairingPsk = pairingPsk
+        self.store = store
+        enabled = true
+        dynamicPairingCodeEnabled = presentation.usesDynamicCode
+        staticPairingCodeEnabled = presentation == .staticCode
+        self.staticPairingCode = staticPairingCode
+        digitAudio = presentation.digitAudio
+        runtime = PairingConfigurationRuntime(configuration: PairingManagementConfiguration(
+            pairingPsk: pairingPsk,
+            pairingPskEnabled: true,
+            unpairedAccessEnabled: false,
+            presentation: presentation,
+            digitAudio: presentation.digitAudio,
+            staticPairingCode: staticPairingCode
+        ))
+    }
+
+    init(
         pairingPsk: Psk? = nil,
         store: (any PairingRecordStore)? = nil,
         enabled: Bool = true,
@@ -300,8 +357,7 @@ public struct PairingConfiguration: Sendable {
         precondition(staticPairingCode.map(PairingManagementConfiguration.isValidStaticPairingCode) ?? true)
         precondition(!(dynamicPairingCodeEnabled && staticPairingCodeEnabled), "Advertise at most one pairing-code method")
         let resolved = pairingPsk ?? .generate()
-        let fallback = PairingRecord(psk: .generate())
-        let resolvedStore = store ?? InMemoryPairingRecordStore(pairingPsk: resolved, preProvisionedRecord: fallback)
+        let resolvedStore = store ?? InMemoryPairingRecordStore(pairingPsk: resolved)
         self.pairingPsk = resolved
         self.store = resolvedStore
         self.enabled = enabled
@@ -309,25 +365,18 @@ public struct PairingConfiguration: Sendable {
         self.staticPairingCodeEnabled = staticPairingCodeEnabled
         self.staticPairingCode = staticPairingCode
         self.digitAudio = digitAudio
-        recordModePskId = fallback.pskId
-        preProvisionedSharedRecord = fallback
         runtime = PairingConfigurationRuntime(configuration: PairingManagementConfiguration(
             pairingPsk: resolved,
             pairingPskEnabled: enabled,
-            recordModePskId: fallback.pskId,
-            // The facade applies its explicit unpaired-access policy before the
-            // first handshake; this default keeps standalone configuration
-            // snapshots conservative until that owner supplies the policy.
             unpairedAccessEnabled: true,
-            dynamicPairingCodeEnabled: dynamicPairingCodeEnabled,
-            staticPairingCodeEnabled: staticPairingCodeEnabled,
-            staticPairingCode: staticPairingCode,
-            digitAudio: digitAudio
+            presentation: staticPairingCodeEnabled ? .staticCode :
+                (dynamicPairingCodeEnabled ? (digitAudio.map { .speaker(audio: $0) } ?? .display) : nil),
+            digitAudio: digitAudio,
+            staticPairingCode: staticPairingCode
         ))
     }
 }
 
-/// Version-zero pairing token containing the client identity and Pairing PSK.
 public struct PairingToken: Sendable, Equatable, Hashable {
     public let clientKey: Data
     public let pairingPsk: Psk
@@ -338,17 +387,14 @@ public struct PairingToken: Sendable, Equatable, Hashable {
         self.pairingPsk = pairingPsk
     }
 
-    /// Encode a dynamic 24-byte code as the version-one QR-safe token.
     static func dynamicCodeToken(_ code: Data) -> String {
         "SP:1\(encode(code))"
     }
 
-    /// Encode as `SP:0` plus the spec's QR-safe base32 body.
     public var string: String {
         "SP:0\(Self.encode(clientKey + pairingPsk.bytes))"
     }
 
-    /// Decode lenient operator input, including an optional `SP:` prefix.
     public init(string: String) throws {
         let normalized = string.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         let body = normalized.hasPrefix("SP:") ? String(normalized.dropFirst(3)) : normalized

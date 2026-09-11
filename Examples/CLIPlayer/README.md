@@ -9,7 +9,7 @@ A simple command-line audio player demonstrating how to use SendspinKit to conne
 - Real-time clock synchronization for multi-room audio
 - Interactive volume and mute controls
 - Event monitoring (connection, trust levels, streams, groups)
-- Optional Pairing PSK setup with `--pairing` (prints an `SP:0` token)
+- Optional pairing with `--pairing` — paired-only access, display code presentation, prints an `SP:0` setup token
 
 ## Building
 
@@ -28,7 +28,7 @@ The CLI player supports both automatic discovery and manual connection:
 # Auto-discover servers on the network
 swift run CLIPlayer
 
-# Enable Pairing PSK and print the setup token (valid for this process's pairing configuration lifetime)
+# Paired-only access with display code presentation; prints the ephemeral device's setup token
 swift run CLIPlayer --pairing
 
 # Auto-discover with custom client name
@@ -115,12 +115,13 @@ let config = PlayerConfiguration(
     supportedFormats: [...]
 )
 
-// Create client
+// Create client (ephemeral demo device; open a durable SendspinDevice in production)
 let client = try SendspinClient(
-    identity: .generate(),
+    device: .ephemeral(),
     name: "My Player",
     roles: [.playerV1],
-    playerConfig: config
+    playerConfig: config,
+    access: .allowUnpaired
 )
 
 // Connect to discovered server

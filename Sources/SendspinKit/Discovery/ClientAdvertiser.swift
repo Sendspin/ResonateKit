@@ -2,38 +2,23 @@ import Foundation
 import Network
 import os
 
-/// Advertises this client via mDNS and accepts incoming WebSocket connections from servers.
-///
-/// This implements the spec's recommended "Server Initiated Connections" flow:
-/// the client advertises `_sendspin._tcp.local.` via Bonjour, and servers discover
-/// and connect to the client via WebSocket.
-///
-/// Once ``stop()`` is called, the ``connections`` stream is finished and cannot be
-/// restarted. Create a new `ClientAdvertiser` instance to advertise again.
-///
-/// Usage:
-/// ```swift
-/// let advertiser = ClientAdvertiser(name: "Living Room Speaker")
-/// try advertiser.start()
-///
-/// for await transport in advertiser.connections {
-///     try await client.acceptConnection(transport)
-/// }
-/// ```
+/// Advertises this client via mDNS and accepts incoming WebSocket connections.
+/// Single-use: `stop()` finishes the stream; create a new instance to advertise again.
 public actor ClientAdvertiser {
-    /// Friendly name advertised in TXT records
     private let name: String?
-    /// Port to listen on
     private let port: UInt16
-    /// WebSocket endpoint path
     private let path: String
+    private let maximumPendingConnections: Int
+    private let pendingConnectionTimeout: Duration
+    private let listenerFactory: @Sendable (NWParameters, NWEndpoint.Port) throws -> any ClientListenerHandle
 
-    private var listener: NWListener?
-    /// Marked `nonisolated(unsafe)` because it is accessed in `deinit` (non-isolated).
-    /// `AsyncStream.Continuation` is thread-safe; `finish()` is safe to call from any context.
+    private var listener: (any ClientListenerHandle)?
+    private var listenerToken: UUID?
     private nonisolated(unsafe) var connectionsContinuation: AsyncStream<any SendspinTransport>.Continuation?
-    private var consecutiveFailures = 0
-    private static let maxConsecutiveFailures = 3
+    private var readinessWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+    private var listenerReady = false
+    private var pendingConnections: [UUID: NWConnection] = [:]
+    private var pendingConnectionTimeouts: [UUID: Task<Void, Never>] = [:]
 
     /// Stream of incoming server connections, each as a ready-to-use transport.
     public nonisolated let connections: AsyncStream<any SendspinTransport>
@@ -43,172 +28,358 @@ public actor ClientAdvertiser {
         listener != nil
     }
 
+    /// Whether this advertiser was created for the requested endpoint.
+    public func matches(port requestedPort: UInt16, path requestedPath: String) -> Bool {
+        port == requestedPort && path == requestedPath
+    }
+
     /// Whether this advertiser has been permanently stopped.
-    /// Once `true`, ``start()`` will throw and a new instance must be created.
     public var isTerminated: Bool {
         connectionsContinuation == nil
     }
 
-    /// Create a client advertiser.
-    /// - Parameters:
-    ///   - name: Friendly name for this client (advertised in TXT records, optional)
-    ///   - port: Port to listen on (default: ``SendspinDefaults/clientPort``). Pass 0 for OS-assigned port.
-    ///   - path: WebSocket endpoint path (default: ``SendspinDefaults/webSocketPath``)
     public init(
         name: String? = nil,
         port: UInt16 = SendspinDefaults.clientPort,
         path: String = SendspinDefaults.webSocketPath
     ) {
+        self.init(
+            name: name,
+            port: port,
+            path: path,
+            listenerFactory: { parameters, port in
+                try NWClientListenerHandle(listener: NWListener(using: parameters, on: port))
+            }
+        )
+    }
+
+    init(
+        name: String?,
+        port: UInt16,
+        path: String,
+        maximumPendingConnections: Int = clientAdvertiserPendingLimit,
+        pendingConnectionTimeout: Duration = clientAdvertiserPendingConnectionTimeout,
+        listenerFactory: @escaping @Sendable (NWParameters, NWEndpoint.Port) throws -> any ClientListenerHandle
+    ) {
+        precondition(maximumPendingConnections > 0)
         self.name = name
         self.port = port
         self.path = path
+        self.maximumPendingConnections = maximumPendingConnections
+        self.pendingConnectionTimeout = pendingConnectionTimeout
+        self.listenerFactory = listenerFactory
 
         var continuation: AsyncStream<any SendspinTransport>.Continuation?
-        connections = AsyncStream { continuation = $0 }
+        connections = AsyncStream(
+            bufferingPolicy: .bufferingOldest(maximumPendingConnections)
+        ) { continuation = $0 }
         connectionsContinuation = continuation
     }
 
-    /// Start advertising and listening for server connections.
-    /// - Throws: ``TerminatedError`` if this instance has been permanently stopped.
-    public func start() throws {
-        guard listener == nil else { return }
+    /// Start advertising and wait for `NWListener.State.ready`, not mere construction.
+    /// Failed or cancelled startup throws instead of reporting an unusable listener.
+    public func start() async throws {
+        if listener != nil, listenerReady {
+            return
+        }
+        guard listener == nil else {
+            try Task.checkCancellation()
+            return try await waitForReadiness()
+        }
         guard connectionsContinuation != nil else { throw TerminatedError() }
-        // Servers concatenate this path onto the dial URL; a non-absolute value
-        // would malform it (or be parsed as authority). This is our own config,
-        // so fail loud rather than silently sanitize.
         guard path.hasPrefix("/") else { throw ConfigurationError.invalidWebSocketPath(path) }
+        try Task.checkCancellation()
 
-        // Configure WebSocket protocol options on top of TCP.
         let wsOptions = NWProtocolWebSocket.Options()
         wsOptions.autoReplyPing = true
-
-        // Build parameters: TCP base with WebSocket application protocol
         let parameters = NWParameters.tcp
         parameters.defaultProtocolStack.applicationProtocols.insert(wsOptions, at: 0)
-
-        // NWEndpoint.Port(rawValue:) only returns nil for 0, handled by the .any branch.
         let nwPort: NWEndpoint.Port = port == 0
             ? .any
             // swiftlint:disable:next force_unwrapping
             : NWEndpoint.Port(rawValue: port)!
+        let listener = try listenerFactory(parameters, nwPort)
 
-        let listener = try NWListener(using: parameters, on: nwPort)
-
-        // Build TXT record for Bonjour advertisement
         var txtRecord = NWTXTRecord()
         txtRecord["path"] = path
         if let name {
             txtRecord["name"] = name
         }
+        listener.service = NWListener.Service(type: SendspinDefaults.clientServiceType, txtRecord: txtRecord)
 
-        listener.service = NWListener.Service(
-            type: SendspinDefaults.clientServiceType,
-            txtRecord: txtRecord
-        )
-
+        let token = UUID()
+        listenerToken = token
         listener.stateUpdateHandler = { [weak self] state in
-            Task { await self?.handleListenerState(state) }
+            Task { await self?.handleListenerState(state, token: token) }
         }
-
         listener.newConnectionHandler = { [weak self] connection in
-            Task { await self?.handleNewConnection(connection) }
+            Task { await self?.handleNewConnection(connection, token: token) }
         }
 
         self.listener = listener
         listener.start(queue: .global(qos: .userInitiated))
+
+        return try await waitForReadiness()
     }
 
-    /// Stop advertising and close all pending connections.
-    /// Finishes the ``connections`` stream — any `for await` loop consuming it will exit.
-    /// This is terminal; create a new instance to advertise again.
+    private func waitForReadiness() async throws {
+        if listenerReady {
+            return
+        }
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                readinessWaiters[waiterID] = continuation
+            }
+        } onCancel: {
+            Task { await self.cancelReadinessWaiter(waiterID) }
+        }
+    }
+
+    /// Stop advertising and close pending connections. This is terminal; admitted
+    /// transports already yielded from `connections` are not touched.
     public func stop() {
-        listener?.cancel()
-        listener = nil
-        terminateStream()
+        terminateListener(with: CancellationError())
     }
 
-    // MARK: - Private
-
-    /// Finish the connections stream and nil out the continuation, making this
-    /// advertiser permanently unable to yield new connections.
     private func terminateStream() {
         connectionsContinuation?.finish()
         connectionsContinuation = nil
     }
 
-    private func handleListenerState(_ state: NWListener.State) {
+    private func terminateListener(with error: Error) {
+        let currentListener = listener
+        listener = nil
+        listenerToken = nil
+        listenerReady = false
+        currentListener?.stateUpdateHandler = nil
+        currentListener?.newConnectionHandler = nil
+        currentListener?.cancel()
+
+        for timeout in pendingConnectionTimeouts.values {
+            timeout.cancel()
+        }
+        pendingConnectionTimeouts.removeAll()
+        for connection in pendingConnections.values {
+            connection.stateUpdateHandler = nil
+            connection.cancel()
+        }
+        pendingConnections.removeAll()
+
+        let waiters = readinessWaiters
+        readinessWaiters.removeAll()
+        for continuation in waiters.values {
+            continuation.resume(throwing: error)
+        }
+        terminateStream()
+    }
+
+    private func cancelReadinessWaiter(_ id: UUID) {
+        guard let continuation = readinessWaiters.removeValue(forKey: id) else { return }
+        continuation.resume(throwing: CancellationError())
+        guard readinessWaiters.isEmpty, listener != nil, !listenerReady else { return }
+        terminateListener(with: CancellationError())
+    }
+
+    private func handleListenerState(_ state: ClientListenerState, token: UUID) {
+        guard listenerToken == token, listener != nil else { return }
         switch state {
         case .ready:
-            consecutiveFailures = 0
-            let actualPort = listener?.port?.rawValue ?? port
+            listenerReady = true
+            let actualPort = listener?.port ?? port
             Log.discovery.info("Listening on port \(actualPort), advertising \(SendspinDefaults.clientServiceType)")
-        case let .failed(error):
-            Log.discovery.error("Listener failed: \(error)")
-            listener?.cancel()
-            listener = nil
-
-            consecutiveFailures += 1
-            guard consecutiveFailures < Self.maxConsecutiveFailures else {
-                // swiftformat:disable:next redundantSelf
-                Log.discovery.error("\(self.consecutiveFailures) consecutive failures — giving up")
-                terminateStream()
-                return
+            let waiters = readinessWaiters
+            readinessWaiters.removeAll()
+            for continuation in waiters.values {
+                continuation.resume()
             }
-            do {
-                try start()
-            } catch {
-                Log.discovery.error("Restart failed: \(error) — giving up")
-                terminateStream()
-            }
+        case let .failed(description):
+            Log.discovery.error("Listener failed: \(description)")
+            terminateListener(with: ClientAdvertiserError.listenerFailed(description))
         case .cancelled:
             Log.discovery.info("Listener cancelled")
+            terminateListener(with: CancellationError())
         case .setup, .waiting:
+            break
+        }
+    }
+
+    private func handleNewConnection(_ connection: NWConnection, token: UUID) {
+        guard listenerToken == token, listenerReady, connectionsContinuation != nil else {
+            connection.cancel()
+            return
+        }
+        guard pendingConnections.count < maximumPendingConnections else {
+            Log.discovery.warning("Rejecting inbound connection because the pending connection limit is full")
+            connection.cancel()
+            return
+        }
+
+        let connectionID = UUID()
+        pendingConnections[connectionID] = connection
+        pendingConnectionTimeouts[connectionID] = Task { [weak self, pendingConnectionTimeout] in
+            do {
+                try await Task.sleep(for: pendingConnectionTimeout)
+            } catch {
+                return
+            }
+            await self?.expirePendingConnection(connectionID)
+        }
+        connection.stateUpdateHandler = { [weak self] state in
+            Task { await self?.handleConnectionState(state, id: connectionID) }
+        }
+        connection.start(queue: .global(qos: .userInitiated))
+    }
+
+    private func handleConnectionState(_ state: NWConnection.State, id: UUID) async {
+        guard let connection = pendingConnections[id] else { return }
+        switch state {
+        case .ready:
+            pendingConnections.removeValue(forKey: id)
+            pendingConnectionTimeouts.removeValue(forKey: id)?.cancel()
+            connection.stateUpdateHandler = nil
+            guard connectionsContinuation != nil, listenerReady else {
+                connection.cancel()
+                return
+            }
+            let transport = NWWebSocketTransport(connection: connection)
+            await transport.startReceiving()
+            guard connectionsContinuation != nil, listenerReady else {
+                await transport.disconnect()
+                return
+            }
+            if let result = connectionsContinuation?.yield(transport), case let .dropped(dropped) = result {
+                Task { await dropped.disconnect() }
+            }
+        case let .failed(error):
+            Log.discovery.error("Incoming connection failed: \(error)")
+            removePendingConnection(id, cancel: true)
+        case .cancelled:
+            removePendingConnection(id, cancel: false)
+        case .setup, .preparing, .waiting:
             break
         @unknown default:
             break
         }
     }
 
-    private func handleNewConnection(_ connection: NWConnection) {
-        // NWEndpoint doesn't conform to CustomStringConvertible, so os.Logger's
-        // OSLogInterpolation can't interpolate it directly. String(describing:) is required.
-        Log.discovery.info("Incoming connection from \(String(describing: connection.endpoint))")
+    private func expirePendingConnection(_ id: UUID) {
+        guard pendingConnections[id] != nil else { return }
+        Log.discovery.info("Closing inbound connection that did not become ready in time")
+        removePendingConnection(id, cancel: true)
+    }
 
-        connection.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready:
-                Task { await self?.connectionReady(connection) }
-            case let .failed(error):
-                Log.discovery.error("Connection from \(String(describing: connection.endpoint)) failed: \(error)")
-                connection.cancel()
-            case .cancelled:
-                // Break the connection → handler → connection cycle for a connection that
-                // dies before `connectionReady` wraps it.
-                connection.stateUpdateHandler = nil
-            case .setup, .preparing, .waiting:
-                break
-            @unknown default:
-                break
-            }
+    private func removePendingConnection(_ id: UUID, cancel: Bool) {
+        pendingConnectionTimeouts.removeValue(forKey: id)?.cancel()
+        guard let connection = pendingConnections.removeValue(forKey: id) else { return }
+        connection.stateUpdateHandler = nil
+        if cancel {
+            connection.cancel()
         }
-
-        connection.start(queue: .global(qos: .userInitiated))
     }
 
-    private func connectionReady(_ connection: NWConnection) async {
-        let transport = NWWebSocketTransport(connection: connection)
-        // Start the receive loop before yielding so consumers don't miss early frames.
-        // There's an unavoidable actor-hop gap between NWConnection reporting .ready
-        // and this method executing; NWConnection buffers incoming WebSocket frames
-        // during that window, so no data is lost.
-        await transport.startReceiving()
-        connectionsContinuation?.yield(transport)
-    }
-
-    /// Callers should call stop() before releasing. The cancel/finish calls
-    /// below are thread-safe no-ops if stop() was already called.
     deinit {
+        listener?.stateUpdateHandler = nil
+        listener?.newConnectionHandler = nil
         listener?.cancel()
+        for timeout in pendingConnectionTimeouts.values {
+            timeout.cancel()
+        }
+        for connection in pendingConnections.values {
+            connection.stateUpdateHandler = nil
+            connection.cancel()
+        }
+        for continuation in readinessWaiters.values {
+            continuation.resume(throwing: CancellationError())
+        }
         connectionsContinuation?.finish()
+    }
+}
+
+let clientAdvertiserPendingLimit = 4
+let clientAdvertiserPendingConnectionTimeout: Duration = .seconds(30)
+
+enum ClientAdvertiserError: Error, Equatable, LocalizedError {
+    case listenerFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .listenerFailed(description):
+            "Listener failed: \(description)"
+        }
+    }
+}
+
+enum ClientListenerState: Sendable {
+    case setup
+    case waiting
+    case ready
+    case failed(String)
+    case cancelled
+}
+
+protocol ClientListenerHandle: AnyObject, Sendable {
+    var stateUpdateHandler: (@Sendable (ClientListenerState) -> Void)? { get set }
+    var newConnectionHandler: (@Sendable (NWConnection) -> Void)? { get set }
+    var service: NWListener.Service? { get set }
+    var port: UInt16? { get }
+    func start(queue: DispatchQueue)
+    func cancel()
+}
+
+private final class NWClientListenerHandle: ClientListenerHandle, @unchecked Sendable {
+    private let listener: NWListener
+    private var clientStateUpdateHandler: (@Sendable (ClientListenerState) -> Void)?
+
+    var stateUpdateHandler: (@Sendable (ClientListenerState) -> Void)? {
+        get { clientStateUpdateHandler }
+        set {
+            clientStateUpdateHandler = newValue
+            let listenerHandler: (@Sendable (NWListener.State) -> Void)? = if let newValue {
+                { state in
+                    newValue(Self.map(state))
+                }
+            } else {
+                nil
+            }
+            listener.stateUpdateHandler = listenerHandler
+        }
+    }
+
+    var newConnectionHandler: (@Sendable (NWConnection) -> Void)? {
+        get { listener.newConnectionHandler }
+        set { listener.newConnectionHandler = newValue }
+    }
+
+    var service: NWListener.Service? {
+        get { listener.service }
+        set { listener.service = newValue }
+    }
+
+    var port: UInt16? {
+        listener.port?.rawValue
+    }
+
+    init(listener: NWListener) {
+        self.listener = listener
+    }
+
+    func start(queue: DispatchQueue) {
+        listener.start(queue: queue)
+    }
+
+    func cancel() {
+        listener.cancel()
+    }
+
+    private static func map(_ state: NWListener.State) -> ClientListenerState {
+        switch state {
+        case .setup: .setup
+        case .waiting: .waiting
+        case .ready: .ready
+        case let .failed(error): .failed(String(describing: error))
+        case .cancelled: .cancelled
+        @unknown default: .cancelled
+        }
     }
 }

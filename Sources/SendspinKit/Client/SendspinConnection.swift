@@ -132,6 +132,7 @@ actor SendspinConnection {
     var pskCategory: PskCategory
     var matchedPskId: String
     let pairingStore: (any PairingRecordStore)?
+    var pairingProtectionLease: PairingRecordProtectionLease?
     let pairingConfigurationRuntime: PairingConfigurationRuntime?
     let pairingAttemptTimeout: Duration
     #if DEBUG
@@ -143,7 +144,7 @@ actor SendspinConnection {
     let identityPrivateKey: Curve25519.KeyAgreement.PrivateKey
     let serverStaticPublicKey: Curve25519.KeyAgreement.PublicKey
     let suite: NoiseCipherSuite
-    let candidateProvider: @Sendable () async -> [PskCandidate]
+    let candidateProvider: @Sendable () async throws -> [PskCandidate]
     let clientHelloPayload: ClientHelloPayload
     var rehandshakeInProgress = false
     nonisolated var isRehandshakeInProgress: Bool {
@@ -264,6 +265,7 @@ actor SendspinConnection {
         pskCategory: PskCategory,
         matchedPskId: String = "",
         pairingStore: (any PairingRecordStore)? = nil,
+        pairingProtectionLease: PairingRecordProtectionLease? = nil,
         pairingConfigurationRuntime: PairingConfigurationRuntime? = nil,
         pairingAttemptTimeout: Duration = .seconds(120),
         pairingWindowLifetime: Duration = .seconds(300),
@@ -273,7 +275,7 @@ actor SendspinConnection {
         identityPrivateKey: Curve25519.KeyAgreement.PrivateKey,
         serverStaticPublicKey: Curve25519.KeyAgreement.PublicKey,
         suite: NoiseCipherSuite,
-        candidateProvider: @escaping @Sendable () async -> [PskCandidate],
+        candidateProvider: @escaping @Sendable () async throws -> [PskCandidate],
         clientHelloPayload: ClientHelloPayload,
         unpairedAccessEnabled: Bool = true,
         effectivePlayerFormats: [AudioFormatSpec]? = nil,
@@ -330,6 +332,7 @@ actor SendspinConnection {
         self.pskCategory = pskCategory
         self.matchedPskId = matchedPskId
         self.pairingStore = pairingStore
+        self.pairingProtectionLease = pairingProtectionLease
         self.pairingConfigurationRuntime = pairingConfigurationRuntime
         self.pairingAttemptTimeout = pairingAttemptTimeout
         self.pairingWindowLifetime = pairingWindowLifetime
@@ -511,7 +514,13 @@ actor SendspinConnection {
         lifecycle = .running
         if case .longTerm = pskCategory, let pairingStore {
             let pskId = matchedPskId
-            Task { await pairingStore.markUsed(pskId: pskId) }
+            Task {
+                do {
+                    try await pairingStore.markUsed(pskId: pskId)
+                } catch {
+                    Log.client.error("Pairing record mark-used failed: \(error.localizedDescription)")
+                }
+            }
         }
         supervisorSpawnCount += 1
 
@@ -526,6 +535,20 @@ actor SendspinConnection {
             let observed = await transport.closeReason
             await finishTeardown(disconnectReason ?? .connectionLost(observed))
         }
+    }
+
+    /// Update access policy and close dependent unpaired sessions.
+    func updateAccessPolicy(_ policy: AccessPolicy) async throws {
+        let enabled = policy == .allowUnpaired
+        sessionContext = ActivationAdmissibility.SessionContext(
+            category: sessionContext.category,
+            unpairedAccessEnabled: enabled,
+            offeredPairMethods: sessionContext.offeredPairMethods,
+            offeredDynamicFormats: sessionContext.offeredDynamicFormats
+        )
+        let dependsOnUnpairedAccess = activities.contains(.playback) || !activeRoles.isEmpty
+        guard !enabled, pskCategory == .sentinel, dependsOnUnpairedAccess else { return }
+        await disconnect(reason: .pairingRequired)
     }
 
     /// Graceful disconnect: send goodbye and close.

@@ -72,7 +72,7 @@ private func isRetryableError(_ error: any Error) -> Bool {
 
     if let clientError = error as? SendspinClientError {
         switch clientError {
-        case .alreadyConnected:
+        case .alreadyConnected, .modeConflict:
             // Programmer error — we're not calling disconnect() between
             // attempts. Shouldn't happen in this loop, but if it does, retry
             // won't help.
@@ -150,8 +150,9 @@ struct ErrorRecovery: AsyncParsableCommand {
 
     @MainActor
     private func makeClient() throws -> SendspinClient {
+        // Demo runner: ephemeral device plus unpaired access so retries work against any server.
         try SendspinClient(
-            identity: .generate(),
+            device: .ephemeral(),
             name: "Error Recovery",
             roles: [.playerV1],
             playerConfig: try PlayerConfiguration(
@@ -159,7 +160,8 @@ struct ErrorRecovery: AsyncParsableCommand {
                 supportedFormats: [
                     try AudioFormatSpec(codec: .pcm, channels: 2, sampleRate: 48_000, bitDepth: 16)
                 ]
-            )
+            ),
+            access: .allowUnpaired
         )
     }
 

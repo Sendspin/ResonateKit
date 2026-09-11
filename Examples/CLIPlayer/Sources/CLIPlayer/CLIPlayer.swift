@@ -93,19 +93,21 @@ final class CLIPlayer {
 
         // Create client
         let config = try Self.playerConfig(volumeMode: volumeMode)
-        let identity = SendspinIdentity.generate()
-        let pairing = enablePairing ? PairingConfiguration() : nil
-        if let pairing {
-            let token = PairingToken(clientKey: identity.publicKeyBytes, pairingPsk: pairing.pairingPsk)
+        // Ephemeral demo device: identity and pairing state vanish when the process exits.
+        let device = SendspinDevice.ephemeral()
+        let pairing: PairingPresentation = enablePairing ? .display : .tokenOnly
+        if enablePairing {
+            let token = device.makePairingToken()
             print("[PAIRING] token: \(token.string)")
         }
         let client = try SendspinClient(
-            identity: identity,
+            device: device,
             name: clientName,
             roles: [.playerV1, .metadataV1, .controllerV1, .artworkV1],
             playerConfig: config,
             artworkConfig: Self.artworkConfig,
-            pairing: pairing
+            pairing: pairing,
+            access: enablePairing ? .pairedOnly : .allowUnpaired
         )
         self.client = client
 
@@ -449,19 +451,21 @@ final class CLIPlayer {
         print("Advertising on port \(port)...")
 
         let config = try Self.playerConfig(volumeMode: volumeMode)
-        let identity = SendspinIdentity.generate()
-        let pairing = enablePairing ? PairingConfiguration() : nil
-        if let pairing {
-            let token = PairingToken(clientKey: identity.publicKeyBytes, pairingPsk: pairing.pairingPsk)
+        // Ephemeral demo device: identity and pairing state vanish when the process exits.
+        let device = SendspinDevice.ephemeral()
+        let pairing: PairingPresentation = enablePairing ? .display : .tokenOnly
+        if enablePairing {
+            let token = device.makePairingToken()
             print("[PAIRING] token: \(token.string)")
         }
         let client = try SendspinClient(
-            identity: identity,
+            device: device,
             name: clientName,
             roles: [.playerV1, .metadataV1, .controllerV1, .artworkV1],
             playerConfig: config,
             artworkConfig: Self.artworkConfig,
-            pairing: pairing
+            pairing: pairing,
+            access: enablePairing ? .pairedOnly : .allowUnpaired
         )
         self.client = client
 
@@ -470,9 +474,7 @@ final class CLIPlayer {
             await monitorEvents(client: client, useTUI: useTUI)
         }
 
-        // Start the advertiser
-        let advertiser = ClientAdvertiser(name: clientName, port: port)
-        try await advertiser.start()
+        try await client.startAdvertising(port: port)
 
         print("✅ Advertising as '\(clientName)' on port \(port)")
         print("   Waiting for servers to connect...")
@@ -490,16 +492,8 @@ final class CLIPlayer {
             await CLIPlayer.runCommandLoopStatic(client: client, display: useTUI ? display : nil)
         }
 
-        // Accept incoming server connections (runs until advertiser stops)
-        for await transport in advertiser.connections {
-            fputs("[LISTEN] Server connected via transport, running handshake...\n", stderr)
-            do {
-                try await client.acceptConnection(transport)
-                fputs("[LISTEN] Handshake complete\n", stderr)
-            } catch {
-                fputs("[LISTEN] Connection failed: \(error)\n", stderr)
-            }
-        }
+        // Closing the client finishes its event streams and this listener lifetime.
+        await eventTask?.value
 
         if useTUI {
             await display.stop()

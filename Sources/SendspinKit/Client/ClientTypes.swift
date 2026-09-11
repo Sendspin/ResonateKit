@@ -651,6 +651,8 @@ public enum SendspinClientError: SendspinError, Equatable, LocalizedError {
     /// A command or message could not be sent over the transport.
     /// The associated string describes the underlying transport error.
     case sendFailed(String)
+    /// A client-initiated connection mode conflicts with the active listener or session.
+    case modeConflict
     /// A role-specific API was called before that protocol role was active.
     case roleNotActive(VersionedRole)
     /// A facade-initiated send was attempted before `server/hello` completed the handshake.
@@ -675,6 +677,8 @@ public enum SendspinClientError: SendspinError, Equatable, LocalizedError {
             "Already connected or connecting to a Sendspin server"
         case let .sendFailed(reason):
             "Failed to send message: \(reason)"
+        case .modeConflict:
+            "The requested connection mode conflicts with the active listener or session"
         case let .roleNotActive(role):
             "The \(role.identifier) role is not active for this connection"
         case .handshakeIncomplete:

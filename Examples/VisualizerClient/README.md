@@ -25,9 +25,10 @@ Use mDNS discovery instead:
 swift run VisualizerClient --discover --timeout 5
 ```
 
-The app accepts `--name <name>` to set its client name. Add `--pairing` to disable unpaired
-access and enable dynamic pairing setup. The generated identity and pairing PSK are process-local
-for this example; the printed pairing token must be persisted by a real host application.
+The app accepts `--name <name>` to set its client name. Add `--pairing` for paired-only access with
+display code presentation. The example runs on an ephemeral demo device, so its identity and pairing
+state are process-local; a real host application opens a durable device with
+`SendspinDevice.open(storage:)` instead.
 The pairing panel displays the current immutable attempt snapshot, treats the peer ID as unverified
 until trust succeeds, opens the authorization window with the captured `PairingAttemptID`, and
 cancels with that exact ID. A stale button action is reported instead of retargeting a newer attempt.

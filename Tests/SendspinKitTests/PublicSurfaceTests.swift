@@ -10,7 +10,6 @@ struct PublicSurfaceTests {
         let configuration = PairingManagementConfiguration(
             pairingPsk: pairingPsk,
             pairingPskEnabled: true,
-            recordModePskId: "record-mode",
             unpairedAccessEnabled: true
         )
         let runtime = PairingConfigurationRuntime(configuration: configuration)

@@ -30,6 +30,7 @@ struct NoiseSessionOutcome: ~Copyable {
     let serverStaticPublicKey: Curve25519.KeyAgreement.PublicKey
     let suite: NoiseCipherSuite
     let matchedCandidate: PskCandidate
+    let protectionLease: PairingRecordProtectionLease?
 
     consuming func takeChannel() -> NoiseChannel {
         channel
@@ -46,20 +47,47 @@ enum NoiseSessionEstablisher {
     /// during the cleartext and Noise-handshake phases.
     static let defaultPhaseTimeout = Duration.seconds(30)
 
+    struct ProtectionHooks: Sendable {
+        let onCandidateMatched: (@Sendable (PskCandidate) async throws -> PairingRecordProtectionLease?)?
+        let releaseCandidateLease: (@Sendable (PairingRecordProtectionLease) async -> Void)?
+
+        init(
+            onCandidateMatched: (@Sendable (PskCandidate) async throws -> PairingRecordProtectionLease?)? = nil,
+            releaseCandidateLease: (@Sendable (PairingRecordProtectionLease) async -> Void)? = nil
+        ) {
+            self.onCandidateMatched = onCandidateMatched
+            self.releaseCandidateLease = releaseCandidateLease
+        }
+    }
+
+    struct Options: Sendable {
+        let suite: NoiseCipherSuite
+        let phaseTimeout: Duration
+        let protectionHooks: ProtectionHooks
+
+        init(
+            suite: NoiseCipherSuite = .chaChaPoly,
+            phaseTimeout: Duration = defaultPhaseTimeout,
+            protectionHooks: ProtectionHooks = ProtectionHooks()
+        ) {
+            self.suite = suite
+            self.phaseTimeout = phaseTimeout
+            self.protectionHooks = protectionHooks
+        }
+    }
+
     static func establish(
         on transport: any SendspinTransport,
         identity: SendspinIdentity,
-        suite: NoiseCipherSuite,
         candidates: [PskCandidate],
-        phaseTimeout: Duration = defaultPhaseTimeout
+        options: Options = Options()
     ) async throws -> NoiseSessionOutcome {
         do {
             return try await run(
                 on: transport,
                 identity: identity,
-                suite: suite,
                 candidates: candidates,
-                phaseTimeout: phaseTimeout
+                options: options
             )
         } catch {
             // Failure Handling: close the WebSocket, send no application-level error.
@@ -68,13 +96,31 @@ enum NoiseSessionEstablisher {
         }
     }
 
-    private static func run(
+    static func establish(
         on transport: any SendspinTransport,
         identity: SendspinIdentity,
         suite: NoiseCipherSuite,
         candidates: [PskCandidate],
-        phaseTimeout: Duration
+        phaseTimeout: Duration = defaultPhaseTimeout
     ) async throws -> NoiseSessionOutcome {
+        try await establish(
+            on: transport,
+            identity: identity,
+            candidates: candidates,
+            options: Options(suite: suite, phaseTimeout: phaseTimeout)
+        )
+    }
+
+    private static func run(
+        on transport: any SendspinTransport,
+        identity: SendspinIdentity,
+        candidates: [PskCandidate],
+        options: Options
+    ) async throws -> NoiseSessionOutcome {
+        let suite = options.suite
+        let phaseTimeout = options.phaseTimeout
+        let onCandidateMatched = options.protectionHooks.onCandidateMatched
+        let releaseCandidateLease = options.protectionHooks.releaseCandidateLease
         let encoder = SendspinEncoding.makeEncoder()
 
         // client/init — retain the exact bytes we put on the wire.
@@ -152,30 +198,42 @@ enum NoiseSessionEstablisher {
             candidate = PskCandidate(psk: .sentinel, category: .sentinel)
         }
 
-        // Noise message 2, PSK mixed at the psk2 position; payload is the literal `{}`.
-        let noiseMessage2: Data
-        let transportStates: NoiseTransport
-        do {
-            noiseMessage2 = try handshake.writeMessage2(psk: candidate.psk, payload: noiseMessage2Payload)
-            transportStates = try handshake.makeTransport()
-        } catch let error as NoiseError {
-            throw HandshakeError.noise(error)
-        }
-        let message2 = NoiseHandshakeMessage(
-            payload: NoiseHandshakePayload(data: Base64URL.encode(noiseMessage2))
-        )
-        guard let message2Text = try String(data: encoder.encode(message2), encoding: .utf8) else {
-            throw HandshakeError.malformed
-        }
-        try await transport.sendRawText(message2Text)
+        var protectionLease = try await onCandidateMatched?(candidate) ?? nil
 
-        return NoiseSessionOutcome(
-            channel: NoiseChannel(transport: transportStates),
-            serverId: serverId,
-            serverStaticPublicKey: serverStaticKey,
-            suite: suite,
-            matchedCandidate: candidate
-        )
+        do {
+            // Noise message 2, PSK mixed at the psk2 position; payload is the literal `{}`.
+            let noiseMessage2: Data
+            let transportStates: NoiseTransport
+            do {
+                noiseMessage2 = try handshake.writeMessage2(psk: candidate.psk, payload: noiseMessage2Payload)
+                transportStates = try handshake.makeTransport()
+            } catch let error as NoiseError {
+                throw HandshakeError.noise(error)
+            }
+            let message2 = NoiseHandshakeMessage(
+                payload: NoiseHandshakePayload(data: Base64URL.encode(noiseMessage2))
+            )
+            guard let message2Text = try String(data: encoder.encode(message2), encoding: .utf8) else {
+                throw HandshakeError.malformed
+            }
+            try await transport.sendRawText(message2Text)
+
+            let outcome = NoiseSessionOutcome(
+                channel: NoiseChannel(transport: transportStates),
+                serverId: serverId,
+                serverStaticPublicKey: serverStaticKey,
+                suite: suite,
+                matchedCandidate: candidate,
+                protectionLease: protectionLease
+            )
+            protectionLease = nil
+            return outcome
+        } catch {
+            if let protectionLease {
+                await releaseCandidateLease?(protectionLease)
+            }
+            throw error
+        }
     }
 
     /// Both timeout and caller cancellation must disconnect: cancellation alone

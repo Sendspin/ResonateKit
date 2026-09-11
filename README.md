@@ -32,28 +32,41 @@ dependencies: [
 
 ## Quick Start
 
-A `SendspinIdentity` is the device's long-lived cryptographic identity. The host app owns its
-secret-key persistence: load `secretKeyBytes` from the Keychain (or another protected store) on
-launch, and save the bytes from a newly generated identity before connecting. Rotating the secret
-changes the device's `clientId`.
+A `SendspinDevice` holds the enduring protocol state: the long-lived cryptographic identity, the
+pairing secret, and per-server pairing records. The host app picks the storage backend and opens the
+device before creating a client — `KeychainSendspinDeviceStorage` for production, or
+`SendspinDevice.ephemeral()` for deliberately non-persistent demos and tests. Treat the pairing PSK
+and the token from `device.makePairingToken()` as secrets; display or encode the token as a QR code
+only through a trusted setup flow.
 
-Pairing is also host-owned. Pass a `PairingConfiguration` with an app-backed
-`PairingRecordStore` when pairing should survive process restarts. The default in-memory store is
-useful for tests and demonstrations, but is not persistent. Treat the pairing PSK and the resulting
-`PairingToken.string` as secrets; display or encode the token as a QR code only through a trusted
-setup flow.
+Apps with an existing secure store can implement `SendspinDeviceStorage` instead. The backend loads
+and atomically replaces one opaque, secret-bearing snapshot, and its required `create(_:)` operation
+must atomically create only when absent: return `false` without changing an existing snapshot.
+Storage failures must throw, not masquerade as a missing device. Optional deletion supports explicit
+destructive reset; the library chooses no filesystem location or app namespace.
+
+Keep one live `SendspinDevice` per stored device, including across concurrent opens in the same
+process, and one live client per device. Close the client before sequential reuse. Atomic creation
+prevents identity overwrite during initialization; it does not synchronize multiple loaded devices
+or support cross-process writers. Custom-backend ownership is the app's responsibility.
+
+Every client states its access policy explicitly: `access: .pairedOnly` requires pairing before
+normal roles activate, while `access: .allowUnpaired` permits roles on an unpaired server.
 
 ```swift
 import SendspinKit
 
-// Create a player client
-let identity = SendspinIdentity.generate()
-let pairing = PairingConfiguration() // Pass an app-backed PairingRecordStore in production.
-let token = PairingToken(clientKey: identity.publicKeyBytes, pairingPsk: pairing.pairingPsk)
+// Open the enduring device state from app-owned Keychain storage (created on first launch).
+let device = try await SendspinDevice.open(
+    storage: try KeychainSendspinDeviceStorage(service: "com.example.app", account: "sendspin-device")
+)
+
+// Export the setup token only for an intentional operator pairing flow.
+let token = device.makePairingToken()
 print("Pairing token: \(token.string)") // display or encode as a QR code
 
 let client = try SendspinClient(
-    identity: identity,
+    device: device,
     name: "Living Room Speaker",
     roles: [.playerV1],
     playerConfig: try PlayerConfiguration(
@@ -65,8 +78,7 @@ let client = try SendspinClient(
         requiredLeadTimeMs: 100,
         minBufferMs: 500
     ),
-    unpairedAccessEnabled: false,
-    pairing: pairing
+    access: .pairedOnly
 )
 
 // Discover and connect to the first server found
@@ -75,32 +87,26 @@ if let server = servers.first {
     try await client.connect(to: server.url)
 }
 
-// React to events
+// React to the events this app cares about; ClientEvent has a case per protocol transition.
 for await event in client.events() {
-    switch event {
-    case let .serverConnected(info):
+    if case let .serverConnected(info) = event {
         print("Connected to \(info.name); trust: \(info.trustLevel)")
-    case let .paired(serverId):
-        print("Paired with \(serverId)")
-    case let .streamStarted(format):
+    } else if case let .paired(snapshot) = event {
+        print("Paired with \(snapshot.peer.id)")
+    } else if case let .streamStarted(format) = event {
         print("Playing \(format.codec) at \(format.sampleRate)Hz")
-    case let .metadataReceived(metadata):
+    } else if case let .metadataReceived(metadata) = event {
         print("Now playing: \(metadata.title ?? "Unknown")")
-    case .audioOutputChanged, .outputFormatStatusChanged, .streamingFailed,
-         .streamFormatChanged, .streamEnded, .streamCleared, .groupUpdated,
-         .controllerStateUpdated, .colorStateUpdated, .colorStateCleared,
-         .artworkStreamStarted, .outputDelayChanged, .lastPlayedServerChanged:
-        break
-    case let .disconnected(reason):
+    } else if case let .disconnected(reason) = event {
         print("Disconnected: \(reason)")
     }
 }
 ```
 
 `ServerInfo.trustLevel` reports whether the active session is backed by a pairing record
-(`.user`) or is unpaired (`.none`). Set `unpairedAccessEnabled` to `false` when every server must
-be paired. Enabling unpaired access deliberately permits unauthenticated server access, so an
-on-path attacker can impersonate a server.
+(`.user`) or is unpaired (`.none`). Pass `access: .pairedOnly` when every server must be paired.
+`.allowUnpaired` deliberately permits unauthenticated server access, so an on-path attacker can
+impersonate a server.
 
 Dynamic player, artwork, and visualizer preferences are sent in `client/state`. Use
 `setPlayerFormatPreference(_:)` or `setPlayerFormatPreference(codec:channels:sampleRate:bitDepth:)`
@@ -124,7 +130,8 @@ makes the client available again but does not automatically rejoin its previous 
 
 ## Pairing codes
 
-Pairing-code flows are app-facing setup hooks. Enable a method in `PairingConfiguration`, then
+Pairing-code flows are app-facing setup hooks. Declare the code presentation your device supports
+with the client's `pairing: PairingPresentation` parameter, then
 listen to `SendspinClient.events()` for `ClientEvent.pairingCodeChanged(_:)`,
 `ClientEvent.pairingAttemptEnded(_:)`, and `ClientEvent.paired(_:)`. Each event carries a
 `PairingAttemptSnapshot`; keep its `id` with the UI state that displayed its code.
@@ -160,10 +167,10 @@ listen to `SendspinClient.events()` for `ClientEvent.pairingCodeChanged(_:)`,
   `.ended(.pairingCodeMismatch)`, `.ended(.userCancelled)`, `.ended(.attemptTimeout)`, and
   `.ended(.methodNotSupported)` as outcomes rather than assuming cancellation succeeded.
 
-Static pairing uses `PairingConfiguration(staticPairingCode:staticPairingCodeEnabled:)`. The host
-must provision and persist a device-unique eight-digit ASCII decimal code; never ship a fixed
-shared default. Hosts rotate the code through their local pairing configuration; the secret is
-never exposed in client events. Static codes are not emitted as `pairingCodeChanged` events.
+Static pairing uses `pairing: .staticCode` with an eight-digit code provisioned on the device via
+`SendspinDevice.open(storage:staticCode:)`. The host must provision and persist a device-unique
+ASCII decimal code; never ship a fixed shared default. The secret is never exposed in client
+events. Static codes are not emitted as `pairingCodeChanged` events.
 
 Dynamic pairing binds the code to the physical device-presence flow, so a relay cannot reuse a code
 across different Noise handshakes. Static pairing authenticates the code but does not provide that
@@ -174,9 +181,10 @@ man-in-the-middle pairing flow.
 
 ```swift
 let controller = try SendspinClient(
-    identity: SendspinIdentity.generate(),
+    device: SendspinDevice.ephemeral(), // demo device; see Quick Start for Keychain-backed storage
     name: "Kitchen Display",
-    roles: [.controllerV1, .metadataV1]
+    roles: [.controllerV1, .metadataV1],
+    access: .allowUnpaired
 )
 
 try await controller.connect(to: serverURL)
@@ -207,9 +215,10 @@ extension Color {
 }
 
 let colorDisplay = try SendspinClient(
-    identity: SendspinIdentity.generate(),
+    device: SendspinDevice.ephemeral(), // demo device; see Quick Start for Keychain-backed storage
     name: "Kitchen Display",
-    roles: [.colorV1]
+    roles: [.colorV1],
+    access: .allowUnpaired
 )
 
 struct NowPlayingView: View {
@@ -248,14 +257,15 @@ consumer; a display-link submission is not a guarantee about screen-photon timin
 
 ```swift
 let visualizer = try SendspinClient(
-    identity: SendspinIdentity.generate(),
+    device: SendspinDevice.ephemeral(), // demo device; see Quick Start for Keychain-backed storage
     name: "Kitchen Display",
     roles: [.visualizerV1],
     visualizerConfig: try VisualizerConfiguration(
         types: [.loudness, .spectrum],
         rateMax: 30,
         spectrum: SpectrumConfiguration(nDispBins: 32, scale: .log, fMin: 60, fMax: 16_000)
-    )
+    ),
+    access: .allowUnpaired
 )
 ```
 
